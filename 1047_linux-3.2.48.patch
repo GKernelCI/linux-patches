@@ -1,0 +1,952 @@
+diff --git a/Makefile b/Makefile
+index 40e2a11..299e2eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 2
+-SUBLEVEL = 47
++SUBLEVEL = 48
+ EXTRAVERSION =
+ NAME = Saber-toothed Squirrel
+ 
+diff --git a/arch/arm/include/asm/cacheflush.h b/arch/arm/include/asm/cacheflush.h
+index 1252a26..1397408 100644
+--- a/arch/arm/include/asm/cacheflush.h
++++ b/arch/arm/include/asm/cacheflush.h
+@@ -301,9 +301,7 @@ static inline void flush_anon_page(struct vm_area_struct *vma,
+ }
+ 
+ #define ARCH_HAS_FLUSH_KERNEL_DCACHE_PAGE
+-static inline void flush_kernel_dcache_page(struct page *page)
+-{
+-}
++extern void flush_kernel_dcache_page(struct page *);
+ 
+ #define flush_dcache_mmap_lock(mapping) \
+ 	spin_lock_irq(&(mapping)->tree_lock)
+diff --git a/arch/arm/mm/flush.c b/arch/arm/mm/flush.c
+index 8fda9f7..fe61cab 100644
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -304,6 +304,39 @@ void flush_dcache_page(struct page *page)
+ EXPORT_SYMBOL(flush_dcache_page);
+ 
+ /*
++ * Ensure cache coherency for the kernel mapping of this page. We can
++ * assume that the page is pinned via kmap.
++ *
++ * If the page only exists in the page cache and there are no user
++ * space mappings, this is a no-op since the page was already marked
++ * dirty at creation.  Otherwise, we need to flush the dirty kernel
++ * cache lines directly.
++ */
++void flush_kernel_dcache_page(struct page *page)
++{
++	if (cache_is_vivt() || cache_is_vipt_aliasing()) {
++		struct address_space *mapping;
++
++		mapping = page_mapping(page);
++
++		if (!mapping || mapping_mapped(mapping)) {
++			void *addr;
++
++			addr = page_address(page);
++			/*
++			 * kmap_atomic() doesn't set the page virtual
++			 * address for highmem pages, and
++			 * kunmap_atomic() takes care of cache
++			 * flushing already.
++			 */
++			if (!IS_ENABLED(CONFIG_HIGHMEM) || addr)
++				__cpuc_flush_dcache_area(addr, PAGE_SIZE);
++		}
++	}
++}
++EXPORT_SYMBOL(flush_kernel_dcache_page);
++
++/*
+  * Flush an anonymous page so that users of get_user_pages()
+  * can safely access the data.  The expected sequence is:
+  *
+diff --git a/arch/arm/mm/nommu.c b/arch/arm/mm/nommu.c
+index 941a98c..a5018fb 100644
+--- a/arch/arm/mm/nommu.c
++++ b/arch/arm/mm/nommu.c
+@@ -53,6 +53,12 @@ void flush_dcache_page(struct page *page)
+ }
+ EXPORT_SYMBOL(flush_dcache_page);
+ 
++void flush_kernel_dcache_page(struct page *page)
++{
++	__cpuc_flush_dcache_area(page_address(page), PAGE_SIZE);
++}
++EXPORT_SYMBOL(flush_kernel_dcache_page);
++
+ void copy_to_user_page(struct vm_area_struct *vma, struct page *page,
+ 		       unsigned long uaddr, void *dst, const void *src,
+ 		       unsigned long len)
+diff --git a/arch/tile/lib/exports.c b/arch/tile/lib/exports.c
+index 2a81d32..e51e5cd 100644
+--- a/arch/tile/lib/exports.c
++++ b/arch/tile/lib/exports.c
+@@ -90,4 +90,6 @@ uint64_t __ashrdi3(uint64_t, unsigned int);
+ EXPORT_SYMBOL(__ashrdi3);
+ uint64_t __ashldi3(uint64_t, unsigned int);
+ EXPORT_SYMBOL(__ashldi3);
++int __ffsdi2(uint64_t);
++EXPORT_SYMBOL(__ffsdi2);
+ #endif
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index 9a42703..fb2e69d 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -2120,6 +2120,7 @@ source "fs/Kconfig.binfmt"
+ config IA32_EMULATION
+ 	bool "IA32 Emulation"
+ 	depends on X86_64
++	select BINFMT_ELF
+ 	select COMPAT_BINFMT_ELF
+ 	---help---
+ 	  Include code to run 32-bit programs under a 64-bit kernel. You should
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e82a53a..57867e4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -551,8 +551,6 @@ int __kvm_set_xcr(struct kvm_vcpu *vcpu, u32 index, u64 xcr)
+ 	if (index != XCR_XFEATURE_ENABLED_MASK)
+ 		return 1;
+ 	xcr0 = xcr;
+-	if (kvm_x86_ops->get_cpl(vcpu) != 0)
+-		return 1;
+ 	if (!(xcr0 & XSTATE_FP))
+ 		return 1;
+ 	if ((xcr0 & XSTATE_YMM) && !(xcr0 & XSTATE_SSE))
+@@ -566,7 +564,8 @@ int __kvm_set_xcr(struct kvm_vcpu *vcpu, u32 index, u64 xcr)
+ 
+ int kvm_set_xcr(struct kvm_vcpu *vcpu, u32 index, u64 xcr)
+ {
+-	if (__kvm_set_xcr(vcpu, index, xcr)) {
++	if (kvm_x86_ops->get_cpl(vcpu) != 0 ||
++	    __kvm_set_xcr(vcpu, index, xcr)) {
+ 		kvm_inject_gp(vcpu, 0);
+ 		return 1;
+ 	}
+diff --git a/arch/x86/platform/efi/efi.c b/arch/x86/platform/efi/efi.c
+index 07ef7e8..f9537e3 100644
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@ -49,6 +49,13 @@
+ #define EFI_DEBUG	1
+ #define PFX 		"EFI: "
+ 
++#define EFI_MIN_RESERVE 5120
++
++#define EFI_DUMMY_GUID \
++	EFI_GUID(0x4424ac57, 0xbe4b, 0x47dd, 0x9e, 0x97, 0xed, 0x50, 0xf0, 0x9f, 0x92, 0xa9)
++
++static efi_char16_t efi_dummy_name[6] = { 'D', 'U', 'M', 'M', 'Y', 0 };
++
+ struct efi __read_mostly efi = {
+ 	.mps        = EFI_INVALID_TABLE_ADDR,
+ 	.acpi       = EFI_INVALID_TABLE_ADDR,
+@@ -787,6 +794,13 @@ void __init efi_enter_virtual_mode(void)
+ 	early_iounmap(memmap.map, memmap.nr_map * memmap.desc_size);
+ 	memmap.map = NULL;
+ 	kfree(new_memmap);
++
++	/* clean DUMMY object */
++	efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
++			 EFI_VARIABLE_NON_VOLATILE |
++			 EFI_VARIABLE_BOOTSERVICE_ACCESS |
++			 EFI_VARIABLE_RUNTIME_ACCESS,
++			 0, NULL);
+ }
+ 
+ /*
+@@ -838,22 +852,70 @@ efi_status_t efi_query_variable_store(u32 attributes, unsigned long size)
+ 	efi_status_t status;
+ 	u64 storage_size, remaining_size, max_size;
+ 
++	if (!(attributes & EFI_VARIABLE_NON_VOLATILE))
++		return 0;
++
+ 	status = efi.query_variable_info(attributes, &storage_size,
+ 					 &remaining_size, &max_size);
+ 	if (status != EFI_SUCCESS)
+ 		return status;
+ 
+-	if (!max_size && remaining_size > size)
+-		printk_once(KERN_ERR FW_BUG "Broken EFI implementation"
+-			    " is returning MaxVariableSize=0\n");
++	/*
++	 * Some firmware implementations refuse to boot if there's insufficient
++	 * space in the variable store. We account for that by refusing the
++	 * write if permitting it would reduce the available space to under
++	 * 5KB. This figure was provided by Samsung, so should be safe.
++	 */
++	if ((remaining_size - size < EFI_MIN_RESERVE) &&
++		!efi_no_storage_paranoia) {
++
++		/*
++		 * Triggering garbage collection may require that the firmware
++		 * generate a real EFI_OUT_OF_RESOURCES error. We can force
++		 * that by attempting to use more space than is available.
++		 */
++		unsigned long dummy_size = remaining_size + 1024;
++		void *dummy = kzalloc(dummy_size, GFP_ATOMIC);
++
++		if (!dummy)
++			return EFI_OUT_OF_RESOURCES;
+ 
+-	if (!storage_size || size > remaining_size ||
+-	    (max_size && size > max_size))
+-		return EFI_OUT_OF_RESOURCES;
++		status = efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
++					  EFI_VARIABLE_NON_VOLATILE |
++					  EFI_VARIABLE_BOOTSERVICE_ACCESS |
++					  EFI_VARIABLE_RUNTIME_ACCESS,
++					  dummy_size, dummy);
+ 
+-	if (!efi_no_storage_paranoia &&
+-	    (remaining_size - size) < (storage_size / 2))
+-		return EFI_OUT_OF_RESOURCES;
++		if (status == EFI_SUCCESS) {
++			/*
++			 * This should have failed, so if it didn't make sure
++			 * that we delete it...
++			 */
++			efi.set_variable(efi_dummy_name, &EFI_DUMMY_GUID,
++					 EFI_VARIABLE_NON_VOLATILE |
++					 EFI_VARIABLE_BOOTSERVICE_ACCESS |
++					 EFI_VARIABLE_RUNTIME_ACCESS,
++					 0, dummy);
++		}
++
++		kfree(dummy);
++
++		/*
++		 * The runtime code may now have triggered a garbage collection
++		 * run, so check the variable info again
++		 */
++		status = efi.query_variable_info(attributes, &storage_size,
++						 &remaining_size, &max_size);
++
++		if (status != EFI_SUCCESS)
++			return status;
++
++		/*
++		 * There still isn't enough room, so return an error
++		 */
++		if (remaining_size - size < EFI_MIN_RESERVE)
++			return EFI_OUT_OF_RESOURCES;
++	}
+ 
+ 	return EFI_SUCCESS;
+ }
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 166cb36..c5f7b2c 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -343,6 +343,7 @@ static void virtblk_config_changed_work(struct work_struct *work)
+ 		  cap_str_10, cap_str_2);
+ 
+ 	set_capacity(vblk->disk, capacity);
++	revalidate_disk(vblk->disk);
+ done:
+ 	mutex_unlock(&vblk->config_lock);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_ringbuffer.c b/drivers/gpu/drm/i915/intel_ringbuffer.c
+index 4fddd21..38a7793 100644
+--- a/drivers/gpu/drm/i915/intel_ringbuffer.c
++++ b/drivers/gpu/drm/i915/intel_ringbuffer.c
+@@ -408,11 +408,6 @@ static int init_render_ring(struct intel_ring_buffer *ring)
+ 	if (INTEL_INFO(dev)->gen >= 6)
+ 		I915_WRITE(MI_MODE, GFX_MODE_ENABLE(ASYNC_FLIP_PERF_DISABLE));
+ 
+-	/* Required for the hardware to program scanline values for waiting */
+-	if (INTEL_INFO(dev)->gen == 6)
+-		I915_WRITE(GFX_MODE,
+-			   GFX_MODE_ENABLE(GFX_TLB_INVALIDATE_ALWAYS));
+-
+ 	if (IS_GEN7(dev))
+ 		I915_WRITE(GFX_MODE_GEN7,
+ 			   GFX_MODE_DISABLE(GFX_TLB_INVALIDATE_ALWAYS) |
+diff --git a/drivers/net/ethernet/freescale/gianfar_ptp.c b/drivers/net/ethernet/freescale/gianfar_ptp.c
+index 69c3adf..c2ab21c 100644
+--- a/drivers/net/ethernet/freescale/gianfar_ptp.c
++++ b/drivers/net/ethernet/freescale/gianfar_ptp.c
+@@ -520,6 +520,7 @@ static int gianfar_ptp_probe(struct platform_device *dev)
+ 	return 0;
+ 
+ no_clock:
++	iounmap(etsects->regs);
+ no_ioremap:
+ 	release_resource(etsects->rsrc);
+ no_resource:
+diff --git a/drivers/net/ethernet/realtek/r8169.c b/drivers/net/ethernet/realtek/r8169.c
+index f698183..ed7a5a6 100644
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@ -5524,7 +5524,20 @@ err_out:
+ 	return -EIO;
+ }
+ 
+-static inline void rtl8169_tso_csum(struct rtl8169_private *tp,
++static bool rtl_skb_pad(struct sk_buff *skb)
++{
++	if (skb_padto(skb, ETH_ZLEN))
++		return false;
++	skb_put(skb, ETH_ZLEN - skb->len);
++	return true;
++}
++
++static bool rtl_test_hw_pad_bug(struct rtl8169_private *tp, struct sk_buff *skb)
++{
++	return skb->len < ETH_ZLEN && tp->mac_version == RTL_GIGA_MAC_VER_34;
++}
++
++static inline bool rtl8169_tso_csum(struct rtl8169_private *tp,
+ 				    struct sk_buff *skb, u32 *opts)
+ {
+ 	const struct rtl_tx_desc_info *info = tx_desc_info + tp->txd_version;
+@@ -5537,13 +5550,20 @@ static inline void rtl8169_tso_csum(struct rtl8169_private *tp,
+ 	} else if (skb->ip_summed == CHECKSUM_PARTIAL) {
+ 		const struct iphdr *ip = ip_hdr(skb);
+ 
++		if (unlikely(rtl_test_hw_pad_bug(tp, skb)))
++			return skb_checksum_help(skb) == 0 && rtl_skb_pad(skb);
++
+ 		if (ip->protocol == IPPROTO_TCP)
+ 			opts[offset] |= info->checksum.tcp;
+ 		else if (ip->protocol == IPPROTO_UDP)
+ 			opts[offset] |= info->checksum.udp;
+ 		else
+ 			WARN_ON_ONCE(1);
++	} else {
++		if (unlikely(rtl_test_hw_pad_bug(tp, skb)))
++			return rtl_skb_pad(skb);
+ 	}
++	return true;
+ }
+ 
+ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+@@ -5575,6 +5595,12 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+ 	if (unlikely(le32_to_cpu(txd->opts1) & DescOwn))
+ 		goto err_stop_0;
+ 
++	opts[1] = cpu_to_le32(rtl8169_tx_vlan_tag(tp, skb));
++	opts[0] = DescOwn;
++
++	if (!rtl8169_tso_csum(tp, skb, opts))
++		goto err_update_stats;
++
+ 	len = skb_headlen(skb);
+ 	mapping = dma_map_single(d, skb->data, len, DMA_TO_DEVICE);
+ 	if (unlikely(dma_mapping_error(d, mapping))) {
+@@ -5586,11 +5612,6 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+ 	tp->tx_skb[entry].len = len;
+ 	txd->addr = cpu_to_le64(mapping);
+ 
+-	opts[1] = cpu_to_le32(rtl8169_tx_vlan_tag(tp, skb));
+-	opts[0] = DescOwn;
+-
+-	rtl8169_tso_csum(tp, skb, opts);
+-
+ 	frags = rtl8169_xmit_frags(tp, skb, opts);
+ 	if (frags < 0)
+ 		goto err_dma_1;
+diff --git a/drivers/usb/serial/ti_usb_3410_5052.c b/drivers/usb/serial/ti_usb_3410_5052.c
+index 4b805be..9d3b39e 100644
+--- a/drivers/usb/serial/ti_usb_3410_5052.c
++++ b/drivers/usb/serial/ti_usb_3410_5052.c
+@@ -178,7 +178,8 @@ static struct usb_device_id ti_id_table_3410[15+TI_EXTRA_VID_PID_COUNT+1] = {
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_4543_PRODUCT_ID) },
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454B_PRODUCT_ID) },
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454C_PRODUCT_ID) },
+-	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_PRODUCT_ID) },
++	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_STEREO_PLUG_ID) },
++	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_STRIP_PORT_ID) },
+ 	{ USB_DEVICE(TI_VENDOR_ID, FRI2_PRODUCT_ID) },
+ };
+ 
+diff --git a/drivers/usb/serial/ti_usb_3410_5052.h b/drivers/usb/serial/ti_usb_3410_5052.h
+index b353e7e..4a2423e 100644
+--- a/drivers/usb/serial/ti_usb_3410_5052.h
++++ b/drivers/usb/serial/ti_usb_3410_5052.h
+@@ -52,7 +52,9 @@
+ 
+ /* Abbott Diabetics vendor and product ids */
+ #define ABBOTT_VENDOR_ID		0x1a61
+-#define ABBOTT_PRODUCT_ID		0x3410
++#define ABBOTT_STEREO_PLUG_ID		0x3410
++#define ABBOTT_PRODUCT_ID		ABBOTT_STEREO_PLUG_ID
++#define ABBOTT_STRIP_PORT_ID		0x3420
+ 
+ /* Commands */
+ #define TI_GET_VERSION			0x01
+diff --git a/fs/ncpfs/dir.c b/fs/ncpfs/dir.c
+index 9c51f62..844bd64 100644
+--- a/fs/ncpfs/dir.c
++++ b/fs/ncpfs/dir.c
+@@ -1033,15 +1033,6 @@ static int ncp_rmdir(struct inode *dir, struct dentry *dentry)
+ 	DPRINTK("ncp_rmdir: removing %s/%s\n",
+ 		dentry->d_parent->d_name.name, dentry->d_name.name);
+ 
+-	/*
+-	 * fail with EBUSY if there are still references to this
+-	 * directory.
+-	 */
+-	dentry_unhash(dentry);
+-	error = -EBUSY;
+-	if (!d_unhashed(dentry))
+-		goto out;
+-
+ 	len = sizeof(__name);
+ 	error = ncp_io2vol(server, __name, &len, dentry->d_name.name,
+ 			   dentry->d_name.len, !ncp_preserve_case(dir));
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 2ae1371..1c33dd7 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -105,9 +105,14 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  * @head:	the head for your list.
+  * @member:	the name of the hlist_nulls_node within the struct.
+  *
++ * The barrier() is needed to make sure compiler doesn't cache first element [1],
++ * as this loop can be restarted [2]
++ * [1] Documentation/atomic_ops.txt around line 114
++ * [2] Documentation/RCU/rculist_nulls.txt around line 146
+  */
+ #define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member)			\
+-	for (pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
++	for (({barrier();}),							\
++	     pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
+ 		(!is_a_nulls(pos)) &&						\
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+ 		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
+diff --git a/include/linux/socket.h b/include/linux/socket.h
+index 2acd2e2..7e9f2d3 100644
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@ -336,6 +336,9 @@ extern int put_cmsg(struct msghdr*, int level, int type, int len, void *data);
+ 
+ struct timespec;
+ 
++/* The __sys_...msg variants allow MSG_CMSG_COMPAT */
++extern long __sys_recvmsg(int fd, struct msghdr __user *msg, unsigned flags);
++extern long __sys_sendmsg(int fd, struct msghdr __user *msg, unsigned flags);
+ extern int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 			  unsigned int flags, struct timespec *timeout);
+ extern int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg,
+diff --git a/net/compat.c b/net/compat.c
+index 6def90e..8c979cc 100644
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -733,19 +733,25 @@ static unsigned char nas[21] = {
+ 
+ asmlinkage long compat_sys_sendmsg(int fd, struct compat_msghdr __user *msg, unsigned flags)
+ {
+-	return sys_sendmsg(fd, (struct msghdr __user *)msg, flags | MSG_CMSG_COMPAT);
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++	return __sys_sendmsg(fd, (struct msghdr __user *)msg, flags | MSG_CMSG_COMPAT);
+ }
+ 
+ asmlinkage long compat_sys_sendmmsg(int fd, struct compat_mmsghdr __user *mmsg,
+ 				    unsigned vlen, unsigned int flags)
+ {
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
+ 	return __sys_sendmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+ 			      flags | MSG_CMSG_COMPAT);
+ }
+ 
+ asmlinkage long compat_sys_recvmsg(int fd, struct compat_msghdr __user *msg, unsigned int flags)
+ {
+-	return sys_recvmsg(fd, (struct msghdr __user *)msg, flags | MSG_CMSG_COMPAT);
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++	return __sys_recvmsg(fd, (struct msghdr __user *)msg, flags | MSG_CMSG_COMPAT);
+ }
+ 
+ asmlinkage long compat_sys_recv(int fd, void __user *buf, size_t len, unsigned flags)
+@@ -767,6 +773,9 @@ asmlinkage long compat_sys_recvmmsg(int fd, struct compat_mmsghdr __user *mmsg,
+ 	int datagrams;
+ 	struct timespec ktspec;
+ 
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++
+ 	if (timeout == NULL)
+ 		return __sys_recvmmsg(fd, (struct mmsghdr __user *)mmsg, vlen,
+ 				      flags | MSG_CMSG_COMPAT, NULL);
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+index d55110e..5f28fab 100644
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -716,6 +716,7 @@ static netdev_tx_t ipgre_tunnel_xmit(struct sk_buff *skb, struct net_device *dev
+ 		tiph = &tunnel->parms.iph;
+ 	}
+ 
++	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ 	if ((dst = tiph->daddr) == 0) {
+ 		/* NBMA tunnel */
+ 
+@@ -851,7 +852,6 @@ static netdev_tx_t ipgre_tunnel_xmit(struct sk_buff *skb, struct net_device *dev
+ 	skb_reset_transport_header(skb);
+ 	skb_push(skb, gre_hlen);
+ 	skb_reset_network_header(skb);
+-	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ 	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ 			      IPSKB_REROUTED);
+ 	skb_dst_drop(skb);
+diff --git a/net/ipv4/ipip.c b/net/ipv4/ipip.c
+index 17ad951..5dc5137 100644
+--- a/net/ipv4/ipip.c
++++ b/net/ipv4/ipip.c
+@@ -448,6 +448,7 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	if (tos & 1)
+ 		tos = old_iph->tos;
+ 
++	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ 	if (!dst) {
+ 		/* NBMA tunnel */
+ 		if ((rt = skb_rtable(skb)) == NULL) {
+@@ -531,7 +532,6 @@ static netdev_tx_t ipip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	skb->transport_header = skb->network_header;
+ 	skb_push(skb, sizeof(struct iphdr));
+ 	skb_reset_network_header(skb);
+-	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
+ 	IPCB(skb)->flags &= ~(IPSKB_XFRM_TUNNEL_SIZE | IPSKB_XFRM_TRANSFORMED |
+ 			      IPSKB_REROUTED);
+ 	skb_dst_drop(skb);
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index fe381c2..ec8b4b7e 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -3037,8 +3037,11 @@ int tcp_md5_hash_skb_data(struct tcp_md5sig_pool *hp,
+ 
+ 	for (i = 0; i < shi->nr_frags; ++i) {
+ 		const struct skb_frag_struct *f = &shi->frags[i];
+-		struct page *page = skb_frag_page(f);
+-		sg_set_page(&sg, page, skb_frag_size(f), f->page_offset);
++		unsigned int offset = f->page_offset;
++		struct page *page = skb_frag_page(f) + (offset >> PAGE_SHIFT);
++
++		sg_set_page(&sg, page, skb_frag_size(f),
++			    offset_in_page(offset));
+ 		if (crypto_hash_update(desc, &sg, skb_frag_size(f)))
+ 			return 1;
+ 	}
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 5c1807c..3add486 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -835,11 +835,13 @@ static int tcp_transmit_skb(struct sock *sk, struct sk_buff *skb, int clone_it,
+ 							   &md5);
+ 	tcp_header_size = tcp_options_size + sizeof(struct tcphdr);
+ 
+-	if (tcp_packets_in_flight(tp) == 0) {
++	if (tcp_packets_in_flight(tp) == 0)
+ 		tcp_ca_event(sk, CA_EVENT_TX_START);
+-		skb->ooo_okay = 1;
+-	} else
+-		skb->ooo_okay = 0;
++
++	/* if no packet is in qdisc/device queue, then allow XPS to select
++	 * another queue.
++	 */
++	skb->ooo_okay = sk_wmem_alloc_get(sk) == 0;
+ 
+ 	skb_push(skb, tcp_header_size);
+ 	skb_reset_transport_header(skb);
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index d84033b..d603caa 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -2437,8 +2437,10 @@ static void init_loopback(struct net_device *dev)
+ 			sp_rt = addrconf_dst_alloc(idev, &sp_ifa->addr, 0);
+ 
+ 			/* Failure cases are ignored */
+-			if (!IS_ERR(sp_rt))
++			if (!IS_ERR(sp_rt)) {
++				sp_ifa->rt = sp_rt;
+ 				ip6_ins_rt(sp_rt);
++			}
+ 		}
+ 		read_unlock_bh(&idev->lock);
+ 	}
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 3ccd9b2..6aadaa8 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1233,7 +1233,7 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
+ 			if (WARN_ON(np->cork.opt))
+ 				return -EINVAL;
+ 
+-			np->cork.opt = kmalloc(opt->tot_len, sk->sk_allocation);
++			np->cork.opt = kzalloc(opt->tot_len, sk->sk_allocation);
+ 			if (unlikely(np->cork.opt == NULL))
+ 				return -ENOBUFS;
+ 
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index 6f60175..74410e6 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -350,19 +350,19 @@ static int pppol2tp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msgh
+ 	skb_put(skb, 2);
+ 
+ 	/* Copy user data into skb */
+-	error = memcpy_fromiovec(skb->data, m->msg_iov, total_len);
++	error = memcpy_fromiovec(skb_put(skb, total_len), m->msg_iov,
++				 total_len);
+ 	if (error < 0) {
+ 		kfree_skb(skb);
+ 		goto error_put_sess_tun;
+ 	}
+-	skb_put(skb, total_len);
+ 
+ 	l2tp_xmit_skb(session, skb, session->hdr_len);
+ 
+ 	sock_put(ps->tunnel_sock);
+ 	sock_put(sk);
+ 
+-	return error;
++	return total_len;
+ 
+ error_put_sess_tun:
+ 	sock_put(ps->tunnel_sock);
+diff --git a/net/netlabel/netlabel_domainhash.c b/net/netlabel/netlabel_domainhash.c
+index e5330ed..bf99567 100644
+--- a/net/netlabel/netlabel_domainhash.c
++++ b/net/netlabel/netlabel_domainhash.c
+@@ -245,6 +245,71 @@ static void netlbl_domhsh_audit_add(struct netlbl_dom_map *entry,
+ 	}
+ }
+ 
++/**
++ * netlbl_domhsh_validate - Validate a new domain mapping entry
++ * @entry: the entry to validate
++ *
++ * This function validates the new domain mapping entry to ensure that it is
++ * a valid entry.  Returns zero on success, negative values on failure.
++ *
++ */
++static int netlbl_domhsh_validate(const struct netlbl_dom_map *entry)
++{
++	struct netlbl_af4list *iter4;
++	struct netlbl_domaddr4_map *map4;
++#if IS_ENABLED(CONFIG_IPV6)
++	struct netlbl_af6list *iter6;
++	struct netlbl_domaddr6_map *map6;
++#endif /* IPv6 */
++
++	if (entry == NULL)
++		return -EINVAL;
++
++	switch (entry->type) {
++	case NETLBL_NLTYPE_UNLABELED:
++		if (entry->type_def.cipsov4 != NULL ||
++		    entry->type_def.addrsel != NULL)
++			return -EINVAL;
++		break;
++	case NETLBL_NLTYPE_CIPSOV4:
++		if (entry->type_def.cipsov4 == NULL)
++			return -EINVAL;
++		break;
++	case NETLBL_NLTYPE_ADDRSELECT:
++		netlbl_af4list_foreach(iter4, &entry->type_def.addrsel->list4) {
++			map4 = netlbl_domhsh_addr4_entry(iter4);
++			switch (map4->type) {
++			case NETLBL_NLTYPE_UNLABELED:
++				if (map4->type_def.cipsov4 != NULL)
++					return -EINVAL;
++				break;
++			case NETLBL_NLTYPE_CIPSOV4:
++				if (map4->type_def.cipsov4 == NULL)
++					return -EINVAL;
++				break;
++			default:
++				return -EINVAL;
++			}
++		}
++#if IS_ENABLED(CONFIG_IPV6)
++		netlbl_af6list_foreach(iter6, &entry->type_def.addrsel->list6) {
++			map6 = netlbl_domhsh_addr6_entry(iter6);
++			switch (map6->type) {
++			case NETLBL_NLTYPE_UNLABELED:
++				break;
++			default:
++				return -EINVAL;
++			}
++		}
++#endif /* IPv6 */
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /*
+  * Domain Hash Table Functions
+  */
+@@ -311,6 +376,10 @@ int netlbl_domhsh_add(struct netlbl_dom_map *entry,
+ 	struct netlbl_af6list *tmp6;
+ #endif /* IPv6 */
+ 
++	ret_val = netlbl_domhsh_validate(entry);
++	if (ret_val != 0)
++		return ret_val;
++
+ 	/* XXX - we can remove this RCU read lock as the spinlock protects the
+ 	 *       entire function, but before we do we need to fixup the
+ 	 *       netlbl_af[4,6]list RCU functions to do "the right thing" with
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 5a70215..a2ac2c3 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -2820,12 +2820,11 @@ static int packet_getname_spkt(struct socket *sock, struct sockaddr *uaddr,
+ 		return -EOPNOTSUPP;
+ 
+ 	uaddr->sa_family = AF_PACKET;
++	memset(uaddr->sa_data, 0, sizeof(uaddr->sa_data));
+ 	rcu_read_lock();
+ 	dev = dev_get_by_index_rcu(sock_net(sk), pkt_sk(sk)->ifindex);
+ 	if (dev)
+-		strncpy(uaddr->sa_data, dev->name, 14);
+-	else
+-		memset(uaddr->sa_data, 0, 14);
++		strlcpy(uaddr->sa_data, dev->name, sizeof(uaddr->sa_data));
+ 	rcu_read_unlock();
+ 	*uaddr_len = sizeof(*uaddr);
+ 
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 5e0d86e..ba0108f 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -3929,6 +3929,12 @@ SCTP_STATIC void sctp_destroy_sock(struct sock *sk)
+ 
+ 	/* Release our hold on the endpoint. */
+ 	sp = sctp_sk(sk);
++	/* This could happen during socket init, thus we bail out
++	 * early, since the rest of the below is not setup either.
++	 */
++	if (sp->ep == NULL)
++		return;
++
+ 	if (sp->do_auto_asconf) {
+ 		sp->do_auto_asconf = 0;
+ 		list_del(&sp->auto_asconf_list);
+diff --git a/net/socket.c b/net/socket.c
+index 68879db..cf546a3 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1876,9 +1876,9 @@ struct used_address {
+ 	unsigned int name_len;
+ };
+ 
+-static int __sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
+-			 struct msghdr *msg_sys, unsigned flags,
+-			 struct used_address *used_address)
++static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
++			  struct msghdr *msg_sys, unsigned flags,
++			  struct used_address *used_address)
+ {
+ 	struct compat_msghdr __user *msg_compat =
+ 	    (struct compat_msghdr __user *)msg;
+@@ -1998,22 +1998,30 @@ out:
+  *	BSD sendmsg interface
+  */
+ 
+-SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned, flags)
++long __sys_sendmsg(int fd, struct msghdr __user *msg, unsigned flags)
+ {
+ 	int fput_needed, err;
+ 	struct msghdr msg_sys;
+-	struct socket *sock = sockfd_lookup_light(fd, &err, &fput_needed);
++	struct socket *sock;
+ 
++	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+ 	if (!sock)
+ 		goto out;
+ 
+-	err = __sys_sendmsg(sock, msg, &msg_sys, flags, NULL);
++	err = ___sys_sendmsg(sock, msg, &msg_sys, flags, NULL);
+ 
+ 	fput_light(sock->file, fput_needed);
+ out:
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE3(sendmsg, int, fd, struct msghdr __user *, msg, unsigned int, flags)
++{
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++	return __sys_sendmsg(fd, msg, flags);
++}
++
+ /*
+  *	Linux sendmmsg interface
+  */
+@@ -2044,15 +2052,16 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 
+ 	while (datagrams < vlen) {
+ 		if (MSG_CMSG_COMPAT & flags) {
+-			err = __sys_sendmsg(sock, (struct msghdr __user *)compat_entry,
+-					    &msg_sys, flags, &used_address);
++			err = ___sys_sendmsg(sock, (struct msghdr __user *)compat_entry,
++					     &msg_sys, flags, &used_address);
+ 			if (err < 0)
+ 				break;
+ 			err = __put_user(err, &compat_entry->msg_len);
+ 			++compat_entry;
+ 		} else {
+-			err = __sys_sendmsg(sock, (struct msghdr __user *)entry,
+-					    &msg_sys, flags, &used_address);
++			err = ___sys_sendmsg(sock,
++					     (struct msghdr __user *)entry,
++					     &msg_sys, flags, &used_address);
+ 			if (err < 0)
+ 				break;
+ 			err = put_user(err, &entry->msg_len);
+@@ -2076,11 +2085,13 @@ int __sys_sendmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ SYSCALL_DEFINE4(sendmmsg, int, fd, struct mmsghdr __user *, mmsg,
+ 		unsigned int, vlen, unsigned int, flags)
+ {
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
+ 	return __sys_sendmmsg(fd, mmsg, vlen, flags);
+ }
+ 
+-static int __sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
+-			 struct msghdr *msg_sys, unsigned flags, int nosec)
++static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
++			  struct msghdr *msg_sys, unsigned flags, int nosec)
+ {
+ 	struct compat_msghdr __user *msg_compat =
+ 	    (struct compat_msghdr __user *)msg;
+@@ -2177,23 +2188,31 @@ out:
+  *	BSD recvmsg interface
+  */
+ 
+-SYSCALL_DEFINE3(recvmsg, int, fd, struct msghdr __user *, msg,
+-		unsigned int, flags)
++long __sys_recvmsg(int fd, struct msghdr __user *msg, unsigned flags)
+ {
+ 	int fput_needed, err;
+ 	struct msghdr msg_sys;
+-	struct socket *sock = sockfd_lookup_light(fd, &err, &fput_needed);
++	struct socket *sock;
+ 
++	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+ 	if (!sock)
+ 		goto out;
+ 
+-	err = __sys_recvmsg(sock, msg, &msg_sys, flags, 0);
++	err = ___sys_recvmsg(sock, msg, &msg_sys, flags, 0);
+ 
+ 	fput_light(sock->file, fput_needed);
+ out:
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE3(recvmsg, int, fd, struct msghdr __user *, msg,
++		unsigned int, flags)
++{
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++	return __sys_recvmsg(fd, msg, flags);
++}
++
+ /*
+  *     Linux recvmmsg interface
+  */
+@@ -2231,17 +2250,18 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 		 * No need to ask LSM for more than the first datagram.
+ 		 */
+ 		if (MSG_CMSG_COMPAT & flags) {
+-			err = __sys_recvmsg(sock, (struct msghdr __user *)compat_entry,
+-					    &msg_sys, flags & ~MSG_WAITFORONE,
+-					    datagrams);
++			err = ___sys_recvmsg(sock, (struct msghdr __user *)compat_entry,
++					     &msg_sys, flags & ~MSG_WAITFORONE,
++					     datagrams);
+ 			if (err < 0)
+ 				break;
+ 			err = __put_user(err, &compat_entry->msg_len);
+ 			++compat_entry;
+ 		} else {
+-			err = __sys_recvmsg(sock, (struct msghdr __user *)entry,
+-					    &msg_sys, flags & ~MSG_WAITFORONE,
+-					    datagrams);
++			err = ___sys_recvmsg(sock,
++					     (struct msghdr __user *)entry,
++					     &msg_sys, flags & ~MSG_WAITFORONE,
++					     datagrams);
+ 			if (err < 0)
+ 				break;
+ 			err = put_user(err, &entry->msg_len);
+@@ -2308,6 +2328,9 @@ SYSCALL_DEFINE5(recvmmsg, int, fd, struct mmsghdr __user *, mmsg,
+ 	int datagrams;
+ 	struct timespec timeout_sys;
+ 
++	if (flags & MSG_CMSG_COMPAT)
++		return -EINVAL;
++
+ 	if (!timeout)
+ 		return __sys_recvmmsg(fd, mmsg, vlen, flags, NULL);
+ 
+diff --git a/sound/usb/card.c b/sound/usb/card.c
+index acb7fac..3b79a4a 100644
+--- a/sound/usb/card.c
++++ b/sound/usb/card.c
+@@ -149,14 +149,32 @@ static int snd_usb_create_stream(struct snd_usb_audio *chip, int ctrlif, int int
+ 		return -EINVAL;
+ 	}
+ 
++	alts = &iface->altsetting[0];
++	altsd = get_iface_desc(alts);
++
++	/*
++	 * Android with both accessory and audio interfaces enabled gets the
++	 * interface numbers wrong.
++	 */
++	if ((chip->usb_id == USB_ID(0x18d1, 0x2d04) ||
++	     chip->usb_id == USB_ID(0x18d1, 0x2d05)) &&
++	    interface == 0 &&
++	    altsd->bInterfaceClass == USB_CLASS_VENDOR_SPEC &&
++	    altsd->bInterfaceSubClass == USB_SUBCLASS_VENDOR_SPEC) {
++		interface = 2;
++		iface = usb_ifnum_to_if(dev, interface);
++		if (!iface)
++			return -EINVAL;
++		alts = &iface->altsetting[0];
++		altsd = get_iface_desc(alts);
++	}
++
+ 	if (usb_interface_claimed(iface)) {
+ 		snd_printdd(KERN_INFO "%d:%d:%d: skipping, already claimed\n",
+ 						dev->devnum, ctrlif, interface);
+ 		return -EINVAL;
+ 	}
+ 
+-	alts = &iface->altsetting[0];
+-	altsd = get_iface_desc(alts);
+ 	if ((altsd->bInterfaceClass == USB_CLASS_AUDIO ||
+ 	     altsd->bInterfaceClass == USB_CLASS_VENDOR_SPEC) &&
+ 	    altsd->bInterfaceSubClass == USB_SUBCLASS_MIDISTREAMING) {
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+index 97ec155..aeb26eb 100644
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -821,6 +821,7 @@ static void volume_control_quirks(struct usb_mixer_elem_info *cval,
+ 
+ 	case USB_ID(0x046d, 0x0808):
+ 	case USB_ID(0x046d, 0x0809):
++	case USB_ID(0x046d, 0x081b): /* HD Webcam c310 */
+ 	case USB_ID(0x046d, 0x081d): /* HD Webcam c510 */
+ 	case USB_ID(0x046d, 0x0825): /* HD Webcam c270 */
+ 	case USB_ID(0x046d, 0x0991):
