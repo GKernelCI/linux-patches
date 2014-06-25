@@ -6,6 +6,8 @@ use Cwd;
 
 $tag = shift;
 $kernel_name = shift;
+$LOCAL_TMP = shift;
+$REMOTE_BASE = shift;
 
 if ($tag =~ m/(2\.6\.\d+)-(\d+)/) {
     $ver = $1;
@@ -19,11 +21,17 @@ else { # support for kernels >= 3.0
 
 $have_history = 0;
 
-# Try and find previous release
+$result = `cd $LOCAL_TMP`;
+$result = `git -C ${LOCAL_TMP}/linux-patches reset`;
+$result = `git clone $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
 
+# checkout branch
+$result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
+
+# Try and find previous release
 if ($rel > 1) {
 	$oldtag = $ver.'-'.($rel-1);
-    $cmd='git -C '.${LOCAL_PATCHES_TRUNK}.' rev-list '.$oldtag;
+    $cmd='git -C '.${LOCAL_TMP}.'/linux-patches rev-list '.$oldtag;
     @output = `$cmd`;
 
     foreach $line (@output) { 
@@ -39,12 +47,12 @@ if ($rel > 1) {
 
 
     if ($have_history == 1) {
-        $cmd='git --no-pager -C '.${LOCAL_PATCHES_TRUNK}.' log  --pretty=format:"%s (%an)" --name-status '.$oldtag.'..'.$tag;
+        $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$oldtag.'..'.$tag;
         @log_lines = `$cmd`;
         $have_history = 1;
     }
     else {
-        $cmd='git --no-pager -C '.${LOCAL_PATCHES_TRUNK}.' log  --pretty=format:"%s (%an)" --name-status '.$tag;
+        $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$tag;
         @log_lines = `$cmd`;
     }
 }
@@ -56,12 +64,12 @@ if ($rel > 1) {
 #	#$cmd = 'svn log -q --stop-on-copy '.$subversion_root.'/tags/'.$oldtag;
 #
 #    # check out branch
-#    printf("LOCAL_PATCHES_TRUNK is ${LOCAL_PATCHES_TRUNK}\n");
-#    $cmd='git -C '.${LOCAL_PATCHES_TRUNK}.' checkout '.$ver;
+#    printf("LOCAL_TMP is ${LOCAL_TMP}\n");
+#    $cmd='git -C '.${LOCAL_TMP}.' checkout '.$ver;
 #    @result = `$cmd`;
 #
 #    # get log in between tags
-#    $cmd='git -C '.${LOCAL_PATCHES_TRUNK}.' log '.$oldtag.'..'.$tag.' --name-status';
+#    $cmd='git -C '.${LOCAL_TMP}.' log '.$oldtag.'..'.$tag.' --name-status';
 #    printf (" cmd is $cmd\n");
 #
 #	@log_lines = `$cmd`;
