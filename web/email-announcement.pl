@@ -20,6 +20,7 @@ else { # support for kernels >= 3.0
 }
 
 $have_history = 0;
+$website_base = 'http://dev.gentoo.org/~mpagano/genpatches';
 
 $result = `cd $LOCAL_TMP`;
 $result = `git -C ${LOCAL_TMP}/linux-patches reset`;
