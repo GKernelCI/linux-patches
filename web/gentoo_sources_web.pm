@@ -5,29 +5,32 @@ use Encode;
 
 # Detect which svn server and username to use
 # (broken with >=svn-1.7 due to an extra line added to svn info)
-$subversion_scheme=`svn info | awk '/^URL: / { print $2 }'`;
-$subversion_uri = $subversion_scheme;
-chomp $subversion_uri;
-$subversion_scheme =~ s|^URL: ([a-z][a-z0-9+-.]*)://.*|\1|s;
-$subversion_midpart="";
+#$subversion_scheme=`svn info | awk '/^URL: / { print $2 }'`;
+#$subversion_uri = $subversion_scheme;
+#chomp $subversion_uri;
+#$subversion_scheme =~ s|^URL: ([a-z][a-z0-9+-.]*)://.*|\1|s;
+#$subversion_midpart="";
 my $cmd="";
 
-if ($subversion_scheme == "svn+ssh") {
-	my $trimmed = substr($subversion_uri, 15);
-	if ($trimmed =~ m/^([a-zA-Z]+)@/) {
-		$subversion_midpart = "$1\@svn.gentoo.org/var/svnroot";
-	} else {
-		# couldn't detect username
-		$subversion_midpart = 'svn.gentoo.org/var/svnroot';
-	}
-} else {
-	$subversion_midpart = 'anonsvn.gentoo.org';
-}
-$subversion_root = $subversion_scheme.'://'.$subversion_midpart.'/linux-patches/genpatches-2.6';
+#if ($subversion_scheme == "svn+ssh") {
+#	my $trimmed = substr($subversion_uri, 15);
+#	if ($trimmed =~ m/^([a-zA-Z]+)@/) {
+#		$subversion_midpart = "$1\@svn.gentoo.org/var/svnroot";
+#	} else {
+#		# couldn't detect username
+#		$subversion_midpart = 'svn.gentoo.org/var/svnroot';
+#	}
+#} else {
+#	$subversion_midpart = 'anonsvn.gentoo.org';
+#}
+#$subversion_root = $subversion_scheme.'://'.$subversion_midpart.'/linux-patches/genpatches-2.6';
 $webscript_path = &Cwd::cwd();
 $output_path = $webscript_path.'/output';
 
 $website_base = 'http://dev.gentoo.org/~mpagano/genpatches';
+
+# TODO fix this, maybe from .genpatchsrc
+$git_root='/home/mike/gentoo/linux-patches';
 
 $ebuild_base = '/usr/local/gentoo-x86'; # /usr/portage
 @kernels = ('sys-kernel/ck-sources','sys-kernel/gentoo-sources','sys-kernel/hardened-sources','sys-kernel/openvz-sources','sys-kernel/tuxonice-sources','sys-kernel/vserver-sources','sys-kernel/zen-sources');
@@ -193,7 +196,20 @@ sub include_faq {
 
 sub _get_patch_list {
 	my $tag = shift;
-	my $cmd = 'svn cat '.$subversion_root.'/tags/'.$tag.'/0000_README';
+
+    printf "Inside _get_patch_list with tag $tag\n";
+
+    # work in temporary directory, TODO make this configurable
+    #git -C ${LOCAL_PATCHES_TRUNK} checkout ${BRANCH}
+
+    # get patch list
+
+    # checkout 0000_README for tag
+
+    # checkout tag
+    $cmd = 'git -C /tmp/linux-patches checkout '.$tag;
+
+	$cmd = 'cat /tmp/linux-patches/0000_README';
 	my @readme_lines = `$cmd`;
 	my @patches;
 	my $count = -1;
@@ -202,26 +218,30 @@ sub _get_patch_list {
 		chomp;
 		
 		if (/^[Pp]atch:[ \t]+(.*)$/) {
+            printf ("patch :$1\n");
 			$count++;
 			$patches[$count]{'patch'} = $1;
 		}
 
 		if (/^[Ff]rom:[ \t]+(.*)$/) {
 			$patches[$count]{'from'} = $1;
+            printf ("from :$1\n");
 		}
 
 		if (/^[Dd]esc:[ \t]+(.*)$/) {
 			$patches[$count]{'desc'} = $1;
+            printf ("desc :$1\n");
 		}
 	}
 
 	return @patches;
 }
 
-sub _parse_log {
+sub _parse_log2 {
 	my $tag = shift;
 	my $lastrev = shift;
 	my (@commits, $state, $rev);
+    # TODO
 	my $cmd = 'svn log -v -r '.$lastrev.':HEAD '.$subversion_root.'/tags/'.$tag;
 	my @loglines = `$cmd`;
 
@@ -259,6 +279,7 @@ sub _parse_log {
 
 sub release_is_generated {
 	my $tag = shift;
+
 	return -e $webscript_path.'/generated/'.$tag.'-patches.htm' &&
 		-e $webscript_path.'/generated/'.$tag.'-info.htm';
 }
@@ -356,5 +377,45 @@ sub _get_genpatches_kernels {
     }
     
     return %gp_kernels;
+}
+
+sub _parse_log {
+	my $tag = shift;
+	my $lastrev = shift;
+	my (@commits, $state, $rev);
+    # TODO
+	my $cmd = 'svn log -v -r '.$lastrev.':HEAD '.$subversion_root.'/tags/'.$tag;
+	my @loglines = `$cmd`;
+
+	foreach (@loglines) {
+		if (/^-+$/) {
+			$state = '';
+			next;
+		}
+
+		if ($state eq 'wantpaths') {
+			if (/^\s+([A-Z]) \/genpatches-2\.6\/trunk\/[\d\.]+\/([^\s]+)/) {
+				push (@{$commits[$rev]{"action$1"}}, $2) if $2 != "0000_README";
+			} elsif (/^$/) {
+				$state = 'wantlog';
+			}
+			next;
+		}
+
+		if ($state eq 'wantlog') {
+			$commits[$rev]{'logmsg'} .= "\n$_";
+			next;
+		}
+
+		if (/^r(\d+) \| (\w+) \|/) {
+			$state = 'wantpaths';
+			$rev = $1;
+			$commits[$rev]{'rev'} = $rev;
+			$commits[$rev]{'author'} = $2;
+			next;
+		}
+	}
+
+	return @commits;
 }
 

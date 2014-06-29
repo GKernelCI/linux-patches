@@ -16,6 +16,12 @@ use Sort::Versions;
 # print out arguments for easier debugging
 print "makesite.pl called with arguments: @ARGV \n";
 
+my $cmd = 'rm -rf /tmp/linux-patches';
+$output = `$cmd`;
+
+$cmd = 'git clone ssh://mpagano.com/var/git/linux-patches.git /tmp/linux-patches';
+$output = `$cmd`;
+
 make_index_page();
 make_about_page();
 make_faq_page();
@@ -187,6 +193,7 @@ sub make_kernels_page {
 		print FD '<tr>';
 		print FD '<td>'.$kernel->{'pkg'}.'</td>';
 		print FD '<td>'.$kernel->{'ver'}.'</td>';
+        # need link to be http://git.mpagano.com/?p=linux-patches.git;a=tree;h=9fe89d1c30a6de1bf4996aa8cfaf2a24b77919fe;hb=ae90dea77ef818eb638b8bb086ac8f0b671b28cf
 		
 		print FD '<td><a href="patches-'.$kernel->{'gprev'}.'.htm">'.$kernel->{'gprev'}.'</a> '.$kernel->{'wanted'}.'</td>';
 		print FD '</tr>';
@@ -201,12 +208,16 @@ sub make_release_pages {
 	my ($cmd, @out, @patches, @patchpages, $patch);
 	local *DIR;
 	print ">> Making release pages\n";
-	$cmd = 'svn ls '.$subversion_root.'/tags';
+
+    # get list of tags mike
+	$cmd = 'git -C '.$git_root.' tag -l';
+	print "cmd is git -C $git_root tag -l\n";
 	@out = `$cmd`;
+
 
 	foreach (@out) {
 		chomp;
-		chop;
+		#chop;
 		#next if $_ !~ /^2\.6\./;
 		next if $_ !~ /^\d\.\d/;
 		if (!release_is_generated($_)) {
@@ -218,6 +229,8 @@ sub make_release_pages {
 	}
 	
 	make_releases_index();
+    
+    
 	opendir(DIR, $webscript_path.'/generated');
 	@patchpages = grep { /-patches\.htm$/ } sort readdir DIR;
 	closedir(DIR);
@@ -227,7 +240,6 @@ sub make_release_pages {
 		copy($webscript_path.'/generated/'.$patch, $webscript_path.'/output/patches-'.$1.'.htm');
 	}
 
-print "Done\n";
 }
 
 sub mysort {
@@ -255,10 +267,10 @@ sub make_releases_index {
 		$kernels{$1} = 1;
 	}
 
-	foreach $info (@infopages) {
-		$info =~ m/^(\d\.\d+)-\d+-info\.htm$/;
-		$kernels{$1} = 1;
-	}
+#	foreach $info (@infopages) {
+#		$info =~ m/^(\d\.\d+)-\d+-info\.htm$/;
+#		$kernels{$1} = 1;
+#	}
 
 	open(INDEX, '> '.$webscript_path.'/output/releases.htm');
 	html_header(INDEX, 'genpatches Releases');
@@ -282,6 +294,7 @@ sub make_releases_index {
 	html_footer(INDEX);
 	close (INDEX);
 	closedir(DIR);
+
 }
 
 sub generate_patchlist {
@@ -292,7 +305,6 @@ sub generate_patchlist {
 	local $ext;
 	$ext = get_tarball_ext($tag);
 
-    #print "Writing to $webscript_path/generated/$tag-patches.htm";
 	open(PATCHLIST, '> '.$webscript_path.'/generated/'.$tag.'-patches.htm');
 	html_header(PATCHLIST, "$tag Patch List");
 	print PATCHLIST '<h1>'.$tag.' Patch List</h1>';
@@ -342,8 +354,12 @@ sub generate_info {
     }
 
 	if ($lastrev) {
-		@commits = _parse_log($tag, $lastrev);
+		#@commits = _parse_log($tag, $lastrev);
 		$have_history = @commits;
+        #print "cmd: git --no-pager -C '.$git_root.' log  --pretty=format:%s (%an) --name-status '.$oldtag.'..'.$tag\n";
+        $cmd='git --no-pager -C '.$git_root.' log  --pretty=format:"%s (%an)" --name-status '.$oldtag.'..'.$tag;
+        @commits = `$cmd`;
+        $have_history = 1;
 	}
     else {
         print "no revision found for tag: $tag\n";
@@ -360,15 +376,20 @@ sub generate_info {
 	if ($lastrev && $have_history) {
 		print INFO '<h3>Changes since '.$oldtag.'</h3>';
 		foreach $rev (@commits) {
-			next if !$rev->{'rev'};
-			print INFO '<p><strong>Revision '.$rev->{'rev'}.':</strong> ';
-			print INFO $rev->{'logmsg'}.' ('.$rev->{'author'}.')<br />';
-			print INFO '<strong>Added:</strong> '.$_.'<br />' foreach (@{$rev->{'actionA'}});
-			print INFO '<strong>Modified:</strong> '.$_.'<br />' foreach (@{$rev->{'actionM'}});
-			print INFO '<strong>Deleted:</strong> '.$_.'<br />' foreach (@{$rev->{'actionD'}});
-			print INFO '</p>';
-		}
-	}
+            if (index($rev, "0000_README") == -1) {
+
+		    	print INFO '<p><strong>'.$rev.'</strong></p>';
+    
+    			#next if !$rev->{'rev'};
+    			#print INFO '<p><strong>Revision '.$rev->{'rev'}.':</strong> ';
+    			#print INFO $rev->{'logmsg'}.' ('.$rev->{'author'}.')<br />';
+    			#print INFO '<strong>Added:</strong> '.$_.'<br />' foreach (@{$rev->{'actionA'}});
+    			#print INFO '<strong>Modified:</strong> '.$_.'<br />' foreach (@{$rev->{'actionM'}});
+    			#print INFO '<strong>Deleted:</strong> '.$_.'<br />' foreach (@{$rev->{'actionD'}});
+    			#print INFO '</p>';
+    		}
+    	}
+    }
 	print INFO '<hr />';
 	close (INFO);
 }
@@ -383,20 +404,45 @@ sub process_static_content {
 sub get_last_revision {
     my ($tag, $ver, $rel) = @_;
 
+    #print "Inside get_last_revision: ";
+    #print "tag: ".$tag." ";
+    #print "ver: ".$ver." ";
+    #print "rel: ".$rel."\n";
+
 	my ($have_history, $oldtag, @log_lines,$lastrev);
    	$have_history = 0;
 
    	# Try and find previous release
-  	if ($rel > 1) {
-   		$oldtag = $ver.'-'.($rel-1);
-   		$cmd = 'svn log -q --stop-on-copy '.$subversion_root.'/tags/'.$oldtag;
-   		@log_lines = `$cmd`;
-   		$lastrev = 0;
-   		foreach (@log_lines) {
-   			next if $_ !~ /^r(\d+) \|/;
-   			$lastrev = $1;
-    		last;
-    	}
+#  	if ($rel > 1) {
+#   		$oldtag = $ver.'-'.($rel-1);
+#        # get last tag mike
+#   		$cmd = 'svn log -q --stop-on-copy '.$subversion_root.'/tags/'.$oldtag;
+#   		@log_lines = `$cmd`;
+#   		$lastrev = 0;
+#   		foreach (@log_lines) {
+#   			next if $_ !~ /^r(\d+) \|/;
+#   			$lastrev = $1;
+#    		last;
+#    	}
+#    }
+
+    if ($rel > 1) {
+        $oldtag = $ver.'-'.($rel-1);
+        #print "cmd: git -C ".$git_root." rev-list ".$oldtag."\n";
+        $cmd='git -C '.$git_root.' rev-list '.$oldtag;
+        @output = `$cmd`;
+
+        foreach $line (@output) {
+            $have_history = 1;
+       		$lastrev = 0;
+            if (index($line, "fatal") != -1) {
+                $have_history =0;
+            }
+            if ($have_history == 0) {
+               $lastrev = $oldtag;
+               break;
+            }
+        }
     }
 
     return $lastrev;
