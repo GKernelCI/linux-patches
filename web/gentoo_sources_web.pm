@@ -208,6 +208,7 @@ sub _get_patch_list {
 
     # checkout tag
     $cmd = 'git -C /tmp/linux-patches checkout '.$tag;
+    $output = `$cmd`;
 
 	$cmd = 'cat /tmp/linux-patches/0000_README';
 	my @readme_lines = `$cmd`;
@@ -216,7 +217,7 @@ sub _get_patch_list {
 
 	foreach (@readme_lines) {
 		chomp;
-		
+
 		if (/^[Pp]atch:[ \t]+(.*)$/) {
             printf ("patch :$1\n");
 			$count++;
