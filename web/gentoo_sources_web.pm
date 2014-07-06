@@ -207,6 +207,9 @@ sub _get_patch_list {
     # checkout 0000_README for tag
 
     # checkout tag
+    $cmd = 'git -C /tmp/linux-patches fetch';
+    $output = `$cmd`;
+
     $cmd = 'git -C /tmp/linux-patches checkout '.$tag;
     $output = `$cmd`;
 
