@@ -2572,10 +2572,10 @@ index 4db3c2a1679c..04cb17d4b0ce 100644
  		goto drop;
  
 diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
-index 05c57f0fcabe..630434db0085 100644
+index 05c57f0fcabe..811286a6aa9c 100644
 --- a/net/ipv4/Kconfig
 +++ b/net/ipv4/Kconfig
-@@ -556,6 +556,30 @@ config TCP_CONG_ILLINOIS
+@@ -556,6 +556,38 @@ config TCP_CONG_ILLINOIS
  	For further details see:
  	  http://www.ews.uiuc.edu/~shaoliu/tcpillinois/index.html
  
@@ -2603,10 +2603,18 @@ index 05c57f0fcabe..630434db0085 100644
 +	wVegas congestion control for MPTCP
 +	To enable it, just put 'wvegas' in tcp_congestion_control
 +
++config TCP_CONG_BALIA
++	tristate "MPTCP BALIA CONGESTION CONTROL"
++	depends on MPTCP
++	default n
++	---help---
++	Multipath TCP Balanced Linked Adaptation Congestion Control
++	To enable it, just put 'balia' in tcp_congestion_control
++
  choice
  	prompt "Default TCP congestion control"
  	default DEFAULT_CUBIC
-@@ -584,6 +608,15 @@ choice
+@@ -584,6 +616,18 @@ choice
  	config DEFAULT_WESTWOOD
  		bool "Westwood" if TCP_CONG_WESTWOOD=y
  
@@ -2619,15 +2627,19 @@ index 05c57f0fcabe..630434db0085 100644
 +	config DEFAULT_WVEGAS
 +		bool "Wvegas" if TCP_CONG_WVEGAS=y
 +
++	config DEFAULT_BALIA
++		bool "Balia" if TCP_CONG_BALIA=y
++
  	config DEFAULT_RENO
  		bool "Reno"
  
-@@ -605,6 +638,8 @@ config DEFAULT_TCP_CONG
+@@ -605,6 +649,9 @@ config DEFAULT_TCP_CONG
  	default "vegas" if DEFAULT_VEGAS
  	default "westwood" if DEFAULT_WESTWOOD
  	default "veno" if DEFAULT_VENO
 +	default "coupled" if DEFAULT_COUPLED
 +	default "wvegas" if DEFAULT_WVEGAS
++	default "balia" if DEFAULT_BALIA
  	default "reno" if DEFAULT_RENO
  	default "cubic"
  
@@ -7087,10 +7099,10 @@ index 000000000000..cdfc03adabf8
 +
 diff --git a/net/mptcp/Makefile b/net/mptcp/Makefile
 new file mode 100644
-index 000000000000..35561a7012e3
+index 000000000000..2feb3e873206
 --- /dev/null
 +++ b/net/mptcp/Makefile
-@@ -0,0 +1,20 @@
+@@ -0,0 +1,21 @@
 +#
 +## Makefile for MultiPath TCP support code.
 +#
@@ -7104,6 +7116,7 @@ index 000000000000..35561a7012e3
 +obj-$(CONFIG_TCP_CONG_COUPLED) += mptcp_coupled.o
 +obj-$(CONFIG_TCP_CONG_OLIA) += mptcp_olia.o
 +obj-$(CONFIG_TCP_CONG_WVEGAS) += mptcp_wvegas.o
++obj-$(CONFIG_TCP_CONG_BALIA) += mptcp_balia.o
 +obj-$(CONFIG_MPTCP_FULLMESH) += mptcp_fullmesh.o
 +obj-$(CONFIG_MPTCP_NDIFFPORTS) += mptcp_ndiffports.o
 +obj-$(CONFIG_MPTCP_BINDER) += mptcp_binder.o
@@ -7111,6 +7124,279 @@ index 000000000000..35561a7012e3
 +
 +mptcp-$(subst m,y,$(CONFIG_IPV6)) += mptcp_ipv6.o
 +
+diff --git a/net/mptcp/mptcp_balia.c b/net/mptcp/mptcp_balia.c
+new file mode 100644
+index 000000000000..5cc224d80b01
+--- /dev/null
++++ b/net/mptcp/mptcp_balia.c
+@@ -0,0 +1,267 @@
++/*
++ *	MPTCP implementation - Balia Congestion Control
++ *	(Balanced Linked Adaptation Algorithm)
++ *
++ *	Analysis, Design and Implementation:
++ *	Qiuyu Peng <qpeng@caltech.edu>
++ *	Anwar Walid <anwar@research.bell-labs.com>
++ *	Jaehyun Hwang <jh.hwang@alcatel-lucent.com>
++ *	Steven H. Low <slow@caltech.edu>
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#include <net/tcp.h>
++#include <net/mptcp.h>
++
++#include <linux/module.h>
++
++/* The variable 'rate' (i.e., x_r) will be scaled down
++ * e.g., from B/s to KB/s, MB/s, or GB/s
++ * if max_rate > 2^rate_scale_limit
++ */
++
++static int rate_scale_limit = 30;
++static int scale_num = 10;
++
++struct mptcp_balia {
++	u64	ai;
++	u64	md;
++	bool	forced_update;
++};
++
++static inline int mptcp_balia_sk_can_send(const struct sock *sk)
++{
++	return mptcp_sk_can_send(sk) && tcp_sk(sk)->srtt_us;
++}
++
++static inline u64 mptcp_get_ai(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->ai;
++}
++
++static inline void mptcp_set_ai(const struct sock *meta_sk, u64 ai)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->ai = ai;
++}
++
++static inline u64 mptcp_get_md(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->md;
++}
++
++static inline void mptcp_set_md(const struct sock *meta_sk, u64 md)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->md = md;
++}
++
++static inline u64 mptcp_balia_scale(u64 val, int scale)
++{
++	return (u64) val << scale;
++}
++
++static inline bool mptcp_get_forced(const struct sock *meta_sk)
++{
++	return ((struct mptcp_balia *)inet_csk_ca(meta_sk))->forced_update;
++}
++
++static inline void mptcp_set_forced(const struct sock *meta_sk, bool force)
++{
++	((struct mptcp_balia *)inet_csk_ca(meta_sk))->forced_update = force;
++}
++
++static void mptcp_balia_recalc_ai(const struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	const struct mptcp_cb *mpcb = tp->mpcb;
++	const struct sock *sub_sk;
++	int can_send = 0;
++	u64 max_rate = 0, rate = 0, sum_rate = 0;
++	u64 alpha = 0, ai = 0, md = 0;
++	int num_scale_down = 0;
++
++	if (!mpcb)
++		return;
++
++	/* Only one subflow left - fall back to normal reno-behavior */
++	if (mpcb->cnt_established <= 1)
++		goto exit;
++
++	/* Find max_rate first */
++	mptcp_for_each_sk(mpcb, sub_sk) {
++		struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++		u64 tmp;
++
++		if (!mptcp_balia_sk_can_send(sub_sk))
++			continue;
++
++		can_send++;
++
++		tmp = div_u64((u64)tp->mss_cache * sub_tp->snd_cwnd
++				* (USEC_PER_SEC << 3), sub_tp->srtt_us);
++		sum_rate += tmp;
++
++		if (tmp >= max_rate)
++			max_rate = tmp;
++	}
++
++	/* No subflow is able to send - we don't care anymore */
++	if (unlikely(!can_send))
++		goto exit;
++
++	rate = div_u64((u64)tp->mss_cache * tp->snd_cwnd *
++			(USEC_PER_SEC << 3), tp->srtt_us);
++	alpha = div64_u64(max_rate, rate);
++
++	/* Scale down max_rate from B/s to KB/s, MB/s, or GB/s
++	 * if max_rate is too high (i.e., >2^30)
++	 */
++	while (max_rate > mptcp_balia_scale(1, rate_scale_limit)) {
++		max_rate >>= scale_num;
++		num_scale_down++;
++	}
++
++	if (num_scale_down) {
++		sum_rate = 0;
++		mptcp_for_each_sk(mpcb, sub_sk) {
++			struct tcp_sock *sub_tp = tcp_sk(sub_sk);
++			u64 tmp;
++
++			tmp = div_u64((u64)tp->mss_cache * sub_tp->snd_cwnd
++				* (USEC_PER_SEC << 3), sub_tp->srtt_us);
++			tmp >>= (scale_num * num_scale_down);
++
++			sum_rate += tmp;
++		}
++		rate >>= (scale_num * num_scale_down);
++	}
++
++	/*	(sum_rate)^2 * 10 * w_r
++	 * ai = ------------------------------------
++	 *	(x_r + max_rate) * (4x_r + max_rate)
++	 */
++	sum_rate *= sum_rate;
++
++	ai = div64_u64(sum_rate * 10, rate + max_rate);
++	ai = div64_u64(ai * tp->snd_cwnd, (rate << 2) + max_rate);
++
++	if (unlikely(!ai))
++		ai = tp->snd_cwnd;
++
++	md = ((tp->snd_cwnd >> 1) * min(mptcp_balia_scale(alpha, scale_num),
++					mptcp_balia_scale(3, scale_num) >> 1))
++					>> scale_num;
++
++exit:
++	mptcp_set_ai(sk, ai);
++	mptcp_set_md(sk, md);
++}
++
++static void mptcp_balia_init(struct sock *sk)
++{
++	if (mptcp(tcp_sk(sk))) {
++		mptcp_set_forced(sk, 0);
++		mptcp_set_ai(sk, 0);
++		mptcp_set_md(sk, 0);
++	}
++}
++
++static void mptcp_balia_cwnd_event(struct sock *sk, enum tcp_ca_event event)
++{
++	if (event == CA_EVENT_COMPLETE_CWR || event == CA_EVENT_LOSS)
++		mptcp_balia_recalc_ai(sk);
++}
++
++static void mptcp_balia_set_state(struct sock *sk, u8 ca_state)
++{
++	if (!mptcp(tcp_sk(sk)))
++		return;
++
++	mptcp_set_forced(sk, 1);
++}
++
++static void mptcp_balia_cong_avoid(struct sock *sk, u32 ack, u32 acked)
++{
++	struct tcp_sock *tp = tcp_sk(sk);
++	const struct mptcp_cb *mpcb = tp->mpcb;
++	int snd_cwnd;
++
++	if (!mptcp(tp)) {
++		tcp_reno_cong_avoid(sk, ack, acked);
++		return;
++	}
++
++	if (!tcp_is_cwnd_limited(sk))
++		return;
++
++	if (tp->snd_cwnd <= tp->snd_ssthresh) {
++		/* In "safe" area, increase. */
++		tcp_slow_start(tp, acked);
++		mptcp_balia_recalc_ai(sk);
++		return;
++	}
++
++	if (mptcp_get_forced(mptcp_meta_sk(sk))) {
++		mptcp_balia_recalc_ai(sk);
++		mptcp_set_forced(sk, 0);
++	}
++
++	if (mpcb->cnt_established > 1)
++		snd_cwnd = (int) mptcp_get_ai(sk);
++	else
++		snd_cwnd = tp->snd_cwnd;
++
++	if (tp->snd_cwnd_cnt >= snd_cwnd) {
++		if (tp->snd_cwnd < tp->snd_cwnd_clamp) {
++			tp->snd_cwnd++;
++			mptcp_balia_recalc_ai(sk);
++		}
++
++		tp->snd_cwnd_cnt = 0;
++	} else {
++		tp->snd_cwnd_cnt++;
++	}
++}
++
++static u32 mptcp_balia_ssthresh(struct sock *sk)
++{
++	const struct tcp_sock *tp = tcp_sk(sk);
++	const struct mptcp_cb *mpcb = tp->mpcb;
++
++	if (unlikely(!mptcp(tp) || mpcb->cnt_established <= 1))
++		return tcp_reno_ssthresh(sk);
++	else
++		return max((u32)(tp->snd_cwnd - mptcp_get_md(sk)), 1U);
++}
++
++static struct tcp_congestion_ops mptcp_balia = {
++	.init		= mptcp_balia_init,
++	.ssthresh	= mptcp_balia_ssthresh,
++	.cong_avoid	= mptcp_balia_cong_avoid,
++	.cwnd_event	= mptcp_balia_cwnd_event,
++	.set_state	= mptcp_balia_set_state,
++	.owner		= THIS_MODULE,
++	.name		= "balia",
++};
++
++static int __init mptcp_balia_register(void)
++{
++	BUILD_BUG_ON(sizeof(struct mptcp_balia) > ICSK_CA_PRIV_SIZE);
++	return tcp_register_congestion_control(&mptcp_balia);
++}
++
++static void __exit mptcp_balia_unregister(void)
++{
++	tcp_unregister_congestion_control(&mptcp_balia);
++}
++
++module_init(mptcp_balia_register);
++module_exit(mptcp_balia_unregister);
++
++MODULE_AUTHOR("Jaehyun Hwang, Anwar Walid, Qiuyu Peng, Steven H. Low");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("MPTCP BALIA CONGESTION CONTROL ALGORITHM");
++MODULE_VERSION("0.1");
 diff --git a/net/mptcp/mptcp_binder.c b/net/mptcp/mptcp_binder.c
 new file mode 100644
 index 000000000000..95d8da560715
@@ -10289,10 +10575,10 @@ index 000000000000..28dfa0479f5e
 +}
 diff --git a/net/mptcp/mptcp_fullmesh.c b/net/mptcp/mptcp_fullmesh.c
 new file mode 100644
-index 000000000000..3a54413ce25b
+index 000000000000..2e4895c9e49c
 --- /dev/null
 +++ b/net/mptcp/mptcp_fullmesh.c
-@@ -0,0 +1,1722 @@
+@@ -0,0 +1,1730 @@
 +#include <linux/module.h>
 +
 +#include <net/mptcp.h>
@@ -11282,10 +11568,10 @@ index 000000000000..3a54413ce25b
 +static int inet6_addr_event(struct notifier_block *this,
 +				     unsigned long event, void *ptr);
 +
-+static int ipv6_is_in_dad_state(const struct inet6_ifaddr *ifa)
++static bool ipv6_dad_finished(const struct inet6_ifaddr *ifa)
 +{
-+	return (ifa->flags & IFA_F_TENTATIVE) &&
-+	       ifa->state == INET6_IFADDR_STATE_DAD;
++	return !(ifa->flags & IFA_F_TENTATIVE) ||
++	       ifa->state > INET6_IFADDR_STATE_DAD;
 +}
 +
 +static void dad_init_timer(struct mptcp_dad_data *data,
@@ -11304,14 +11590,22 @@ index 000000000000..3a54413ce25b
 +{
 +	struct mptcp_dad_data *data = (struct mptcp_dad_data *)arg;
 +
-+	if (ipv6_is_in_dad_state(data->ifa)) {
++	/* DAD failed or IP brought down? */
++	if (data->ifa->state == INET6_IFADDR_STATE_ERRDAD ||
++	    data->ifa->state == INET6_IFADDR_STATE_DEAD)
++		goto exit;
++
++	if (!ipv6_dad_finished(data->ifa)) {
 +		dad_init_timer(data, data->ifa);
 +		add_timer(&data->timer);
-+	} else {
-+		inet6_addr_event(NULL, NETDEV_UP, data->ifa);
-+		in6_ifa_put(data->ifa);
-+		kfree(data);
++		return;
 +	}
++
++	inet6_addr_event(NULL, NETDEV_UP, data->ifa);
++
++exit:
++	in6_ifa_put(data->ifa);
++	kfree(data);
 +}
 +
 +static inline void dad_setup_timer(struct inet6_ifaddr *ifa)
@@ -11376,7 +11670,7 @@ index 000000000000..3a54413ce25b
 +	      event == NETDEV_CHANGE))
 +		return NOTIFY_DONE;
 +
-+	if (ipv6_is_in_dad_state(ifa6))
++	if (!ipv6_dad_finished(ifa6))
 +		dad_setup_timer(ifa6);
 +	else
 +		addr6_event_handler(ifa6, event, net);
