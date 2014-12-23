@@ -57,6 +57,10 @@ if ($rel > 1) {
         @log_lines = `$cmd`;
     }
 }
+else {
+    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$tag;
+    @log_lines = `$cmd`;
+}
 
 
 #if ($rel > 1) {
