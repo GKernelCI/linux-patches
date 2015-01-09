@@ -1,52 +1,58 @@
-From 9204dcb026a40cd2cb4310fecf788924d0fbec8d Mon Sep 17 00:00:00 2001
+From 7f87efae9622a8be88fa7e7a705ea26a1342ea47 Mon Sep 17 00:00:00 2001
 From: Mauro Andreolini <mauro.andreolini@unimore.it>
-Date: Fri, 14 Jun 2013 13:46:47 +0200
-Subject: [PATCH 3/3] block, bfq: add Early Queue Merge (EQM) to BFQ-v6r2 for
+Date: Fri, 19 Dec 2014 20:09:48 +0100
+Subject: [PATCH 3/3] block, bfq: add Early Queue Merge (EQM) to BFQ-v7r7 for
  3.10.0
 
-A set of processes may happen  to  perform interleaved reads, i.e., requests
-whose union would give rise to a  sequential read  pattern.  There   are two
-typical  cases: in the first  case,   processes  read  fixed-size  chunks of
+A set of processes may happen  to  perform interleaved reads, i.e.,requests
+whose union would give rise to a  sequential read  pattern.  There are two
+typical  cases: in the first  case,   processes  read  fixed-size chunks of
 data at a fixed distance from each other, while in the second case processes
 may read variable-size chunks at  variable distances. The latter case occurs
-for  example with  KVM, which  splits the  I/O generated  by the  guest into
+for  example with  QEMU, which  splits the  I/O generated  by the  guest into
 multiple chunks,  and lets these chunks  be served by a  pool of cooperating
-processes,  iteratively  assigning  the  next  chunk of  I/O  to  the  first
-available  process. CFQ  uses actual  queue merging  for the  first type  of
-processes, whereas it  uses preemption to get a sequential  read pattern out
+processes,  iteratively  assigning  the  next  chunk of  I/O  to  the first
+available  process. CFQ  uses actual  queue merging  for the  first type of
+rocesses, whereas it  uses preemption to get a sequential  read pattern out
 of the read requests  performed by the second type of  processes. In the end
-it uses  two different  mechanisms to  achieve the  same goal:  boosting the
+it uses  two different  mechanisms to  achieve the  same goal: boosting the
 throughput with interleaved I/O.
 
 This patch introduces  Early Queue Merge (EQM), a unified mechanism to get a
-sequential  read pattern  with both  types of  processes. The  main idea  is
+sequential  read pattern  with both  types of  processes. The  main idea is
 checking newly arrived requests against the next request of the active queue
 both in case of actual request insert and in case of request merge. By doing
 so, both the types of processes can be handled by just merging their queues.
-EQM is  then simpler and  more compact than the  pair of mechanisms  used in
+EQM is  then simpler and  more compact than the  pair of mechanisms used in
 CFQ.
 
-Finally, EQM  also preserves the  typical low-latency properties of  BFQ, by
+Finally, EQM  also preserves the  typical low-latency properties of BFQ, by
 properly restoring the weight-raising state of  a queue when it gets back to
 a non-merged state.
 
 Signed-off-by: Mauro Andreolini <mauro.andreolini@unimore.it>
 Signed-off-by: Arianna Avanzini <avanzini.arianna@gmail.com>
-Reviewed-by: Paolo Valente <paolo.valente@unimore.it>
+Signed-off-by: Paolo Valente <paolo.valente@unimore.it>
 ---
- block/bfq-iosched.c | 653 ++++++++++++++++++++++++++++++++++++----------------
- block/bfq-sched.c   |  28 ---
- block/bfq.h         |  16 ++
- 3 files changed, 466 insertions(+), 231 deletions(-)
+ block/bfq-iosched.c | 751 +++++++++++++++++++++++++++++++++++++---------------
+ block/bfq-sched.c   |  28 --
+ block/bfq.h         |  54 +++-
+ 3 files changed, 581 insertions(+), 252 deletions(-)
 
 diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
-index b230927..bc57923 100644
+index 9de51e3..e0d5c63 100644
 --- a/block/bfq-iosched.c
 +++ b/block/bfq-iosched.c
-@@ -444,6 +444,43 @@ static inline unsigned int bfq_wrais_duration(struct bfq_data *bfqd)
+@@ -571,6 +571,57 @@ static inline unsigned int bfq_wr_duration(struct bfq_data *bfqd)
  	return dur;
  }
  
++static inline unsigned
++bfq_bfqq_cooperations(struct bfq_queue *bfqq)
++{
++	return bfqq->bic ? bfqq->bic->cooperations : 0;
++}
++
 +static inline void
 +bfq_bfqq_resume_state(struct bfq_queue *bfqq, struct bfq_io_cq *bic)
 +{
@@ -54,26 +60,34 @@ index b230927..bc57923 100644
 +		bfq_mark_bfqq_idle_window(bfqq);
 +	else
 +		bfq_clear_bfqq_idle_window(bfqq);
-+	if (bic->raising_time_left && bfqq->bfqd->low_latency) {
++	if (bic->saved_IO_bound)
++		bfq_mark_bfqq_IO_bound(bfqq);
++	else
++		bfq_clear_bfqq_IO_bound(bfqq);
++	/* Assuming that the flag in_large_burst is already correctly set */
++	if (bic->wr_time_left && bfqq->bfqd->low_latency &&
++	    !bfq_bfqq_in_large_burst(bfqq) &&
++	    bic->cooperations < bfqq->bfqd->bfq_coop_thresh) {
 +		/*
 +		 * Start a weight raising period with the duration given by
 +		 * the raising_time_left snapshot.
 +		 */
-+		bfqq->raising_coeff = bfqq->bfqd->bfq_raising_coeff;
-+		bfqq->raising_cur_max_time = bic->raising_time_left;
-+		bfqq->last_rais_start_finish = jiffies;
++		if (bfq_bfqq_busy(bfqq))
++			bfqq->bfqd->wr_busy_queues++;
++		bfqq->wr_coeff = bfqq->bfqd->bfq_wr_coeff;
++		bfqq->wr_cur_max_time = bic->wr_time_left;
++		bfqq->last_wr_start_finish = jiffies;
++		bfqq->entity.ioprio_changed = 1;
 +	}
 +	/*
-+	 * Clear raising_time_left to prevent bfq_bfqq_save_state() from
++	 * Clear wr_time_left to prevent bfq_bfqq_save_state() from
 +	 * getting confused about the queue's need of a weight-raising
 +	 * period.
 +	 */
-+	bic->raising_time_left = 0;
++	bic->wr_time_left = 0;
 +}
 +
-+/*
-+ * Must be called with the queue_lock held.
-+ */
++/* Must be called with the queue_lock held. */
 +static int bfqq_process_refs(struct bfq_queue *bfqq)
 +{
 +	int process_refs, io_refs;
@@ -84,11 +98,36 @@ index b230927..bc57923 100644
 +	return process_refs;
 +}
 +
- static void bfq_add_rq_rb(struct request *rq)
- {
- 	struct bfq_queue *bfqq = RQ_BFQQ(rq);
-@@ -483,11 +520,20 @@ static void bfq_add_rq_rb(struct request *rq)
- 		if (! bfqd->low_latency)
+ /* Empty burst list and add just bfqq (see comments to bfq_handle_burst) */
+ static inline void bfq_reset_burst_list(struct bfq_data *bfqd,
+ 					struct bfq_queue *bfqq)
+@@ -815,7 +866,7 @@ static void bfq_add_request(struct request *rq)
+ 		bfq_rq_pos_tree_add(bfqd, bfqq);
+ 
+ 	if (!bfq_bfqq_busy(bfqq)) {
+-		bool soft_rt,
++		bool soft_rt, coop_or_in_burst,
+ 		     idle_for_long_time = time_is_before_jiffies(
+ 						bfqq->budget_timeout +
+ 						bfqd->bfq_wr_min_idle_time);
+@@ -839,11 +890,12 @@ static void bfq_add_request(struct request *rq)
+ 				bfqd->last_ins_in_burst = jiffies;
+ 		}
+ 
++		coop_or_in_burst = bfq_bfqq_in_large_burst(bfqq) ||
++			bfq_bfqq_cooperations(bfqq) >= bfqd->bfq_coop_thresh;
+ 		soft_rt = bfqd->bfq_wr_max_softrt_rate > 0 &&
+-			!bfq_bfqq_in_large_burst(bfqq) &&
++			!coop_or_in_burst &&
+ 			time_is_before_jiffies(bfqq->soft_rt_next_start);
+-		interactive = !bfq_bfqq_in_large_burst(bfqq) &&
+-			      idle_for_long_time;
++		interactive = !coop_or_in_burst && idle_for_long_time;
+ 		entity->budget = max_t(unsigned long, bfqq->max_budget,
+ 				       bfq_serv_to_charge(next_rq, bfqq));
+ 
+@@ -862,11 +914,20 @@ static void bfq_add_request(struct request *rq)
+ 		if (!bfqd->low_latency)
  			goto add_bfqq_busy;
  
 +		if (bfq_bfqq_just_split(bfqq))
@@ -105,21 +144,61 @@ index b230927..bc57923 100644
 +		 *   requests have not been redirected to a shared queue)
 +		 * start a weight-raising period.
  		 */
--		if(old_raising_coeff == 1 && (idle_for_long_time || soft_rt)) {
-+		if(old_raising_coeff == 1 && (idle_for_long_time || soft_rt) &&
-+		   (!bfq_bfqq_sync(bfqq) || bfqq->bic != NULL)) {
- 			bfqq->raising_coeff = bfqd->bfq_raising_coeff;
- 			if (idle_for_long_time)
- 				bfqq->raising_cur_max_time =
-@@ -517,6 +563,7 @@ static void bfq_add_rq_rb(struct request *rq)
- 						raising_cur_max_time));
- 				}
+-		if (old_wr_coeff == 1 && (interactive || soft_rt)) {
++		if (old_wr_coeff == 1 && (interactive || soft_rt) &&
++		    (!bfq_bfqq_sync(bfqq) || bfqq->bic != NULL)) {
+ 			bfqq->wr_coeff = bfqd->bfq_wr_coeff;
+ 			if (interactive)
+ 				bfqq->wr_cur_max_time = bfq_wr_duration(bfqd);
+@@ -880,7 +941,7 @@ static void bfq_add_request(struct request *rq)
+ 		} else if (old_wr_coeff > 1) {
+ 			if (interactive)
+ 				bfqq->wr_cur_max_time = bfq_wr_duration(bfqd);
+-			else if (bfq_bfqq_in_large_burst(bfqq) ||
++			else if (coop_or_in_burst ||
+ 				 (bfqq->wr_cur_max_time ==
+ 				  bfqd->bfq_wr_rt_max_time &&
+ 				  !soft_rt)) {
+@@ -899,18 +960,18 @@ static void bfq_add_request(struct request *rq)
+ 				/*
+ 				 *
+ 				 * The remaining weight-raising time is lower
+-				 * than bfqd->bfq_wr_rt_max_time, which
+-				 * means that the application is enjoying
+-				 * weight raising either because deemed soft-
+-				 * rt in the near past, or because deemed
+-				 * interactive a long ago. In both cases,
+-				 * resetting now the current remaining weight-
+-				 * raising time for the application to the
+-				 * weight-raising duration for soft rt
+-				 * applications would not cause any latency
+-				 * increase for the application (as the new
+-				 * duration would be higher than the remaining
+-				 * time).
++				 * than bfqd->bfq_wr_rt_max_time, which means
++				 * that the application is enjoying weight
++				 * raising either because deemed soft-rt in
++				 * the near past, or because deemed interactive
++				 * a long ago.
++				 * In both cases, resetting now the current
++				 * remaining weight-raising time for the
++				 * application to the weight-raising duration
++				 * for soft rt applications would not cause any
++				 * latency increase for the application (as the
++				 * new duration would be higher than the
++				 * remaining time).
+ 				 *
+ 				 * In addition, the application is now meeting
+ 				 * the requirements for being deemed soft rt.
+@@ -945,6 +1006,7 @@ static void bfq_add_request(struct request *rq)
+ 					bfqd->bfq_wr_rt_max_time;
+ 			}
  		}
 +set_ioprio_changed:
- 		if (old_raising_coeff != bfqq->raising_coeff)
+ 		if (old_wr_coeff != bfqq->wr_coeff)
  			entity->ioprio_changed = 1;
  add_bfqq_busy:
-@@ -695,89 +742,35 @@ static void bfq_end_raising(struct bfq_data *bfqd)
+@@ -1156,90 +1218,35 @@ static void bfq_end_wr(struct bfq_data *bfqd)
  	spin_unlock_irq(bfqd->queue->queue_lock);
  }
  
@@ -150,8 +229,8 @@ index b230927..bc57923 100644
 -	return bfqq == RQ_BFQQ(rq);
 -}
 -
--static void __bfq_set_active_queue(struct bfq_data *bfqd,
--				   struct bfq_queue *bfqq)
+-static void __bfq_set_in_service_queue(struct bfq_data *bfqd,
+-				       struct bfq_queue *bfqq)
 -{
 -	if (bfqq != NULL) {
 -		bfq_mark_bfqq_must_alloc(bfqq);
@@ -160,18 +239,19 @@ index b230927..bc57923 100644
 -
 -		bfqd->budgets_assigned = (bfqd->budgets_assigned*7 + 256) / 8;
 -
--		bfq_log_bfqq(bfqd, bfqq, "set_active_queue, cur-budget = %lu",
+-		bfq_log_bfqq(bfqd, bfqq,
+-			     "set_in_service_queue, cur-budget = %lu",
 -			     bfqq->entity.budget);
 -	}
 -
--	bfqd->active_queue = bfqq;
+-	bfqd->in_service_queue = bfqq;
 -}
 -
 -/*
-- * Get and set a new active queue for service.
+- * Get and set a new queue for service.
 - */
--static struct bfq_queue *bfq_set_active_queue(struct bfq_data *bfqd,
--					      struct bfq_queue *bfqq)
+-static struct bfq_queue *bfq_set_in_service_queue(struct bfq_data *bfqd,
+-						  struct bfq_queue *bfqq)
 -{
 -	if (!bfqq)
 -		bfqq = bfq_get_next_queue(bfqd);
@@ -180,7 +260,7 @@ index b230927..bc57923 100644
  	else
 -		bfq_get_next_queue_forced(bfqd, bfqq);
 -
--	__bfq_set_active_queue(bfqd, bfqq);
+-	__bfq_set_in_service_queue(bfqd, bfqq);
 -	return bfqq;
 +		return ((struct bio *)io_struct)->bi_sector;
  }
@@ -223,8 +303,8 @@ index b230927..bc57923 100644
  
  	if (RB_EMPTY_ROOT(root))
  		return NULL;
-@@ -796,7 +789,7 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
- 	 * position).
+@@ -1258,7 +1265,7 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
+ 	 * next_request position).
  	 */
  	__bfqq = rb_entry(parent, struct bfq_queue, pos_node);
 -	if (bfq_rq_close(bfqd, __bfqq->next_rq))
@@ -232,7 +312,7 @@ index b230927..bc57923 100644
  		return __bfqq;
  
  	if (blk_rq_pos(__bfqq->next_rq) < sector)
-@@ -807,7 +800,7 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
+@@ -1269,7 +1276,7 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
  		return NULL;
  
  	__bfqq = rb_entry(node, struct bfq_queue, pos_node);
@@ -241,7 +321,7 @@ index b230927..bc57923 100644
  		return __bfqq;
  
  	return NULL;
-@@ -816,14 +809,12 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
+@@ -1278,14 +1285,12 @@ static struct bfq_queue *bfqq_close(struct bfq_data *bfqd)
  /*
   * bfqd - obvious
   * cur_bfqq - passed in so that we don't decide that the current queue
@@ -260,7 +340,7 @@ index b230927..bc57923 100644
  {
  	struct bfq_queue *bfqq;
  
-@@ -843,7 +834,7 @@ static struct bfq_queue *bfq_close_cooperator(struct bfq_data *bfqd,
+@@ -1305,7 +1310,7 @@ static struct bfq_queue *bfq_close_cooperator(struct bfq_data *bfqd,
  	 * working closely on the same area of the disk. In that case,
  	 * we can group them together and don't waste time idling.
  	 */
@@ -269,7 +349,7 @@ index b230927..bc57923 100644
  	if (bfqq == NULL || bfqq == cur_bfqq)
  		return NULL;
  
-@@ -870,6 +861,275 @@ static struct bfq_queue *bfq_close_cooperator(struct bfq_data *bfqd,
+@@ -1332,6 +1337,315 @@ static struct bfq_queue *bfq_close_cooperator(struct bfq_data *bfqd,
  	return bfqq;
  }
  
@@ -308,23 +388,26 @@ index b230927..bc57923 100644
 +		new_bfqq->pid);
 +
 +	/*
-+	 * Merging is just a redirection: the requests of the process owning
-+	 * one of the two queues are redirected to the other queue. The latter
-+	 * queue, in its turn, is set as shared if this is the first time that
-+	 * the requests of some process are redirected to it.
++	 * Merging is just a redirection: the requests of the process
++	 * owning one of the two queues are redirected to the other queue.
++	 * The latter queue, in its turn, is set as shared if this is the
++	 * first time that the requests of some process are redirected to
++	 * it.
 +	 *
 +	 * We redirect bfqq to new_bfqq and not the opposite, because we
-+	 * are in the context of the process owning bfqq, hence we have the
-+	 * io_cq of this process. So we can immediately configure this io_cq
-+	 * to redirect the requests of the process to new_bfqq.
++	 * are in the context of the process owning bfqq, hence we have
++	 * the io_cq of this process. So we can immediately configure this
++	 * io_cq to redirect the requests of the process to new_bfqq.
 +	 *
-+	 * NOTE, even if new_bfqq coincides with the active queue, the io_cq of
-+	 * new_bfqq is not available, because, if the active queue is shared,
-+	 * bfqd->active_bic may not point to the io_cq of the active queue.
-+	 * Redirecting the requests of the process owning bfqq to the currently
-+	 * active queue is in any case the best option, as we feed the active queue
-+	 * with new requests close to the last request served and, by doing so,
-+	 * hopefully increase the throughput.
++	 * NOTE, even if new_bfqq coincides with the in-service queue, the
++	 * io_cq of new_bfqq is not available, because, if the in-service
++	 * queue is shared, bfqd->in_service_bic may not point to the
++	 * io_cq of the in-service queue.
++	 * Redirecting the requests of the process owning bfqq to the
++	 * currently in-service queue is in any case the best option, as
++	 * we feed the in-service queue with new requests close to the
++	 * last request served and, by doing so, hopefully increase the
++	 * throughput.
 +	 */
 +	bfqq->new_bfqq = new_bfqq;
 +	atomic_add(process_refs, &new_bfqq->ref);
@@ -332,41 +415,52 @@ index b230927..bc57923 100644
 +}
 +
 +/*
-+ * Attempt to schedule a merge of bfqq with the currently active queue or
-+ * with a close queue among the scheduled queues.
++ * Attempt to schedule a merge of bfqq with the currently in-service queue
++ * or with a close queue among the scheduled queues.
 + * Return NULL if no merge was scheduled, a pointer to the shared bfq_queue
 + * structure otherwise.
++ *
++ * The OOM queue is not allowed to participate to cooperation: in fact, since
++ * the requests temporarily redirected to the OOM queue could be redirected
++ * again to dedicated queues at any time, the state needed to correctly
++ * handle merging with the OOM queue would be quite complex and expensive
++ * to maintain. Besides, in such a critical condition as an out of memory,
++ * the benefits of queue merging may be little relevant, or even negligible.
 + */
 +static struct bfq_queue *
 +bfq_setup_cooperator(struct bfq_data *bfqd, struct bfq_queue *bfqq,
 +		     void *io_struct, bool request)
 +{
-+	struct bfq_queue *active_bfqq, *new_bfqq;
++	struct bfq_queue *in_service_bfqq, *new_bfqq;
 +
 +	if (bfqq->new_bfqq)
 +		return bfqq->new_bfqq;
 +
-+	if (!io_struct)
++	if (!io_struct || unlikely(bfqq == &bfqd->oom_bfqq))
 +		return NULL;
 +
-+	active_bfqq = bfqd->active_queue;
++	in_service_bfqq = bfqd->in_service_queue;
 +
-+	if (active_bfqq == NULL || active_bfqq == bfqq || !bfqd->active_bic)
++	if (in_service_bfqq == NULL || in_service_bfqq == bfqq ||
++	    !bfqd->in_service_bic ||
++	    unlikely(in_service_bfqq == &bfqd->oom_bfqq))
 +		goto check_scheduled;
 +
-+	if (bfq_class_idle(active_bfqq) || bfq_class_idle(bfqq))
++	if (bfq_class_idle(in_service_bfqq) || bfq_class_idle(bfqq))
 +		goto check_scheduled;
 +
-+	if (bfq_class_rt(active_bfqq) != bfq_class_rt(bfqq))
++	if (bfq_class_rt(in_service_bfqq) != bfq_class_rt(bfqq))
 +		goto check_scheduled;
 +
-+	if (active_bfqq->entity.parent != bfqq->entity.parent)
++	if (in_service_bfqq->entity.parent != bfqq->entity.parent)
 +		goto check_scheduled;
 +
 +	if (bfq_rq_close_to_sector(io_struct, request, bfqd->last_position) &&
-+	    bfq_bfqq_sync(active_bfqq) && bfq_bfqq_sync(bfqq))
-+		if ((new_bfqq = bfq_setup_merge(bfqq, active_bfqq)))
-+			return new_bfqq; /* Merge with the active queue */
++	    bfq_bfqq_sync(in_service_bfqq) && bfq_bfqq_sync(bfqq)) {
++		new_bfqq = bfq_setup_merge(bfqq, in_service_bfqq);
++		if (new_bfqq != NULL)
++			return new_bfqq; /* Merge with in-service queue */
++	}
 +
 +	/*
 +	 * Check whether there is a cooperator among currently scheduled
@@ -376,7 +470,7 @@ index b230927..bc57923 100644
 +check_scheduled:
 +	new_bfqq = bfq_close_cooperator(bfqd, bfqq,
 +					bfq_io_struct_pos(io_struct, request));
-+	if (new_bfqq)
++	if (new_bfqq && likely(new_bfqq != &bfqd->oom_bfqq))
 +		return bfq_setup_merge(bfqq, new_bfqq);
 +
 +	return NULL;
@@ -392,41 +486,46 @@ index b230927..bc57923 100644
 +	 */
 +	if (bfqq->bic == NULL)
 +		return;
-+	if (bfqq->bic->raising_time_left)
++	if (bfqq->bic->wr_time_left)
 +		/*
 +		 * This is the queue of a just-started process, and would
-+		 * deserve weight raising: we set raising_time_left to the full
-+		 * weight-raising duration to trigger weight-raising when and
-+		 * if the queue is split and the first request of the queue
-+		 * is enqueued.
++		 * deserve weight raising: we set wr_time_left to the full
++		 * weight-raising duration to trigger weight-raising when
++		 * and if the queue is split and the first request of the
++		 * queue is enqueued.
 +		 */
-+		bfqq->bic->raising_time_left = bfq_wrais_duration(bfqq->bfqd);
-+	else if (bfqq->raising_coeff > 1) {
-+		unsigned long wrais_duration =
-+			jiffies - bfqq->last_rais_start_finish;
++		bfqq->bic->wr_time_left = bfq_wr_duration(bfqq->bfqd);
++	else if (bfqq->wr_coeff > 1) {
++		unsigned long wr_duration =
++			jiffies - bfqq->last_wr_start_finish;
 +		/*
 +		 * It may happen that a queue's weight raising period lasts
-+		 * longer than its raising_cur_max_time, as weight raising is
++		 * longer than its wr_cur_max_time, as weight raising is
 +		 * handled only when a request is enqueued or dispatched (it
 +		 * does not use any timer). If the weight raising period is
 +		 * about to end, don't save it.
 +		 */
-+		if (bfqq->raising_cur_max_time <= wrais_duration)
-+			bfqq->bic->raising_time_left = 0;
++		if (bfqq->wr_cur_max_time <= wr_duration)
++			bfqq->bic->wr_time_left = 0;
 +		else
-+			bfqq->bic->raising_time_left =
-+				bfqq->raising_cur_max_time - wrais_duration;
++			bfqq->bic->wr_time_left =
++				bfqq->wr_cur_max_time - wr_duration;
 +		/*
 +		 * The bfq_queue is becoming shared or the requests of the
 +		 * process owning the queue are being redirected to a shared
 +		 * queue. Stop the weight raising period of the queue, as in
-+		 * both cases it should not be owned by an interactive or soft
-+		 * real-time application.
++		 * both cases it should not be owned by an interactive or
++		 * soft real-time application.
 +		 */
-+		bfq_bfqq_end_raising(bfqq);
++		bfq_bfqq_end_wr(bfqq);
 +	} else
-+		bfqq->bic->raising_time_left = 0;
++		bfqq->bic->wr_time_left = 0;
 +	bfqq->bic->saved_idle_window = bfq_bfqq_idle_window(bfqq);
++	bfqq->bic->saved_IO_bound = bfq_bfqq_IO_bound(bfqq);
++	bfqq->bic->saved_in_large_burst = bfq_bfqq_in_large_burst(bfqq);
++	bfqq->bic->was_in_burst_list = !hlist_unhashed(&bfqq->burst_list_node);
++	bfqq->bic->cooperations++;
++	bfqq->bic->failed_cooperations = 0;
 +}
 +
 +static inline void
@@ -442,35 +541,52 @@ index b230927..bc57923 100644
 +
 +static void
 +bfq_merge_bfqqs(struct bfq_data *bfqd, struct bfq_io_cq *bic,
-+                struct bfq_queue *bfqq, struct bfq_queue *new_bfqq)
++		struct bfq_queue *bfqq, struct bfq_queue *new_bfqq)
 +{
-+        bfq_log_bfqq(bfqd, bfqq, "merging with queue %lu",
++	bfq_log_bfqq(bfqd, bfqq, "merging with queue %lu",
 +		(long unsigned)new_bfqq->pid);
 +	/* Save weight raising and idle window of the merged queues */
 +	bfq_bfqq_save_state(bfqq);
 +	bfq_bfqq_save_state(new_bfqq);
++	if (bfq_bfqq_IO_bound(bfqq))
++		bfq_mark_bfqq_IO_bound(new_bfqq);
++	bfq_clear_bfqq_IO_bound(bfqq);
 +	/*
 +	 * Grab a reference to the bic, to prevent it from being destroyed
 +	 * before being possibly touched by a bfq_split_bfqq().
 +	 */
 +	bfq_get_bic_reference(bfqq);
 +	bfq_get_bic_reference(new_bfqq);
-+	/* Merge queues (that is, let bic redirect its requests to new_bfqq) */
-+        bic_set_bfqq(bic, new_bfqq, 1);
-+        bfq_mark_bfqq_coop(new_bfqq);
 +	/*
-+	 * new_bfqq now belongs to at least two bics (it is a shared queue): set
-+	 * new_bfqq->bic to NULL. bfqq either:
++	 * Merge queues (that is, let bic redirect its requests to new_bfqq)
++	 */
++	bic_set_bfqq(bic, new_bfqq, 1);
++	bfq_mark_bfqq_coop(new_bfqq);
++	/*
++	 * new_bfqq now belongs to at least two bics (it is a shared queue):
++	 * set new_bfqq->bic to NULL. bfqq either:
 +	 * - does not belong to any bic any more, and hence bfqq->bic must
 +	 *   be set to NULL, or
 +	 * - is a queue whose owning bics have already been redirected to a
-+	 *   different queue, hence the queue is destined to not belong to any
-+	 *   bic soon and bfqq->bic is already NULL (therefore the next
++	 *   different queue, hence the queue is destined to not belong to
++	 *   any bic soon and bfqq->bic is already NULL (therefore the next
 +	 *   assignment causes no harm).
 +	 */
 +	new_bfqq->bic = NULL;
 +	bfqq->bic = NULL;
-+        bfq_put_queue(bfqq);
++	bfq_put_queue(bfqq);
++}
++
++static inline void bfq_bfqq_increase_failed_cooperations(struct bfq_queue *bfqq)
++{
++	struct bfq_io_cq *bic = bfqq->bic;
++	struct bfq_data *bfqd = bfqq->bfqd;
++
++	if (bic && bfq_bfqq_cooperations(bfqq) >= bfqd->bfq_coop_thresh) {
++		bic->failed_cooperations++;
++		if (bic->failed_cooperations >= bfqd->bfq_failed_cooperations)
++			bic->cooperations = 0;
++	}
 +}
 +
 +static int bfq_allow_merge(struct request_queue *q, struct request *rq,
@@ -500,22 +616,25 @@ index b230927..bc57923 100644
 +	 * We take advantage of this function to perform an early merge
 +	 * of the queues of possible cooperating processes.
 +	 */
-+	if (bfqq != NULL &&
-+	    (new_bfqq = bfq_setup_cooperator(bfqd, bfqq, bio, false))) {
-+		bfq_merge_bfqqs(bfqd, bic, bfqq, new_bfqq);
-+		/*
-+		 * If we get here, the bio will be queued in the shared queue,
-+		 * i.e., new_bfqq, so use new_bfqq to decide whether bio and
-+		 * rq can be merged.
-+		 */
-+		bfqq = new_bfqq;
++	if (bfqq != NULL) {
++		new_bfqq = bfq_setup_cooperator(bfqd, bfqq, bio, false);
++		if (new_bfqq != NULL) {
++			bfq_merge_bfqqs(bfqd, bic, bfqq, new_bfqq);
++			/*
++			 * If we get here, the bio will be queued in the
++			 * shared queue, i.e., new_bfqq, so use new_bfqq
++			 * to decide whether bio and rq can be merged.
++			 */
++			bfqq = new_bfqq;
++		} else
++			bfq_bfqq_increase_failed_cooperations(bfqq);
 +	}
 +
 +	return bfqq == RQ_BFQQ(rq);
 +}
 +
-+static void __bfq_set_active_queue(struct bfq_data *bfqd,
-+				   struct bfq_queue *bfqq)
++static void __bfq_set_in_service_queue(struct bfq_data *bfqd,
++				       struct bfq_queue *bfqq)
 +{
 +	if (bfqq != NULL) {
 +		bfq_mark_bfqq_must_alloc(bfqq);
@@ -524,34 +643,33 @@ index b230927..bc57923 100644
 +
 +		bfqd->budgets_assigned = (bfqd->budgets_assigned*7 + 256) / 8;
 +
-+		bfq_log_bfqq(bfqd, bfqq, "set_active_queue, cur-budget = %lu",
++		bfq_log_bfqq(bfqd, bfqq,
++			     "set_in_service_queue, cur-budget = %lu",
 +			     bfqq->entity.budget);
 +	}
 +
-+	bfqd->active_queue = bfqq;
++	bfqd->in_service_queue = bfqq;
 +}
 +
 +/*
-+ * Get and set a new active queue for service.
++ * Get and set a new queue for service.
 + */
-+static struct bfq_queue *bfq_set_active_queue(struct bfq_data *bfqd)
++static struct bfq_queue *bfq_set_in_service_queue(struct bfq_data *bfqd)
 +{
 +	struct bfq_queue *bfqq = bfq_get_next_queue(bfqd);
 +
-+	__bfq_set_active_queue(bfqd, bfqq);
++	__bfq_set_in_service_queue(bfqd, bfqq);
 +	return bfqq;
 +}
 +
  /*
   * If enough samples have been computed, return the current max budget
   * stored in bfqd, which is dynamically updated according to the
-@@ -1017,63 +1277,6 @@ static struct request *bfq_check_fifo(struct bfq_queue *bfqq)
+@@ -1475,61 +1789,6 @@ static struct request *bfq_check_fifo(struct bfq_queue *bfqq)
  	return rq;
  }
  
--/*
-- * Must be called with the queue_lock held.
-- */
+-/* Must be called with the queue_lock held. */
 -static int bfqq_process_refs(struct bfq_queue *bfqq)
 -{
 -	int process_refs, io_refs;
@@ -609,31 +727,7 @@ index b230927..bc57923 100644
  static inline unsigned long bfq_bfqq_budget_left(struct bfq_queue *bfqq)
  {
  	struct bfq_entity *entity = &bfqq->entity;
-@@ -1493,6 +1696,14 @@ static inline int bfq_may_expire_for_budg_timeout(struct bfq_queue *bfqq)
-  *   is likely to boost the disk throughput);
-  * - the queue is weight-raised (waiting for the request is necessary for
-  *   providing the queue with fairness and latency guarantees).
-+ *
-+ * In any case, idling can be disabled for cooperation issues, if
-+ * 1) there is a close cooperator for the queue, or
-+ * 2) the queue is shared and some cooperator is likely to be idle (in this
-+ *    case, by not arming the idle timer, we try to slow down the queue, to
-+ *    prevent the zones of the disk accessed by the active cooperators to
-+ *    become too distant from the zone that will be accessed by the currently
-+ *    idle cooperators).
-  */
- static inline bool bfq_bfqq_must_idle(struct bfq_queue *bfqq,
- 				      int budg_timeout)
-@@ -1507,7 +1718,7 @@ static inline bool bfq_bfqq_must_idle(struct bfq_queue *bfqq,
- 		(bfqd->rq_in_driver == 0 ||
- 				budg_timeout ||
-                                 bfqq->raising_coeff > 1) &&
--                !bfq_close_cooperator(bfqd, bfqq) &&
-+                !bfq_close_cooperator(bfqd, bfqq, bfqd->last_position) &&
-                 (!bfq_bfqq_coop(bfqq) ||
- 			!bfq_bfqq_some_coop_idle(bfqq)) &&
- 		!bfq_queue_nonrot_noidle(bfqd, bfqq));
-@@ -1519,7 +1730,7 @@ static inline bool bfq_bfqq_must_idle(struct bfq_queue *bfqq,
+@@ -2263,7 +2522,7 @@ static inline bool bfq_bfqq_must_idle(struct bfq_queue *bfqq)
   */
  static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
  {
@@ -641,10 +735,10 @@ index b230927..bc57923 100644
 +	struct bfq_queue *bfqq;
  	struct request *next_rq;
  	enum bfqq_expiration reason = BFQ_BFQQ_BUDGET_TIMEOUT;
- 	int budg_timeout;
-@@ -1530,17 +1741,6 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
  
- 	bfq_log_bfqq(bfqd, bfqq, "select_queue: already active queue");
+@@ -2273,17 +2532,6 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
+ 
+ 	bfq_log_bfqq(bfqd, bfqq, "select_queue: already in-service queue");
  
 -	/*
 -         * If another queue has a request waiting within our mean seek
@@ -657,10 +751,10 @@ index b230927..bc57923 100644
 -        if (new_bfqq != NULL && bfqq->new_bfqq == NULL)
 -                bfq_setup_merge(bfqq, new_bfqq);
 -
- 	budg_timeout = bfq_may_expire_for_budg_timeout(bfqq);
- 	if (budg_timeout &&
- 	    !bfq_bfqq_must_idle(bfqq, budg_timeout))
-@@ -1577,10 +1777,7 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
+ 	if (bfq_may_expire_for_budg_timeout(bfqq) &&
+ 	    !timer_pending(&bfqd->idle_slice_timer) &&
+ 	    !bfq_bfqq_must_idle(bfqq))
+@@ -2322,10 +2570,7 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
  				bfq_clear_bfqq_wait_request(bfqq);
  				del_timer(&bfqd->idle_slice_timer);
  			}
@@ -672,16 +766,14 @@ index b230927..bc57923 100644
  		}
  	}
  
-@@ -1589,26 +1786,19 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
- 	 * queue still has requests in flight or is idling for a new request,
- 	 * then keep it.
+@@ -2334,40 +2579,30 @@ static struct bfq_queue *bfq_select_queue(struct bfq_data *bfqd)
+ 	 * in flight (possibly waiting for a completion) or is idling for a
+ 	 * new request, then keep it.
  	 */
 -	if (new_bfqq == NULL && (timer_pending(&bfqd->idle_slice_timer) ||
+-	    (bfqq->dispatched != 0 && bfq_bfqq_must_not_expire(bfqq)))) {
 +	if (timer_pending(&bfqd->idle_slice_timer) ||
- 	    (bfqq->dispatched != 0 &&
- 	     (bfq_bfqq_idle_window(bfqq) || bfqq->raising_coeff > 1) &&
--	     !bfq_queue_nonrot_noidle(bfqd, bfqq)))) {
-+	     !bfq_queue_nonrot_noidle(bfqd, bfqq))) {
++	    (bfqq->dispatched != 0 && bfq_bfqq_must_not_expire(bfqq))) {
  		bfqq = NULL;
  		goto keep_queue;
 -	} else if (new_bfqq != NULL && timer_pending(&bfqd->idle_slice_timer)) {
@@ -697,41 +789,67 @@ index b230927..bc57923 100644
  expire:
  	bfq_bfqq_expire(bfqd, bfqq, 0, reason);
  new_queue:
--	bfqq = bfq_set_active_queue(bfqd, new_bfqq);
-+	bfqq = bfq_set_active_queue(bfqd);
+-	bfqq = bfq_set_in_service_queue(bfqd, new_bfqq);
++	bfqq = bfq_set_in_service_queue(bfqd);
  	bfq_log(bfqd, "select_queue: new queue %d returned",
  		bfqq != NULL ? bfqq->pid : 0);
  keep_queue:
-@@ -1617,9 +1807,8 @@ keep_queue:
+ 	return bfqq;
+ }
  
- static void update_raising_data(struct bfq_data *bfqd, struct bfq_queue *bfqq)
+-static void bfq_update_wr_data(struct bfq_data *bfqd,
+-			       struct bfq_queue *bfqq)
++static void bfq_update_wr_data(struct bfq_data *bfqd, struct bfq_queue *bfqq)
  {
-+	struct bfq_entity *entity = &bfqq->entity;
- 	if (bfqq->raising_coeff > 1) { /* queue is being boosted */
+-	if (bfqq->wr_coeff > 1) { /* queue is being boosted */
 -		struct bfq_entity *entity = &bfqq->entity;
 -
++	struct bfq_entity *entity = &bfqq->entity;
++	if (bfqq->wr_coeff > 1) { /* queue is being weight-raised */
  		bfq_log_bfqq(bfqd, bfqq,
- 			"raising period dur %u/%u msec, "
- 			"old raising coeff %u, w %d(%d)",
-@@ -1656,12 +1845,14 @@ static void update_raising_data(struct bfq_data *bfqd, struct bfq_queue *bfqq)
- 					     jiffies_to_msecs(bfqq->
- 						raising_cur_max_time));
- 				bfq_bfqq_end_raising(bfqq);
--				__bfq_entity_update_weight_prio(
--					bfq_entity_service_tree(entity),
--					entity);
- 			}
+ 			"raising period dur %u/%u msec, old coeff %u, w %d(%d)",
+-			jiffies_to_msecs(jiffies -
+-				bfqq->last_wr_start_finish),
++			jiffies_to_msecs(jiffies - bfqq->last_wr_start_finish),
+ 			jiffies_to_msecs(bfqq->wr_cur_max_time),
+ 			bfqq->wr_coeff,
+ 			bfqq->entity.weight, bfqq->entity.orig_weight);
+@@ -2376,12 +2611,16 @@ static void bfq_update_wr_data(struct bfq_data *bfqd,
+ 		       entity->orig_weight * bfqq->wr_coeff);
+ 		if (entity->ioprio_changed)
+ 			bfq_log_bfqq(bfqd, bfqq, "WARN: pending prio change");
++
+ 		/*
+ 		 * If the queue was activated in a burst, or
+ 		 * too much time has elapsed from the beginning
+-		 * of this weight-raising, then end weight raising.
++		 * of this weight-raising period, or the queue has
++		 * exceeded the acceptable number of cooperations,
++		 * then end weight raising.
+ 		 */
+ 		if (bfq_bfqq_in_large_burst(bfqq) ||
++		    bfq_bfqq_cooperations(bfqq) >= bfqd->bfq_coop_thresh ||
+ 		    time_is_before_jiffies(bfqq->last_wr_start_finish +
+ 					   bfqq->wr_cur_max_time)) {
+ 			bfqq->last_wr_start_finish = jiffies;
+@@ -2390,11 +2629,13 @@ static void bfq_update_wr_data(struct bfq_data *bfqd,
+ 				     bfqq->last_wr_start_finish,
+ 				     jiffies_to_msecs(bfqq->wr_cur_max_time));
+ 			bfq_bfqq_end_wr(bfqq);
+-			__bfq_entity_update_weight_prio(
+-				bfq_entity_service_tree(entity),
+-				entity);
  		}
  	}
 +	/* Update weight both if it must be raised and if it must be lowered */
-+	if ((entity->weight > entity->orig_weight) != (bfqq->raising_coeff > 1))
++	if ((entity->weight > entity->orig_weight) != (bfqq->wr_coeff > 1))
 +		__bfq_entity_update_weight_prio(
 +			bfq_entity_service_tree(entity),
 +			entity);
  }
  
  /*
-@@ -1901,6 +2092,25 @@ static void bfq_init_icq(struct io_cq *icq)
+@@ -2642,6 +2883,25 @@ static inline void bfq_init_icq(struct io_cq *icq)
  	struct bfq_io_cq *bic = icq_to_bic(icq);
  
  	bic->ttime.last_end_request = jiffies;
@@ -753,11 +871,11 @@ index b230927..bc57923 100644
 +	 * the field raising_time_left and assign 1 to it, to mark the queue
 +	 * as needing weight raising.
 +	 */
-+	bic->raising_time_left = 1;
++	bic->wr_time_left = 1;
  }
  
  static void bfq_exit_icq(struct io_cq *icq)
-@@ -1914,6 +2124,13 @@ static void bfq_exit_icq(struct io_cq *icq)
+@@ -2655,6 +2915,13 @@ static void bfq_exit_icq(struct io_cq *icq)
  	}
  
  	if (bic->bfqq[BLK_RW_SYNC]) {
@@ -771,7 +889,7 @@ index b230927..bc57923 100644
  		bfq_exit_bfqq(bfqd, bic->bfqq[BLK_RW_SYNC]);
  		bic->bfqq[BLK_RW_SYNC] = NULL;
  	}
-@@ -2211,6 +2428,10 @@ static void bfq_update_idle_window(struct bfq_data *bfqd,
+@@ -2950,6 +3217,10 @@ static void bfq_update_idle_window(struct bfq_data *bfqd,
  	if (!bfq_bfqq_sync(bfqq) || bfq_class_idle(bfqq))
  		return;
  
@@ -782,7 +900,7 @@ index b230927..bc57923 100644
  	enable_idle = bfq_bfqq_idle_window(bfqq);
  
  	if (atomic_read(&bic->icq.ioc->active_ref) == 0 ||
-@@ -2251,6 +2472,7 @@ static void bfq_rq_enqueued(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+@@ -2997,6 +3268,7 @@ static void bfq_rq_enqueued(struct bfq_data *bfqd, struct bfq_queue *bfqq,
  	if (bfqq->entity.service > bfq_max_budget(bfqd) / 8 ||
  	    !BFQQ_SEEKY(bfqq))
  		bfq_update_idle_window(bfqd, bfqq, bic);
@@ -790,7 +908,7 @@ index b230927..bc57923 100644
  
  	bfq_log_bfqq(bfqd, bfqq,
  		     "rq_enqueued: idle_window=%d (seeky %d, mean %llu)",
-@@ -2302,13 +2524,45 @@ static void bfq_rq_enqueued(struct bfq_data *bfqd, struct bfq_queue *bfqq,
+@@ -3057,13 +3329,49 @@ static void bfq_rq_enqueued(struct bfq_data *bfqd, struct bfq_queue *bfqq,
  static void bfq_insert_request(struct request_queue *q, struct request *rq)
  {
  	struct bfq_data *bfqd = q->elevator->elevator_data;
@@ -804,27 +922,31 @@ index b230927..bc57923 100644
 +	 * driver: make sure we are in process context while trying to
 +	 * merge two bfq_queues.
 +	 */
-+	if (!in_interrupt() &&
-+	    (new_bfqq = bfq_setup_cooperator(bfqd, bfqq, rq, true))) {
-+		if (bic_to_bfqq(RQ_BIC(rq), 1) != bfqq)
-+			new_bfqq = bic_to_bfqq(RQ_BIC(rq), 1);
-+		/*
-+		 * Release the request's reference to the old bfqq
-+		 * and make sure one is taken to the shared queue.
-+		 */
-+		new_bfqq->allocated[rq_data_dir(rq)]++;
-+		bfqq->allocated[rq_data_dir(rq)]--;
-+		atomic_inc(&new_bfqq->ref);
-+		bfq_put_queue(bfqq);
-+		if (bic_to_bfqq(RQ_BIC(rq), 1) == bfqq)
-+			bfq_merge_bfqqs(bfqd, RQ_BIC(rq), bfqq, new_bfqq);
-+		rq->elv.priv[1] = new_bfqq;
-+		bfqq = new_bfqq;
++	if (!in_interrupt()) {
++		new_bfqq = bfq_setup_cooperator(bfqd, bfqq, rq, true);
++		if (new_bfqq != NULL) {
++			if (bic_to_bfqq(RQ_BIC(rq), 1) != bfqq)
++				new_bfqq = bic_to_bfqq(RQ_BIC(rq), 1);
++			/*
++			 * Release the request's reference to the old bfqq
++			 * and make sure one is taken to the shared queue.
++			 */
++			new_bfqq->allocated[rq_data_dir(rq)]++;
++			bfqq->allocated[rq_data_dir(rq)]--;
++			atomic_inc(&new_bfqq->ref);
++			bfq_put_queue(bfqq);
++			if (bic_to_bfqq(RQ_BIC(rq), 1) == bfqq)
++				bfq_merge_bfqqs(bfqd, RQ_BIC(rq),
++						bfqq, new_bfqq);
++			rq->elv.priv[1] = new_bfqq;
++			bfqq = new_bfqq;
++		} else
++			bfq_bfqq_increase_failed_cooperations(bfqq);
 +	}
 +
  	bfq_init_prio_data(bfqq, RQ_BIC(rq));
  
- 	bfq_add_rq_rb(rq);
+ 	bfq_add_request(rq);
  
 +	/*
 +	 * Here a newly-created bfq_queue has already started a weight-raising
@@ -833,46 +955,30 @@ index b230927..bc57923 100644
 +	 * comments about this field in bfq_init_icq().
 +	 */
 +	if (bfqq->bic != NULL)
-+		bfqq->bic->raising_time_left = 0;
++		bfqq->bic->wr_time_left = 0;
  	rq_set_fifo_time(rq, jiffies + bfqd->bfq_fifo_expire[rq_is_sync(rq)]);
  	list_add_tail(&rq->queuelist, &bfqq->fifo);
  
-@@ -2371,15 +2625,6 @@ static void bfq_completed_request(struct request_queue *q, struct request *rq)
- 		if (bfq_bfqq_budget_new(bfqq))
- 			bfq_set_budget_timeout(bfqd);
- 
--		/* Idling is disabled also for cooperation issues:
--		 * 1) there is a close cooperator for the queue, or
--		 * 2) the queue is shared and some cooperator is likely
--		 *    to be idle (in this case, by not arming the idle timer,
--		 *    we try to slow down the queue, to prevent the zones
--		 *    of the disk accessed by the active cooperators to become
--		 *    too distant from the zone that will be accessed by the
--		 *    currently idle cooperators)
--		 */
- 		if (bfq_bfqq_must_idle(bfqq, budg_timeout))
- 			bfq_arm_slice_timer(bfqd);
- 		else if (budg_timeout)
-@@ -2449,18 +2694,6 @@ static void bfq_put_request(struct request *rq)
+@@ -3228,18 +3536,6 @@ static void bfq_put_request(struct request *rq)
  	}
  }
  
 -static struct bfq_queue *
 -bfq_merge_bfqqs(struct bfq_data *bfqd, struct bfq_io_cq *bic,
--                struct bfq_queue *bfqq)
+-		struct bfq_queue *bfqq)
 -{
--        bfq_log_bfqq(bfqd, bfqq, "merging with queue %lu",
+-	bfq_log_bfqq(bfqd, bfqq, "merging with queue %lu",
 -		(long unsigned)bfqq->new_bfqq->pid);
--        bic_set_bfqq(bic, bfqq->new_bfqq, 1);
--        bfq_mark_bfqq_coop(bfqq->new_bfqq);
--        bfq_put_queue(bfqq);
--        return bic_to_bfqq(bic, 1);
+-	bic_set_bfqq(bic, bfqq->new_bfqq, 1);
+-	bfq_mark_bfqq_coop(bfqq->new_bfqq);
+-	bfq_put_queue(bfqq);
+-	return bic_to_bfqq(bic, 1);
 -}
 -
  /*
   * Returns NULL if a new bfqq should be allocated, or the old bfqq if this
   * was the last process referring to said bfqq.
-@@ -2469,6 +2702,9 @@ static struct bfq_queue *
+@@ -3248,6 +3544,9 @@ static struct bfq_queue *
  bfq_split_bfqq(struct bfq_io_cq *bic, struct bfq_queue *bfqq)
  {
  	bfq_log_bfqq(bfqq->bfqd, bfqq, "splitting queue");
@@ -881,8 +987,8 @@ index b230927..bc57923 100644
 +
  	if (bfqq_process_refs(bfqq) == 1) {
  		bfqq->pid = current->pid;
- 		bfq_clear_bfqq_some_coop_idle(bfqq);
-@@ -2498,6 +2734,7 @@ static int bfq_set_request(struct request_queue *q, struct request *rq,
+ 		bfq_clear_bfqq_coop(bfqq);
+@@ -3276,6 +3575,7 @@ static int bfq_set_request(struct request_queue *q, struct request *rq,
  	struct bfq_queue *bfqq;
  	struct bfq_group *bfqg;
  	unsigned long flags;
@@ -890,9 +996,21 @@ index b230927..bc57923 100644
  
  	might_sleep_if(gfp_mask & __GFP_WAIT);
  
-@@ -2516,24 +2753,14 @@ new_queue:
+@@ -3293,25 +3593,26 @@ new_queue:
+ 	if (bfqq == NULL || bfqq == &bfqd->oom_bfqq) {
  		bfqq = bfq_get_queue(bfqd, bfqg, is_sync, bic, gfp_mask);
  		bic_set_bfqq(bic, bfqq, is_sync);
++		if (split && is_sync) {
++			if ((bic->was_in_burst_list && bfqd->large_burst) ||
++			    bic->saved_in_large_burst)
++				bfq_mark_bfqq_in_large_burst(bfqq);
++			else {
++			    bfq_clear_bfqq_in_large_burst(bfqq);
++			    if (bic->was_in_burst_list)
++			       hlist_add_head(&bfqq->burst_list_node,
++				              &bfqd->burst_list);
++			}
++		}
  	} else {
 -		/*
 -		 * If the queue was seeky for too long, break it apart.
@@ -917,7 +1035,7 @@ index b230927..bc57923 100644
  	}
  
  	bfqq->allocated[rw]++;
-@@ -2544,6 +2771,26 @@ new_queue:
+@@ -3322,6 +3623,26 @@ new_queue:
  	rq->elv.priv[0] = bic;
  	rq->elv.priv[1] = bfqq;
  
@@ -928,14 +1046,14 @@ index b230927..bc57923 100644
 +	 * queue has just been split, mark a flag so that the
 +	 * information is available to the other scheduler hooks.
 +	 */
-+	if (bfqq_process_refs(bfqq) == 1) {
++	if (likely(bfqq != &bfqd->oom_bfqq) && bfqq_process_refs(bfqq) == 1) {
 +		bfqq->bic = bic;
 +		if (split) {
 +			bfq_mark_bfqq_just_split(bfqq);
 +			/*
-+			 * If the queue has just been split from a shared queue,
-+			 * restore the idle window and the possible weight
-+			 * raising period.
++			 * If the queue has just been split from a shared
++			 * queue, restore the idle window and the possible
++			 * weight raising period.
 +			 */
 +			bfq_bfqq_resume_state(bfqq, bic);
 +		}
@@ -945,10 +1063,10 @@ index b230927..bc57923 100644
  
  	return 0;
 diff --git a/block/bfq-sched.c b/block/bfq-sched.c
-index 03f8061..a0edaa2 100644
+index 2931563..6764a7e 100644
 --- a/block/bfq-sched.c
 +++ b/block/bfq-sched.c
-@@ -978,34 +978,6 @@ static struct bfq_queue *bfq_get_next_queue(struct bfq_data *bfqd)
+@@ -1091,34 +1091,6 @@ static struct bfq_queue *bfq_get_next_queue(struct bfq_data *bfqd)
  	return bfqq;
  }
  
@@ -961,7 +1079,7 @@ index 03f8061..a0edaa2 100644
 -	struct bfq_entity *entity;
 -	struct bfq_sched_data *sd;
 -
--	BUG_ON(bfqd->active_queue != NULL);
+-	BUG_ON(bfqd->in_service_queue != NULL);
 -
 -	entity = &bfqq->entity;
 -	/*
@@ -972,50 +1090,81 @@ index 03f8061..a0edaa2 100644
 -		bfq_update_budget(entity);
 -		bfq_update_vtime(bfq_entity_service_tree(entity));
 -		bfq_active_extract(bfq_entity_service_tree(entity), entity);
--		sd->active_entity = entity;
--		sd->next_active = NULL;
+-		sd->in_service_entity = entity;
+-		sd->next_in_service = NULL;
 -		entity->service = 0;
 -	}
 -
 -	return;
 -}
 -
- static void __bfq_bfqd_reset_active(struct bfq_data *bfqd)
+ static void __bfq_bfqd_reset_in_service(struct bfq_data *bfqd)
  {
- 	if (bfqd->active_bic != NULL) {
+ 	if (bfqd->in_service_bic != NULL) {
 diff --git a/block/bfq.h b/block/bfq.h
-index 48ecde9..bb52975 100644
+index 84c7861..0a40b4b 100644
 --- a/block/bfq.h
 +++ b/block/bfq.h
-@@ -188,6 +188,8 @@ struct bfq_group;
-  * @pid: pid of the process owning the queue, used for logging purposes.
-  * @last_rais_start_time: last (idle -> weight-raised) transition attempt
-  * @raising_cur_max_time: current max raising time for this queue
+@@ -218,18 +218,21 @@ struct bfq_group;
+  *                      idle @bfq_queue with no outstanding requests, then
+  *                      the task associated with the queue it is deemed as
+  *                      soft real-time (see the comments to the function
+- *                      bfq_bfqq_softrt_next_start()).
++ *                      bfq_bfqq_softrt_next_start())
+  * @last_idle_bklogged: time of the last transition of the @bfq_queue from
+  *                      idle to backlogged
+  * @service_from_backlogged: cumulative service received from the @bfq_queue
+  *                           since the last transition from idle to
+  *                           backlogged
 + * @bic: pointer to the bfq_io_cq owning the bfq_queue, set to %NULL if the
 + *	 queue is shared
   *
-  * A bfq_queue is a leaf request queue; it can be associated to an io_context
-  * or more (if it is an async one).  @cgroup holds a reference to the
-@@ -231,6 +233,7 @@ struct bfq_queue {
- 	sector_t last_request_pos;
+- * A bfq_queue is a leaf request queue; it can be associated with an io_context
+- * or more, if it is async or shared between cooperating processes. @cgroup
+- * holds a reference to the cgroup, to be sure that it does not disappear while
+- * a bfqq still references it (mostly to avoid races between request issuing and
+- * task migration followed by cgroup destruction).
++ * A bfq_queue is a leaf request queue; it can be associated with an
++ * io_context or more, if it  is  async or shared  between  cooperating
++ * processes. @cgroup holds a reference to the cgroup, to be sure that it
++ * does not disappear while a bfqq still references it (mostly to avoid
++ * races between request issuing and task migration followed by cgroup
++ * destruction).
+  * All the fields are protected by the queue lock of the containing bfqd.
+  */
+ struct bfq_queue {
+@@ -269,6 +272,7 @@ struct bfq_queue {
+ 	unsigned int requests_within_timer;
  
  	pid_t pid;
 +	struct bfq_io_cq *bic;
  
  	/* weight-raising fields */
- 	unsigned int raising_cur_max_time;
-@@ -257,12 +260,23 @@ struct bfq_ttime {
+ 	unsigned long wr_cur_max_time;
+@@ -298,12 +302,42 @@ struct bfq_ttime {
   * @icq: associated io_cq structure
   * @bfqq: array of two process queues, the sync and the async
   * @ttime: associated @bfq_ttime struct
-+ * @raising_time_left: snapshot of the time left before weight raising ends
-+ *		       for the sync queue associated to this process; this
-+ *		       snapshot is taken to remember this value while the weight
-+ *		       raising is suspended because the queue is merged with a
-+ *		       shared queue, and is used to set @raising_cur_max_time
-+ *		       when the queue is split from the shared queue and its
-+ *		       weight is raised again
-+ * @saved_idle_window: same purpose as the previous field for the idle window
++ * @wr_time_left: snapshot of the time left before weight raising ends
++ *                for the sync queue associated to this process; this
++ *		  snapshot is taken to remember this value while the weight
++ *		  raising is suspended because the queue is merged with a
++ *		  shared queue, and is used to set @raising_cur_max_time
++ *		  when the queue is split from the shared queue and its
++ *		  weight is raised again
++ * @saved_idle_window: same purpose as the previous field for the idle
++ *                     window
++ * @saved_IO_bound: same purpose as the previous two fields for the I/O
++ *                  bound classification of a queue
++ * @saved_in_large_burst: same purpose as the previous fields for the
++ *                        value of the field keeping the queue's belonging
++ *                        to a large burst
++ * @was_in_burst_list: true if the queue belonged to a burst list
++ *                     before its merge with another cooperating queue
++ * @cooperations: counter of consecutive successful queue merges underwent
++ *                by any of the process' @bfq_queues
++ * @failed_cooperations: counter of consecutive failed queue merges of any
++ *                       of the process' @bfq_queues
   */
  struct bfq_io_cq {
  	struct io_cq icq; /* must be the first member */
@@ -1023,27 +1172,51 @@ index 48ecde9..bb52975 100644
  	struct bfq_ttime ttime;
  	int ioprio;
 +
-+	unsigned int raising_time_left;
-+	unsigned int saved_idle_window;
++	unsigned int wr_time_left;
++	bool saved_idle_window;
++	bool saved_IO_bound;
++
++	bool saved_in_large_burst;
++	bool was_in_burst_list;
++
++	unsigned int cooperations;
++	unsigned int failed_cooperations;
  };
  
- /**
-@@ -403,6 +417,7 @@ enum bfqq_state_flags {
+ enum bfq_device_speed {
+@@ -539,7 +573,7 @@ enum bfqq_state_flags {
+ 	BFQ_BFQQ_FLAG_prio_changed,	/* task priority has changed */
+ 	BFQ_BFQQ_FLAG_sync,		/* synchronous queue */
+ 	BFQ_BFQQ_FLAG_budget_new,	/* no completion with this budget */
+-	BFQ_BFQQ_FLAG_IO_bound,         /*
++	BFQ_BFQQ_FLAG_IO_bound,		/*
+ 					 * bfqq has timed-out at least once
+ 					 * having consumed at most 2/10 of
+ 					 * its budget
+@@ -552,12 +586,13 @@ enum bfqq_state_flags {
+ 					 * bfqq has proved to be slow and
+ 					 * seeky until budget timeout
+ 					 */
+-	BFQ_BFQQ_FLAG_softrt_update,    /*
++	BFQ_BFQQ_FLAG_softrt_update,	/*
+ 					 * may need softrt-next-start
+ 					 * update
+ 					 */
  	BFQ_BFQQ_FLAG_coop,		/* bfqq is shared */
- 	BFQ_BFQQ_FLAG_split_coop,	/* shared bfqq will be splitted */
- 	BFQ_BFQQ_FLAG_some_coop_idle,   /* some cooperator is inactive */
+-	BFQ_BFQQ_FLAG_split_coop,	/* shared bfqq will be splitted */
++	BFQ_BFQQ_FLAG_split_coop,	/* shared bfqq will be split */
 +	BFQ_BFQQ_FLAG_just_split,	/* queue has just been split */
  };
  
  #define BFQ_BFQQ_FNS(name)						\
-@@ -430,6 +445,7 @@ BFQ_BFQQ_FNS(budget_new);
+@@ -587,6 +622,7 @@ BFQ_BFQQ_FNS(in_large_burst);
+ BFQ_BFQQ_FNS(constantly_seeky);
  BFQ_BFQQ_FNS(coop);
  BFQ_BFQQ_FNS(split_coop);
- BFQ_BFQQ_FNS(some_coop_idle);
 +BFQ_BFQQ_FNS(just_split);
+ BFQ_BFQQ_FNS(softrt_update);
  #undef BFQ_BFQQ_FNS
  
- /* Logging facilities. */
 -- 
-1.8.1.4
+2.1.3
 
