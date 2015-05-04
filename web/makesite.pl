@@ -19,7 +19,7 @@ print "makesite.pl called with arguments: @ARGV \n";
 my $cmd = 'rm -rf /tmp/linux-patches';
 $output = `$cmd`;
 
-$cmd = 'git clone git+ssh://git@git.overlays.gentoo.org/proj/linux-patches.git /tmp/linux-patches';
+$cmd = 'git clone git+ssh://git@git.gentoo.org/proj/linux-patches.git /tmp/linux-patches';
 $output = `$cmd`;
 
 make_index_page();
