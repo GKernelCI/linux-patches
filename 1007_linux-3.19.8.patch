@@ -1,0 +1,211 @@
+diff --git a/Makefile b/Makefile
+index 69952c1404b2..110782bba50d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 19
+-SUBLEVEL = 7
++SUBLEVEL = 8
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/drivers/clk/at91/clk-usb.c b/drivers/clk/at91/clk-usb.c
+index 0b7c3e8840ba..0283a5713d6c 100644
+--- a/drivers/clk/at91/clk-usb.c
++++ b/drivers/clk/at91/clk-usb.c
+@@ -58,8 +58,6 @@ static unsigned long at91sam9x5_clk_usb_recalc_rate(struct clk_hw *hw,
+ 
+ static long at91sam9x5_clk_usb_determine_rate(struct clk_hw *hw,
+ 					      unsigned long rate,
+-					      unsigned long min_rate,
+-					      unsigned long max_rate,
+ 					      unsigned long *best_parent_rate,
+ 					      struct clk_hw **best_parent_hw)
+ {
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index c132d9030729..0589a849d2a5 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -489,7 +489,7 @@ int t4_memory_rw(struct adapter *adap, int win, int mtype, u32 addr,
+ 		memoffset = (mtype * (edc_size * 1024 * 1024));
+ 	else {
+ 		mc_size = EXT_MEM0_SIZE_G(t4_read_reg(adap,
+-						      MA_EXT_MEMORY1_BAR_A));
++						      MA_EXT_MEMORY0_BAR_A));
+ 		memoffset = (MEM_MC0 * edc_size + mc_size) * 1024 * 1024;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index 2617c9d68d9b..c998c4d8c7e9 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -1467,6 +1467,7 @@ static void mlx4_en_service_task(struct work_struct *work)
+ 		if (mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS)
+ 			mlx4_en_ptp_overflow_check(mdev);
+ 
++		mlx4_en_recover_from_oom(priv);
+ 		queue_delayed_work(mdev->workqueue, &priv->service_task,
+ 				   SERVICE_TASK_DELAY);
+ 	}
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index a0474eb94aa3..10d353356b88 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -240,6 +240,12 @@ static int mlx4_en_prepare_rx_desc(struct mlx4_en_priv *priv,
+ 	return mlx4_en_alloc_frags(priv, rx_desc, frags, ring->page_alloc, gfp);
+ }
+ 
++static inline bool mlx4_en_is_ring_empty(struct mlx4_en_rx_ring *ring)
++{
++	BUG_ON((u32)(ring->prod - ring->cons) > ring->actual_size);
++	return ring->prod == ring->cons;
++}
++
+ static inline void mlx4_en_update_rx_prod_db(struct mlx4_en_rx_ring *ring)
+ {
+ 	*ring->wqres.db.db = cpu_to_be32(ring->prod & 0xffff);
+@@ -311,8 +317,7 @@ static void mlx4_en_free_rx_buf(struct mlx4_en_priv *priv,
+ 	       ring->cons, ring->prod);
+ 
+ 	/* Unmap and free Rx buffers */
+-	BUG_ON((u32) (ring->prod - ring->cons) > ring->actual_size);
+-	while (ring->cons != ring->prod) {
++	while (!mlx4_en_is_ring_empty(ring)) {
+ 		index = ring->cons & ring->size_mask;
+ 		en_dbg(DRV, priv, "Processing descriptor:%d\n", index);
+ 		mlx4_en_free_rx_desc(priv, ring, index);
+@@ -487,6 +492,23 @@ err_allocator:
+ 	return err;
+ }
+ 
++/* We recover from out of memory by scheduling our napi poll
++ * function (mlx4_en_process_cq), which tries to allocate
++ * all missing RX buffers (call to mlx4_en_refill_rx_buffers).
++ */
++void mlx4_en_recover_from_oom(struct mlx4_en_priv *priv)
++{
++	int ring;
++
++	if (!priv->port_up)
++		return;
++
++	for (ring = 0; ring < priv->rx_ring_num; ring++) {
++		if (mlx4_en_is_ring_empty(priv->rx_ring[ring]))
++			napi_reschedule(&priv->rx_cq[ring]->napi);
++	}
++}
++
+ void mlx4_en_destroy_rx_ring(struct mlx4_en_priv *priv,
+ 			     struct mlx4_en_rx_ring **pring,
+ 			     u32 size, u16 stride)
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_tx.c b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+index e3357bf523df..18db895daa2e 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_tx.c
+@@ -143,8 +143,10 @@ int mlx4_en_create_tx_ring(struct mlx4_en_priv *priv,
+ 	ring->hwtstamp_tx_type = priv->hwtstamp_config.tx_type;
+ 	ring->queue_index = queue_index;
+ 
+-	if (queue_index < priv->num_tx_rings_p_up && cpu_online(queue_index))
+-		cpumask_set_cpu(queue_index, &ring->affinity_mask);
++	if (queue_index < priv->num_tx_rings_p_up)
++		cpumask_set_cpu_local_first(queue_index,
++					    priv->mdev->dev->numa_node,
++					    &ring->affinity_mask);
+ 
+ 	*pring = ring;
+ 	return 0;
+@@ -213,7 +215,7 @@ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
+ 
+ 	err = mlx4_qp_to_ready(mdev->dev, &ring->wqres.mtt, &ring->context,
+ 			       &ring->qp, &ring->qp_state);
+-	if (!user_prio && cpu_online(ring->queue_index))
++	if (!cpumask_empty(&ring->affinity_mask))
+ 		netif_set_xps_queue(priv->dev, &ring->affinity_mask,
+ 				    ring->queue_index);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+index 8805ef1a4c75..6cc49c1549b0 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
++++ b/drivers/net/ethernet/mellanox/mlx4/mlx4_en.h
+@@ -788,6 +788,7 @@ int mlx4_en_activate_tx_ring(struct mlx4_en_priv *priv,
+ void mlx4_en_deactivate_tx_ring(struct mlx4_en_priv *priv,
+ 				struct mlx4_en_tx_ring *ring);
+ void mlx4_en_set_num_rx_rings(struct mlx4_en_dev *mdev);
++void mlx4_en_recover_from_oom(struct mlx4_en_priv *priv);
+ int mlx4_en_create_rx_ring(struct mlx4_en_priv *priv,
+ 			   struct mlx4_en_rx_ring **pring,
+ 			   u32 size, u16 stride, int node);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index a64e7a207d2b..0c5796eadae1 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -357,8 +357,8 @@ select_insn:
+ 	ALU64_MOD_X:
+ 		if (unlikely(SRC == 0))
+ 			return 0;
+-		tmp = DST;
+-		DST = do_div(tmp, SRC);
++		div64_u64_rem(DST, SRC, &tmp);
++		DST = tmp;
+ 		CONT;
+ 	ALU_MOD_X:
+ 		if (unlikely(SRC == 0))
+@@ -367,8 +367,8 @@ select_insn:
+ 		DST = do_div(tmp, (u32) SRC);
+ 		CONT;
+ 	ALU64_MOD_K:
+-		tmp = DST;
+-		DST = do_div(tmp, IMM);
++		div64_u64_rem(DST, IMM, &tmp);
++		DST = tmp;
+ 		CONT;
+ 	ALU_MOD_K:
+ 		tmp = (u32) DST;
+@@ -377,7 +377,7 @@ select_insn:
+ 	ALU64_DIV_X:
+ 		if (unlikely(SRC == 0))
+ 			return 0;
+-		do_div(DST, SRC);
++		DST = div64_u64(DST, SRC);
+ 		CONT;
+ 	ALU_DIV_X:
+ 		if (unlikely(SRC == 0))
+@@ -387,7 +387,7 @@ select_insn:
+ 		DST = (u32) tmp;
+ 		CONT;
+ 	ALU64_DIV_K:
+-		do_div(DST, IMM);
++		DST = div64_u64(DST, IMM);
+ 		CONT;
+ 	ALU_DIV_K:
+ 		tmp = (u32) DST;
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 0ae28f517a9b..c0db43d2e1a6 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -158,6 +158,7 @@ void ping_unhash(struct sock *sk)
+ 	if (sk_hashed(sk)) {
+ 		write_lock_bh(&ping_table.lock);
+ 		hlist_nulls_del(&sk->sk_nulls_node);
++		sk_nulls_node_init(&sk->sk_nulls_node);
+ 		sock_put(sk);
+ 		isk->inet_num = 0;
+ 		isk->inet_sport = 0;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 52e1f2bf0ca2..ac40410b94d0 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -963,10 +963,7 @@ static void __ip_rt_update_pmtu(struct rtable *rt, struct flowi4 *fl4, u32 mtu)
+ 	if (dst_metric_locked(dst, RTAX_MTU))
+ 		return;
+ 
+-	if (dst->dev->mtu < mtu)
+-		return;
+-
+-	if (rt->rt_pmtu && rt->rt_pmtu < mtu)
++	if (ipv4_mtu(dst) < mtu)
+ 		return;
+ 
+ 	if (mtu < ip_rt_min_pmtu)
