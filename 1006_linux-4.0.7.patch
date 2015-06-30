@@ -1,0 +1,707 @@
+diff --git a/Makefile b/Makefile
+index af6da040b952..bd76a8e94395 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 0
+-SUBLEVEL = 6
++SUBLEVEL = 7
+ EXTRAVERSION =
+ NAME = Hurr durr I'ma sheep
+ 
+diff --git a/arch/arm/mach-exynos/common.h b/arch/arm/mach-exynos/common.h
+index f70eca7ee705..0ef8d4b47102 100644
+--- a/arch/arm/mach-exynos/common.h
++++ b/arch/arm/mach-exynos/common.h
+@@ -153,6 +153,8 @@ extern void exynos_enter_aftr(void);
+ 
+ extern struct cpuidle_exynos_data cpuidle_coupled_exynos_data;
+ 
++extern void exynos_set_delayed_reset_assertion(bool enable);
++
+ extern void s5p_init_cpu(void __iomem *cpuid_addr);
+ extern unsigned int samsung_rev(void);
+ extern void __iomem *cpu_boot_reg_base(void);
+diff --git a/arch/arm/mach-exynos/exynos.c b/arch/arm/mach-exynos/exynos.c
+index 9e9dfdfad9d7..1081ff1f03c6 100644
+--- a/arch/arm/mach-exynos/exynos.c
++++ b/arch/arm/mach-exynos/exynos.c
+@@ -166,6 +166,33 @@ static void __init exynos_init_io(void)
+ 	exynos_map_io();
+ }
+ 
++/*
++ * Set or clear the USE_DELAYED_RESET_ASSERTION option. Used by smp code
++ * and suspend.
++ *
++ * This is necessary only on Exynos4 SoCs. When system is running
++ * USE_DELAYED_RESET_ASSERTION should be set so the ARM CLK clock down
++ * feature could properly detect global idle state when secondary CPU is
++ * powered down.
++ *
++ * However this should not be set when such system is going into suspend.
++ */
++void exynos_set_delayed_reset_assertion(bool enable)
++{
++	if (soc_is_exynos4()) {
++		unsigned int tmp, core_id;
++
++		for (core_id = 0; core_id < num_possible_cpus(); core_id++) {
++			tmp = pmu_raw_readl(EXYNOS_ARM_CORE_OPTION(core_id));
++			if (enable)
++				tmp |= S5P_USE_DELAYED_RESET_ASSERTION;
++			else
++				tmp &= ~(S5P_USE_DELAYED_RESET_ASSERTION);
++			pmu_raw_writel(tmp, EXYNOS_ARM_CORE_OPTION(core_id));
++		}
++	}
++}
++
+ static const struct of_device_id exynos_dt_pmu_match[] = {
+ 	{ .compatible = "samsung,exynos3250-pmu" },
+ 	{ .compatible = "samsung,exynos4210-pmu" },
+diff --git a/arch/arm/mach-exynos/platsmp.c b/arch/arm/mach-exynos/platsmp.c
+index d2e9f12d12f1..d45e8cd23925 100644
+--- a/arch/arm/mach-exynos/platsmp.c
++++ b/arch/arm/mach-exynos/platsmp.c
+@@ -34,30 +34,6 @@
+ 
+ extern void exynos4_secondary_startup(void);
+ 
+-/*
+- * Set or clear the USE_DELAYED_RESET_ASSERTION option, set on Exynos4 SoCs
+- * during hot-(un)plugging CPUx.
+- *
+- * The feature can be cleared safely during first boot of secondary CPU.
+- *
+- * Exynos4 SoCs require setting USE_DELAYED_RESET_ASSERTION during powering
+- * down a CPU so the CPU idle clock down feature could properly detect global
+- * idle state when CPUx is off.
+- */
+-static void exynos_set_delayed_reset_assertion(u32 core_id, bool enable)
+-{
+-	if (soc_is_exynos4()) {
+-		unsigned int tmp;
+-
+-		tmp = pmu_raw_readl(EXYNOS_ARM_CORE_OPTION(core_id));
+-		if (enable)
+-			tmp |= S5P_USE_DELAYED_RESET_ASSERTION;
+-		else
+-			tmp &= ~(S5P_USE_DELAYED_RESET_ASSERTION);
+-		pmu_raw_writel(tmp, EXYNOS_ARM_CORE_OPTION(core_id));
+-	}
+-}
+-
+ #ifdef CONFIG_HOTPLUG_CPU
+ static inline void cpu_leave_lowpower(u32 core_id)
+ {
+@@ -73,8 +49,6 @@ static inline void cpu_leave_lowpower(u32 core_id)
+ 	  : "=&r" (v)
+ 	  : "Ir" (CR_C), "Ir" (0x40)
+ 	  : "cc");
+-
+-	 exynos_set_delayed_reset_assertion(core_id, false);
+ }
+ 
+ static inline void platform_do_lowpower(unsigned int cpu, int *spurious)
+@@ -87,14 +61,6 @@ static inline void platform_do_lowpower(unsigned int cpu, int *spurious)
+ 		/* Turn the CPU off on next WFI instruction. */
+ 		exynos_cpu_power_down(core_id);
+ 
+-		/*
+-		 * Exynos4 SoCs require setting
+-		 * USE_DELAYED_RESET_ASSERTION so the CPU idle
+-		 * clock down feature could properly detect
+-		 * global idle state when CPUx is off.
+-		 */
+-		exynos_set_delayed_reset_assertion(core_id, true);
+-
+ 		wfi();
+ 
+ 		if (pen_release == core_id) {
+@@ -354,9 +320,6 @@ static int exynos_boot_secondary(unsigned int cpu, struct task_struct *idle)
+ 		udelay(10);
+ 	}
+ 
+-	/* No harm if this is called during first boot of secondary CPU */
+-	exynos_set_delayed_reset_assertion(core_id, false);
+-
+ 	/*
+ 	 * now the secondary core is starting up let it run its
+ 	 * calibrations, then wait for it to finish
+@@ -403,6 +366,8 @@ static void __init exynos_smp_prepare_cpus(unsigned int max_cpus)
+ 
+ 	exynos_sysram_init();
+ 
++	exynos_set_delayed_reset_assertion(true);
++
+ 	if (read_cpuid_part() == ARM_CPU_PART_CORTEX_A9)
+ 		scu_enable(scu_base_addr());
+ 
+diff --git a/arch/arm/mach-exynos/suspend.c b/arch/arm/mach-exynos/suspend.c
+index 318d127df147..582ef2df960d 100644
+--- a/arch/arm/mach-exynos/suspend.c
++++ b/arch/arm/mach-exynos/suspend.c
+@@ -235,6 +235,8 @@ static void exynos_pm_enter_sleep_mode(void)
+ 
+ static void exynos_pm_prepare(void)
+ {
++	exynos_set_delayed_reset_assertion(false);
++
+ 	/* Set wake-up mask registers */
+ 	exynos_pm_set_wakeup_mask();
+ 
+@@ -383,6 +385,7 @@ early_wakeup:
+ 
+ 	/* Clear SLEEP mode set in INFORM1 */
+ 	pmu_raw_writel(0x0, S5P_INFORM1);
++	exynos_set_delayed_reset_assertion(true);
+ }
+ 
+ static void exynos3250_pm_resume(void)
+diff --git a/arch/powerpc/kernel/idle_power7.S b/arch/powerpc/kernel/idle_power7.S
+index 05adc8bbdef8..401d8d0085aa 100644
+--- a/arch/powerpc/kernel/idle_power7.S
++++ b/arch/powerpc/kernel/idle_power7.S
+@@ -500,9 +500,11 @@ BEGIN_FTR_SECTION
+ 	CHECK_HMI_INTERRUPT
+ END_FTR_SECTION_IFSET(CPU_FTR_HVMODE)
+ 	ld	r1,PACAR1(r13)
++	ld	r6,_CCR(r1)
+ 	ld	r4,_MSR(r1)
+ 	ld	r5,_NIP(r1)
+ 	addi	r1,r1,INT_FRAME_SIZE
++	mtcr	r6
+ 	mtspr	SPRN_SRR1,r4
+ 	mtspr	SPRN_SRR0,r5
+ 	rfid
+diff --git a/arch/x86/kernel/kprobes/core.c b/arch/x86/kernel/kprobes/core.c
+index 4e3d5a9621fe..03189d86357d 100644
+--- a/arch/x86/kernel/kprobes/core.c
++++ b/arch/x86/kernel/kprobes/core.c
+@@ -354,6 +354,7 @@ int __copy_instruction(u8 *dest, u8 *src)
+ {
+ 	struct insn insn;
+ 	kprobe_opcode_t buf[MAX_INSN_SIZE];
++	int length;
+ 	unsigned long recovered_insn =
+ 		recover_probed_instruction(buf, (unsigned long)src);
+ 
+@@ -361,16 +362,18 @@ int __copy_instruction(u8 *dest, u8 *src)
+ 		return 0;
+ 	kernel_insn_init(&insn, (void *)recovered_insn, MAX_INSN_SIZE);
+ 	insn_get_length(&insn);
++	length = insn.length;
++
+ 	/* Another subsystem puts a breakpoint, failed to recover */
+ 	if (insn.opcode.bytes[0] == BREAKPOINT_INSTRUCTION)
+ 		return 0;
+-	memcpy(dest, insn.kaddr, insn.length);
++	memcpy(dest, insn.kaddr, length);
+ 
+ #ifdef CONFIG_X86_64
+ 	if (insn_rip_relative(&insn)) {
+ 		s64 newdisp;
+ 		u8 *disp;
+-		kernel_insn_init(&insn, dest, insn.length);
++		kernel_insn_init(&insn, dest, length);
+ 		insn_get_displacement(&insn);
+ 		/*
+ 		 * The copied instruction uses the %rip-relative addressing
+@@ -394,7 +397,7 @@ int __copy_instruction(u8 *dest, u8 *src)
+ 		*(s32 *) disp = (s32) newdisp;
+ 	}
+ #endif
+-	return insn.length;
++	return length;
+ }
+ 
+ static int arch_copy_kprobe(struct kprobe *p)
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 4ee827d7bf36..3cb2b58fa26b 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1064,6 +1064,17 @@ static void update_divide_count(struct kvm_lapic *apic)
+ 				   apic->divide_count);
+ }
+ 
++static void apic_update_lvtt(struct kvm_lapic *apic)
++{
++	u32 timer_mode = kvm_apic_get_reg(apic, APIC_LVTT) &
++			apic->lapic_timer.timer_mode_mask;
++
++	if (apic->lapic_timer.timer_mode != timer_mode) {
++		apic->lapic_timer.timer_mode = timer_mode;
++		hrtimer_cancel(&apic->lapic_timer.timer);
++	}
++}
++
+ static void apic_timer_expired(struct kvm_lapic *apic)
+ {
+ 	struct kvm_vcpu *vcpu = apic->vcpu;
+@@ -1272,6 +1283,7 @@ static int apic_reg_write(struct kvm_lapic *apic, u32 reg, u32 val)
+ 				apic_set_reg(apic, APIC_LVTT + 0x10 * i,
+ 					     lvt_val | APIC_LVT_MASKED);
+ 			}
++			apic_update_lvtt(apic);
+ 			atomic_set(&apic->lapic_timer.pending, 0);
+ 
+ 		}
+@@ -1304,20 +1316,13 @@ static int apic_reg_write(struct kvm_lapic *apic, u32 reg, u32 val)
+ 
+ 		break;
+ 
+-	case APIC_LVTT: {
+-		u32 timer_mode = val & apic->lapic_timer.timer_mode_mask;
+-
+-		if (apic->lapic_timer.timer_mode != timer_mode) {
+-			apic->lapic_timer.timer_mode = timer_mode;
+-			hrtimer_cancel(&apic->lapic_timer.timer);
+-		}
+-
++	case APIC_LVTT:
+ 		if (!kvm_apic_sw_enabled(apic))
+ 			val |= APIC_LVT_MASKED;
+ 		val &= (apic_lvt_mask[0] | apic->lapic_timer.timer_mode_mask);
+ 		apic_set_reg(apic, APIC_LVTT, val);
++		apic_update_lvtt(apic);
+ 		break;
+-	}
+ 
+ 	case APIC_TMICT:
+ 		if (apic_lvtt_tscdeadline(apic))
+@@ -1552,7 +1557,7 @@ void kvm_lapic_reset(struct kvm_vcpu *vcpu)
+ 
+ 	for (i = 0; i < APIC_LVT_NUM; i++)
+ 		apic_set_reg(apic, APIC_LVTT + 0x10 * i, APIC_LVT_MASKED);
+-	apic->lapic_timer.timer_mode = 0;
++	apic_update_lvtt(apic);
+ 	apic_set_reg(apic, APIC_LVT0,
+ 		     SET_APIC_DELIVERY_MODE(0, APIC_MODE_EXTINT));
+ 
+@@ -1778,6 +1783,7 @@ void kvm_apic_post_state_restore(struct kvm_vcpu *vcpu,
+ 
+ 	apic_update_ppr(apic);
+ 	hrtimer_cancel(&apic->lapic_timer.timer);
++	apic_update_lvtt(apic);
+ 	update_divide_count(apic);
+ 	start_apic_timer(apic);
+ 	apic->irr_pending = true;
+diff --git a/drivers/bluetooth/ath3k.c b/drivers/bluetooth/ath3k.c
+index 288547a3c566..f26ebc5e0be6 100644
+--- a/drivers/bluetooth/ath3k.c
++++ b/drivers/bluetooth/ath3k.c
+@@ -80,6 +80,7 @@ static const struct usb_device_id ath3k_table[] = {
+ 	{ USB_DEVICE(0x0489, 0xe057) },
+ 	{ USB_DEVICE(0x0489, 0xe056) },
+ 	{ USB_DEVICE(0x0489, 0xe05f) },
++	{ USB_DEVICE(0x0489, 0xe076) },
+ 	{ USB_DEVICE(0x0489, 0xe078) },
+ 	{ USB_DEVICE(0x04c5, 0x1330) },
+ 	{ USB_DEVICE(0x04CA, 0x3004) },
+@@ -111,6 +112,7 @@ static const struct usb_device_id ath3k_table[] = {
+ 	{ USB_DEVICE(0x13d3, 0x3408) },
+ 	{ USB_DEVICE(0x13d3, 0x3423) },
+ 	{ USB_DEVICE(0x13d3, 0x3432) },
++	{ USB_DEVICE(0x13d3, 0x3474) },
+ 
+ 	/* Atheros AR5BBU12 with sflash firmware */
+ 	{ USB_DEVICE(0x0489, 0xE02C) },
+@@ -135,6 +137,7 @@ static const struct usb_device_id ath3k_blist_tbl[] = {
+ 	{ USB_DEVICE(0x0489, 0xe056), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe057), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe05f), .driver_info = BTUSB_ATH3012 },
++	{ USB_DEVICE(0x0489, 0xe076), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe078), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x04c5, 0x1330), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x04ca, 0x3004), .driver_info = BTUSB_ATH3012 },
+@@ -166,6 +169,7 @@ static const struct usb_device_id ath3k_blist_tbl[] = {
+ 	{ USB_DEVICE(0x13d3, 0x3408), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x13d3, 0x3423), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x13d3, 0x3432), .driver_info = BTUSB_ATH3012 },
++	{ USB_DEVICE(0x13d3, 0x3474), .driver_info = BTUSB_ATH3012 },
+ 
+ 	/* Atheros AR5BBU22 with sflash firmware */
+ 	{ USB_DEVICE(0x0489, 0xE036), .driver_info = BTUSB_ATH3012 },
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index 2c527da668ae..4fc415703ffc 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -174,6 +174,7 @@ static const struct usb_device_id blacklist_table[] = {
+ 	{ USB_DEVICE(0x0489, 0xe056), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe057), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe05f), .driver_info = BTUSB_ATH3012 },
++	{ USB_DEVICE(0x0489, 0xe076), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x0489, 0xe078), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x04c5, 0x1330), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x04ca, 0x3004), .driver_info = BTUSB_ATH3012 },
+@@ -205,6 +206,7 @@ static const struct usb_device_id blacklist_table[] = {
+ 	{ USB_DEVICE(0x13d3, 0x3408), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x13d3, 0x3423), .driver_info = BTUSB_ATH3012 },
+ 	{ USB_DEVICE(0x13d3, 0x3432), .driver_info = BTUSB_ATH3012 },
++	{ USB_DEVICE(0x13d3, 0x3474), .driver_info = BTUSB_ATH3012 },
+ 
+ 	/* Atheros AR5BBU12 with sflash firmware */
+ 	{ USB_DEVICE(0x0489, 0xe02c), .driver_info = BTUSB_IGNORE },
+diff --git a/drivers/clk/at91/clk-pll.c b/drivers/clk/at91/clk-pll.c
+index 6ec79dbc0840..cbbe40377ad6 100644
+--- a/drivers/clk/at91/clk-pll.c
++++ b/drivers/clk/at91/clk-pll.c
+@@ -173,8 +173,7 @@ static long clk_pll_get_best_div_mul(struct clk_pll *pll, unsigned long rate,
+ 	int i = 0;
+ 
+ 	/* Check if parent_rate is a valid input rate */
+-	if (parent_rate < characteristics->input.min ||
+-	    parent_rate > characteristics->input.max)
++	if (parent_rate < characteristics->input.min)
+ 		return -ERANGE;
+ 
+ 	/*
+@@ -187,6 +186,15 @@ static long clk_pll_get_best_div_mul(struct clk_pll *pll, unsigned long rate,
+ 	if (!mindiv)
+ 		mindiv = 1;
+ 
++	if (parent_rate > characteristics->input.max) {
++		tmpdiv = DIV_ROUND_UP(parent_rate, characteristics->input.max);
++		if (tmpdiv > PLL_DIV_MAX)
++			return -ERANGE;
++
++		if (tmpdiv > mindiv)
++			mindiv = tmpdiv;
++	}
++
+ 	/*
+ 	 * Calculate the maximum divider which is limited by PLL register
+ 	 * layout (limited by the MUL or DIV field size).
+diff --git a/drivers/clk/at91/pmc.h b/drivers/clk/at91/pmc.h
+index 69abb08cf146..eb8e5dc9076d 100644
+--- a/drivers/clk/at91/pmc.h
++++ b/drivers/clk/at91/pmc.h
+@@ -121,7 +121,7 @@ extern void __init of_at91sam9x5_clk_smd_setup(struct device_node *np,
+ 					       struct at91_pmc *pmc);
+ #endif
+ 
+-#if defined(CONFIG_HAVE_AT91_SMD)
++#if defined(CONFIG_HAVE_AT91_H32MX)
+ extern void __init of_sama5d4_clk_h32mx_setup(struct device_node *np,
+ 					      struct at91_pmc *pmc);
+ #endif
+diff --git a/drivers/crypto/caam/caamhash.c b/drivers/crypto/caam/caamhash.c
+index f347ab7eea95..08b0da23c4ab 100644
+--- a/drivers/crypto/caam/caamhash.c
++++ b/drivers/crypto/caam/caamhash.c
+@@ -1543,6 +1543,8 @@ static int ahash_init(struct ahash_request *req)
+ 
+ 	state->current_buf = 0;
+ 	state->buf_dma = 0;
++	state->buflen_0 = 0;
++	state->buflen_1 = 0;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/crypto/caam/caamrng.c b/drivers/crypto/caam/caamrng.c
+index ae31e555793c..a48dc251b14f 100644
+--- a/drivers/crypto/caam/caamrng.c
++++ b/drivers/crypto/caam/caamrng.c
+@@ -56,7 +56,7 @@
+ 
+ /* Buffer, its dma address and lock */
+ struct buf_data {
+-	u8 buf[RN_BUF_SIZE];
++	u8 buf[RN_BUF_SIZE] ____cacheline_aligned;
+ 	dma_addr_t addr;
+ 	struct completion filled;
+ 	u32 hw_desc[DESC_JOB_O_LEN];
+diff --git a/drivers/gpu/drm/i915/i915_drv.c b/drivers/gpu/drm/i915/i915_drv.c
+index ec4d932f8be4..169123a6ad0e 100644
+--- a/drivers/gpu/drm/i915/i915_drv.c
++++ b/drivers/gpu/drm/i915/i915_drv.c
+@@ -693,6 +693,16 @@ static int i915_drm_resume(struct drm_device *dev)
+ 		intel_init_pch_refclk(dev);
+ 		drm_mode_config_reset(dev);
+ 
++		/*
++		 * Interrupts have to be enabled before any batches are run.
++		 * If not the GPU will hang. i915_gem_init_hw() will initiate
++		 * batches to update/restore the context.
++		 *
++		 * Modeset enabling in intel_modeset_init_hw() also needs
++		 * working interrupts.
++		 */
++		intel_runtime_pm_enable_interrupts(dev_priv);
++
+ 		mutex_lock(&dev->struct_mutex);
+ 		if (i915_gem_init_hw(dev)) {
+ 			DRM_ERROR("failed to re-initialize GPU, declaring wedged!\n");
+@@ -700,9 +710,6 @@ static int i915_drm_resume(struct drm_device *dev)
+ 		}
+ 		mutex_unlock(&dev->struct_mutex);
+ 
+-		/* We need working interrupts for modeset enabling ... */
+-		intel_runtime_pm_enable_interrupts(dev_priv);
+-
+ 		intel_modeset_init_hw(dev);
+ 
+ 		spin_lock_irq(&dev_priv->irq_lock);
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 7a628e4cb27a..9536ec390614 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -2732,6 +2732,9 @@ void i915_gem_reset(struct drm_device *dev)
+ void
+ i915_gem_retire_requests_ring(struct intel_engine_cs *ring)
+ {
++	if (list_empty(&ring->request_list))
++		return;
++
+ 	WARN_ON(i915_verify_lists(ring->dev));
+ 
+ 	/* Retire requests first as we use it above for the early return.
+@@ -3088,8 +3091,8 @@ int i915_vma_unbind(struct i915_vma *vma)
+ 		} else if (vma->ggtt_view.pages) {
+ 			sg_free_table(vma->ggtt_view.pages);
+ 			kfree(vma->ggtt_view.pages);
+-			vma->ggtt_view.pages = NULL;
+ 		}
++		vma->ggtt_view.pages = NULL;
+ 	}
+ 
+ 	drm_mm_remove_node(&vma->node);
+diff --git a/drivers/gpu/drm/mgag200/mgag200_mode.c b/drivers/gpu/drm/mgag200/mgag200_mode.c
+index 9872ba9abf1a..2ffeda3589c2 100644
+--- a/drivers/gpu/drm/mgag200/mgag200_mode.c
++++ b/drivers/gpu/drm/mgag200/mgag200_mode.c
+@@ -1526,6 +1526,11 @@ static int mga_vga_mode_valid(struct drm_connector *connector,
+ 		return MODE_BANDWIDTH;
+ 	}
+ 
++	if ((mode->hdisplay % 8) != 0 || (mode->hsync_start % 8) != 0 ||
++	    (mode->hsync_end % 8) != 0 || (mode->htotal % 8) != 0) {
++		return MODE_H_ILLEGAL;
++	}
++
+ 	if (mode->crtc_hdisplay > 2048 || mode->crtc_hsync_start > 4096 ||
+ 	    mode->crtc_hsync_end > 4096 || mode->crtc_htotal > 4096 ||
+ 	    mode->crtc_vdisplay > 2048 || mode->crtc_vsync_start > 4096 ||
+diff --git a/drivers/gpu/drm/radeon/radeon_kms.c b/drivers/gpu/drm/radeon/radeon_kms.c
+index 686411e4e4f6..b82f2dd1fc32 100644
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -547,6 +547,9 @@ static int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file
+ 		else
+ 			*value = 1;
+ 		break;
++	case RADEON_INFO_VA_UNMAP_WORKING:
++		*value = true;
++		break;
+ 	default:
+ 		DRM_DEBUG_KMS("Invalid request %d\n", info->request);
+ 		return -EINVAL;
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 147029adb885..ac72ece70160 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -2316,7 +2316,6 @@ isert_build_rdma_wr(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+ 	page_off = offset % PAGE_SIZE;
+ 
+ 	send_wr->sg_list = ib_sge;
+-	send_wr->num_sge = sg_nents;
+ 	send_wr->wr_id = (uintptr_t)&isert_cmd->tx_desc;
+ 	/*
+ 	 * Perform mapping of TCM scatterlist memory ib_sge dma_addr.
+@@ -2336,14 +2335,17 @@ isert_build_rdma_wr(struct isert_conn *isert_conn, struct isert_cmd *isert_cmd,
+ 			  ib_sge->addr, ib_sge->length, ib_sge->lkey);
+ 		page_off = 0;
+ 		data_left -= ib_sge->length;
++		if (!data_left)
++			break;
+ 		ib_sge++;
+ 		isert_dbg("Incrementing ib_sge pointer to %p\n", ib_sge);
+ 	}
+ 
++	send_wr->num_sge = ++i;
+ 	isert_dbg("Set outgoing sg_list: %p num_sg: %u from TCM SGLs\n",
+ 		  send_wr->sg_list, send_wr->num_sge);
+ 
+-	return sg_nents;
++	return send_wr->num_sge;
+ }
+ 
+ static int
+@@ -3311,6 +3313,7 @@ static void isert_free_conn(struct iscsi_conn *conn)
+ {
+ 	struct isert_conn *isert_conn = conn->context;
+ 
++	isert_wait4flush(isert_conn);
+ 	isert_put_conn(isert_conn);
+ }
+ 
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 9b4e30a82e4a..beda011cb741 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1889,8 +1889,8 @@ static int map_request(struct dm_target *ti, struct request *rq,
+ 			dm_kill_unmapped_request(rq, r);
+ 			return r;
+ 		}
+-		if (IS_ERR(clone))
+-			return DM_MAPIO_REQUEUE;
++		if (r != DM_MAPIO_REMAPPED)
++			return r;
+ 		if (setup_clone(clone, rq, tio, GFP_KERNEL)) {
+ 			/* -ENOMEM */
+ 			ti->type->release_clone_rq(clone);
+diff --git a/drivers/net/wireless/b43/main.c b/drivers/net/wireless/b43/main.c
+index 75345c1e8c34..5c91df5c1f4f 100644
+--- a/drivers/net/wireless/b43/main.c
++++ b/drivers/net/wireless/b43/main.c
+@@ -5365,6 +5365,10 @@ static void b43_supported_bands(struct b43_wldev *dev, bool *have_2ghz_phy,
+ 		*have_5ghz_phy = true;
+ 		return;
+ 	case 0x4321: /* BCM4306 */
++		/* There are 14e4:4321 PCI devs with 2.4 GHz BCM4321 (N-PHY) */
++		if (dev->phy.type != B43_PHYTYPE_G)
++			break;
++		/* fall through */
+ 	case 0x4313: /* BCM4311 */
+ 	case 0x431a: /* BCM4318 */
+ 	case 0x432a: /* BCM4321 */
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 220c0fd059bb..50faef4f056f 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -1468,6 +1468,11 @@ skip_countries:
+ 		goto alloc_fail8;
+ 	}
+ 
++	if (quirks & CLEAR_HALT_CONDITIONS) {
++		usb_clear_halt(usb_dev, usb_rcvbulkpipe(usb_dev, epread->bEndpointAddress));
++		usb_clear_halt(usb_dev, usb_sndbulkpipe(usb_dev, epwrite->bEndpointAddress));
++	}
++
+ 	return 0;
+ alloc_fail8:
+ 	if (acm->country_codes) {
+@@ -1747,6 +1752,10 @@ static const struct usb_device_id acm_ids[] = {
+ 	.driver_info = NO_UNION_NORMAL, /* reports zero length descriptor */
+ 	},
+ 
++	{ USB_DEVICE(0x2912, 0x0001), /* ATOL FPrint */
++	.driver_info = CLEAR_HALT_CONDITIONS,
++	},
++
+ 	/* Nokia S60 phones expose two ACM channels. The first is
+ 	 * a modem and is picked up by the standard AT-command
+ 	 * information below. The second is 'vendor-specific' but
+diff --git a/drivers/usb/class/cdc-acm.h b/drivers/usb/class/cdc-acm.h
+index ffeb3c83941f..b3b6c9db6fe5 100644
+--- a/drivers/usb/class/cdc-acm.h
++++ b/drivers/usb/class/cdc-acm.h
+@@ -133,3 +133,4 @@ struct acm {
+ #define NO_DATA_INTERFACE		BIT(4)
+ #define IGNORE_DEVICE			BIT(5)
+ #define QUIRK_CONTROL_LINE_STATE	BIT(6)
++#define CLEAR_HALT_CONDITIONS		BIT(7)
+diff --git a/include/uapi/drm/radeon_drm.h b/include/uapi/drm/radeon_drm.h
+index 50d0fb41a3bf..76d2edea5bd1 100644
+--- a/include/uapi/drm/radeon_drm.h
++++ b/include/uapi/drm/radeon_drm.h
+@@ -1034,6 +1034,7 @@ struct drm_radeon_cs {
+ #define RADEON_INFO_VRAM_USAGE		0x1e
+ #define RADEON_INFO_GTT_USAGE		0x1f
+ #define RADEON_INFO_ACTIVE_CU_COUNT	0x20
++#define RADEON_INFO_VA_UNMAP_WORKING	0x25
+ 
+ struct drm_radeon_info {
+ 	uint32_t		request;
+diff --git a/kernel/trace/trace_events_filter.c b/kernel/trace/trace_events_filter.c
+index ced69da0ff55..7f2e97ce71a7 100644
+--- a/kernel/trace/trace_events_filter.c
++++ b/kernel/trace/trace_events_filter.c
+@@ -1369,19 +1369,26 @@ static int check_preds(struct filter_parse_state *ps)
+ {
+ 	int n_normal_preds = 0, n_logical_preds = 0;
+ 	struct postfix_elt *elt;
++	int cnt = 0;
+ 
+ 	list_for_each_entry(elt, &ps->postfix, list) {
+-		if (elt->op == OP_NONE)
++		if (elt->op == OP_NONE) {
++			cnt++;
+ 			continue;
++		}
+ 
+ 		if (elt->op == OP_AND || elt->op == OP_OR) {
+ 			n_logical_preds++;
++			cnt--;
+ 			continue;
+ 		}
++		if (elt->op != OP_NOT)
++			cnt--;
+ 		n_normal_preds++;
++		WARN_ON_ONCE(cnt < 0);
+ 	}
+ 
+-	if (!n_normal_preds || n_logical_preds >= n_normal_preds) {
++	if (cnt != 1 || !n_normal_preds || n_logical_preds >= n_normal_preds) {
+ 		parse_error(ps, FILT_ERR_INVALID_FILTER, 0);
+ 		return -EINVAL;
+ 	}
+diff --git a/sound/pci/hda/patch_sigmatel.c b/sound/pci/hda/patch_sigmatel.c
+index 87eff3173ce9..60b3100a2120 100644
+--- a/sound/pci/hda/patch_sigmatel.c
++++ b/sound/pci/hda/patch_sigmatel.c
+@@ -100,6 +100,7 @@ enum {
+ 	STAC_HP_ENVY_BASS,
+ 	STAC_HP_BNB13_EQ,
+ 	STAC_HP_ENVY_TS_BASS,
++	STAC_HP_ENVY_TS_DAC_BIND,
+ 	STAC_92HD83XXX_GPIO10_EAPD,
+ 	STAC_92HD83XXX_MODELS
+ };
+@@ -2170,6 +2171,22 @@ static void stac92hd83xxx_fixup_gpio10_eapd(struct hda_codec *codec,
+ 	spec->eapd_switch = 0;
+ }
+ 
++static void hp_envy_ts_fixup_dac_bind(struct hda_codec *codec,
++					    const struct hda_fixup *fix,
++					    int action)
++{
++	struct sigmatel_spec *spec = codec->spec;
++	static hda_nid_t preferred_pairs[] = {
++		0xd, 0x13,
++		0
++	};
++
++	if (action != HDA_FIXUP_ACT_PRE_PROBE)
++		return;
++
++	spec->gen.preferred_dacs = preferred_pairs;
++}
++
+ static const struct hda_verb hp_bnb13_eq_verbs[] = {
+ 	/* 44.1KHz base */
+ 	{ 0x22, 0x7A6, 0x3E },
+@@ -2685,6 +2702,12 @@ static const struct hda_fixup stac92hd83xxx_fixups[] = {
+ 			{}
+ 		},
+ 	},
++	[STAC_HP_ENVY_TS_DAC_BIND] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = hp_envy_ts_fixup_dac_bind,
++		.chained = true,
++		.chain_id = STAC_HP_ENVY_TS_BASS,
++	},
+ 	[STAC_92HD83XXX_GPIO10_EAPD] = {
+ 		.type = HDA_FIXUP_FUNC,
+ 		.v.func = stac92hd83xxx_fixup_gpio10_eapd,
+@@ -2763,6 +2786,8 @@ static const struct snd_pci_quirk stac92hd83xxx_fixup_tbl[] = {
+ 			  "HP bNB13", STAC_HP_BNB13_EQ),
+ 	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x190e,
+ 			  "HP ENVY TS", STAC_HP_ENVY_TS_BASS),
++	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x1967,
++			  "HP ENVY TS", STAC_HP_ENVY_TS_DAC_BIND),
+ 	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x1940,
+ 			  "HP bNB13", STAC_HP_BNB13_EQ),
+ 	SND_PCI_QUIRK(PCI_VENDOR_ID_HP, 0x1941,
