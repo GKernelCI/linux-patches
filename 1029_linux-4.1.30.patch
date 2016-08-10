@@ -1,0 +1,1516 @@
+diff --git a/Makefile b/Makefile
+index 76fa21fa16b8..137679c0cc49 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 1
+-SUBLEVEL = 29
++SUBLEVEL = 30
+ EXTRAVERSION =
+ NAME = Series 4800
+ 
+diff --git a/arch/arm/mach-mvebu/coherency.c b/arch/arm/mach-mvebu/coherency.c
+index e46e9ea1e187..0ee54cd9bf0b 100644
+--- a/arch/arm/mach-mvebu/coherency.c
++++ b/arch/arm/mach-mvebu/coherency.c
+@@ -116,22 +116,16 @@ static void __init armada_370_coherency_init(struct device_node *np)
+ }
+ 
+ /*
+- * This ioremap hook is used on Armada 375/38x to ensure that PCIe
+- * memory areas are mapped as MT_UNCACHED instead of MT_DEVICE. This
+- * is needed as a workaround for a deadlock issue between the PCIe
+- * interface and the cache controller.
++ * This ioremap hook is used on Armada 375/38x to ensure that all MMIO
++ * areas are mapped as MT_UNCACHED instead of MT_DEVICE. This is
++ * needed for the HW I/O coherency mechanism to work properly without
++ * deadlock.
+  */
+ static void __iomem *
+-armada_pcie_wa_ioremap_caller(phys_addr_t phys_addr, size_t size,
+-			      unsigned int mtype, void *caller)
++armada_wa_ioremap_caller(phys_addr_t phys_addr, size_t size,
++			 unsigned int mtype, void *caller)
+ {
+-	struct resource pcie_mem;
+-
+-	mvebu_mbus_get_pcie_mem_aperture(&pcie_mem);
+-
+-	if (pcie_mem.start <= phys_addr && (phys_addr + size) <= pcie_mem.end)
+-		mtype = MT_UNCACHED;
+-
++	mtype = MT_UNCACHED;
+ 	return __arm_ioremap_caller(phys_addr, size, mtype, caller);
+ }
+ 
+@@ -140,7 +134,7 @@ static void __init armada_375_380_coherency_init(struct device_node *np)
+ 	struct device_node *cache_dn;
+ 
+ 	coherency_cpu_base = of_iomap(np, 0);
+-	arch_ioremap_caller = armada_pcie_wa_ioremap_caller;
++	arch_ioremap_caller = armada_wa_ioremap_caller;
+ 
+ 	/*
+ 	 * We should switch the PL310 to I/O coherency mode only if
+diff --git a/arch/mips/kernel/setup.c b/arch/mips/kernel/setup.c
+index 49b52035226c..be73c491182b 100644
+--- a/arch/mips/kernel/setup.c
++++ b/arch/mips/kernel/setup.c
+@@ -686,9 +686,6 @@ static void __init arch_mem_init(char **cmdline_p)
+ 	for_each_memblock(reserved, reg)
+ 		if (reg->size != 0)
+ 			reserve_bootmem(reg->base, reg->size, BOOTMEM_DEFAULT);
+-
+-	reserve_bootmem_region(__pa_symbol(&__nosave_begin),
+-			__pa_symbol(&__nosave_end)); /* Reserve for hibernation */
+ }
+ 
+ static void __init resource_init(void)
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index 71c7ace855d7..1d71181dcc04 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -1301,18 +1301,10 @@ static int __init numa_parse_sun4u(void)
+ 
+ static int __init bootmem_init_numa(void)
+ {
+-	int i, j;
+ 	int err = -1;
+ 
+ 	numadbg("bootmem_init_numa()\n");
+ 
+-	/* Some sane defaults for numa latency values */
+-	for (i = 0; i < MAX_NUMNODES; i++) {
+-		for (j = 0; j < MAX_NUMNODES; j++)
+-			numa_latency[i][j] = (i == j) ?
+-				LOCAL_DISTANCE : REMOTE_DISTANCE;
+-	}
+-
+ 	if (numa_enabled) {
+ 		if (tlb_type == hypervisor)
+ 			err = numa_parse_mdesc();
+diff --git a/arch/x86/kernel/early-quirks.c b/arch/x86/kernel/early-quirks.c
+index fe9f0b79a18b..1390ecd8392a 100644
+--- a/arch/x86/kernel/early-quirks.c
++++ b/arch/x86/kernel/early-quirks.c
+@@ -11,7 +11,11 @@
+ 
+ #include <linux/pci.h>
+ #include <linux/acpi.h>
++#include <linux/delay.h>
++#include <linux/dmi.h>
+ #include <linux/pci_ids.h>
++#include <linux/bcma/bcma.h>
++#include <linux/bcma/bcma_regs.h>
+ #include <drm/i915_drm.h>
+ #include <asm/pci-direct.h>
+ #include <asm/dma.h>
+@@ -21,6 +25,9 @@
+ #include <asm/iommu.h>
+ #include <asm/gart.h>
+ #include <asm/irq_remapping.h>
++#include <asm/early_ioremap.h>
++
++#define dev_err(msg)  pr_err("pci 0000:%02x:%02x.%d: %s", bus, slot, func, msg)
+ 
+ static void __init fix_hypertransport_config(int num, int slot, int func)
+ {
+@@ -76,6 +83,13 @@ static void __init nvidia_bugs(int num, int slot, int func)
+ #ifdef CONFIG_ACPI
+ #ifdef CONFIG_X86_IO_APIC
+ 	/*
++	 * Only applies to Nvidia root ports (bus 0) and not to
++	 * Nvidia graphics cards with PCI ports on secondary buses.
++	 */
++	if (num)
++		return;
++
++	/*
+ 	 * All timer overrides on Nvidia are
+ 	 * wrong unless HPET is enabled.
+ 	 * Unfortunately that's not true on many Asus boards.
+@@ -588,6 +602,61 @@ static void __init force_disable_hpet(int num, int slot, int func)
+ #endif
+ }
+ 
++#define BCM4331_MMIO_SIZE	16384
++#define BCM4331_PM_CAP		0x40
++#define bcma_aread32(reg)	ioread32(mmio + 1 * BCMA_CORE_SIZE + reg)
++#define bcma_awrite32(reg, val)	iowrite32(val, mmio + 1 * BCMA_CORE_SIZE + reg)
++
++static void __init apple_airport_reset(int bus, int slot, int func)
++{
++	void __iomem *mmio;
++	u16 pmcsr;
++	u64 addr;
++	int i;
++
++	if (!dmi_match(DMI_SYS_VENDOR, "Apple Inc."))
++		return;
++
++	/* Card may have been put into PCI_D3hot by grub quirk */
++	pmcsr = read_pci_config_16(bus, slot, func, BCM4331_PM_CAP + PCI_PM_CTRL);
++
++	if ((pmcsr & PCI_PM_CTRL_STATE_MASK) != PCI_D0) {
++		pmcsr &= ~PCI_PM_CTRL_STATE_MASK;
++		write_pci_config_16(bus, slot, func, BCM4331_PM_CAP + PCI_PM_CTRL, pmcsr);
++		mdelay(10);
++
++		pmcsr = read_pci_config_16(bus, slot, func, BCM4331_PM_CAP + PCI_PM_CTRL);
++		if ((pmcsr & PCI_PM_CTRL_STATE_MASK) != PCI_D0) {
++			dev_err("Cannot power up Apple AirPort card\n");
++			return;
++		}
++	}
++
++	addr  =      read_pci_config(bus, slot, func, PCI_BASE_ADDRESS_0);
++	addr |= (u64)read_pci_config(bus, slot, func, PCI_BASE_ADDRESS_1) << 32;
++	addr &= PCI_BASE_ADDRESS_MEM_MASK;
++
++	mmio = early_ioremap(addr, BCM4331_MMIO_SIZE);
++	if (!mmio) {
++		dev_err("Cannot iomap Apple AirPort card\n");
++		return;
++	}
++
++	pr_info("Resetting Apple AirPort card (left enabled by EFI)\n");
++
++	for (i = 0; bcma_aread32(BCMA_RESET_ST) && i < 30; i++)
++		udelay(10);
++
++	bcma_awrite32(BCMA_RESET_CTL, BCMA_RESET_CTL_RESET);
++	bcma_aread32(BCMA_RESET_CTL);
++	udelay(1);
++
++	bcma_awrite32(BCMA_RESET_CTL, 0);
++	bcma_aread32(BCMA_RESET_CTL);
++	udelay(10);
++
++	early_iounmap(mmio, BCM4331_MMIO_SIZE);
++}
+ 
+ #define QFLAG_APPLY_ONCE 	0x1
+ #define QFLAG_APPLIED		0x2
+@@ -601,12 +670,6 @@ struct chipset {
+ 	void (*f)(int num, int slot, int func);
+ };
+ 
+-/*
+- * Only works for devices on the root bus. If you add any devices
+- * not on bus 0 readd another loop level in early_quirks(). But
+- * be careful because at least the Nvidia quirk here relies on
+- * only matching on bus 0.
+- */
+ static struct chipset early_qrk[] __initdata = {
+ 	{ PCI_VENDOR_ID_NVIDIA, PCI_ANY_ID,
+ 	  PCI_CLASS_BRIDGE_PCI, PCI_ANY_ID, QFLAG_APPLY_ONCE, nvidia_bugs },
+@@ -632,9 +695,13 @@ static struct chipset early_qrk[] __initdata = {
+ 	 */
+ 	{ PCI_VENDOR_ID_INTEL, 0x0f00,
+ 		PCI_CLASS_BRIDGE_HOST, PCI_ANY_ID, 0, force_disable_hpet},
++	{ PCI_VENDOR_ID_BROADCOM, 0x4331,
++	  PCI_CLASS_NETWORK_OTHER, PCI_ANY_ID, 0, apple_airport_reset},
+ 	{}
+ };
+ 
++static void __init early_pci_scan_bus(int bus);
++
+ /**
+  * check_dev_quirk - apply early quirks to a given PCI device
+  * @num: bus number
+@@ -643,7 +710,7 @@ static struct chipset early_qrk[] __initdata = {
+  *
+  * Check the vendor & device ID against the early quirks table.
+  *
+- * If the device is single function, let early_quirks() know so we don't
++ * If the device is single function, let early_pci_scan_bus() know so we don't
+  * poke at this device again.
+  */
+ static int __init check_dev_quirk(int num, int slot, int func)
+@@ -652,6 +719,7 @@ static int __init check_dev_quirk(int num, int slot, int func)
+ 	u16 vendor;
+ 	u16 device;
+ 	u8 type;
++	u8 sec;
+ 	int i;
+ 
+ 	class = read_pci_config_16(num, slot, func, PCI_CLASS_DEVICE);
+@@ -679,25 +747,36 @@ static int __init check_dev_quirk(int num, int slot, int func)
+ 
+ 	type = read_pci_config_byte(num, slot, func,
+ 				    PCI_HEADER_TYPE);
++
++	if ((type & 0x7f) == PCI_HEADER_TYPE_BRIDGE) {
++		sec = read_pci_config_byte(num, slot, func, PCI_SECONDARY_BUS);
++		if (sec > num)
++			early_pci_scan_bus(sec);
++	}
++
+ 	if (!(type & 0x80))
+ 		return -1;
+ 
+ 	return 0;
+ }
+ 
+-void __init early_quirks(void)
++static void __init early_pci_scan_bus(int bus)
+ {
+ 	int slot, func;
+ 
+-	if (!early_pci_allowed())
+-		return;
+-
+ 	/* Poor man's PCI discovery */
+-	/* Only scan the root bus */
+ 	for (slot = 0; slot < 32; slot++)
+ 		for (func = 0; func < 8; func++) {
+ 			/* Only probe function 0 on single fn devices */
+-			if (check_dev_quirk(0, slot, func))
++			if (check_dev_quirk(bus, slot, func))
+ 				break;
+ 		}
+ }
++
++void __init early_quirks(void)
++{
++	if (!early_pci_allowed())
++		return;
++
++	early_pci_scan_bus(0);
++}
+diff --git a/drivers/ata/libata-core.c b/drivers/ata/libata-core.c
+index e0064d180f04..9daf46bf3a28 100644
+--- a/drivers/ata/libata-core.c
++++ b/drivers/ata/libata-core.c
+@@ -4138,6 +4138,12 @@ static const struct ata_blacklist_entry ata_device_blacklist [] = {
+ 	 */
+ 	{ "ST380013AS",		"3.20",		ATA_HORKAGE_MAX_SEC_1024 },
+ 
++	/*
++	 * Device times out with higher max sects.
++	 * https://bugzilla.kernel.org/show_bug.cgi?id=121671
++	 */
++	{ "LITEON CX1-JB256-HP", NULL,		ATA_HORKAGE_MAX_SEC_1024 },
++
+ 	/* Devices we expect to fail diagnostics */
+ 
+ 	/* Devices where NCQ should be avoided */
+diff --git a/drivers/bcma/bcma_private.h b/drivers/bcma/bcma_private.h
+index 15f2b2e242ea..d492c2eddd7b 100644
+--- a/drivers/bcma/bcma_private.h
++++ b/drivers/bcma/bcma_private.h
+@@ -8,8 +8,6 @@
+ #include <linux/bcma/bcma.h>
+ #include <linux/delay.h>
+ 
+-#define BCMA_CORE_SIZE		0x1000
+-
+ #define bcma_err(bus, fmt, ...) \
+ 	pr_err("bus%d: " fmt, (bus)->num, ##__VA_ARGS__)
+ #define bcma_warn(bus, fmt, ...) \
+diff --git a/drivers/gpu/drm/i915/i915_gem_shrinker.c b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+index f7929e769250..7ab9cc456dd2 100644
+--- a/drivers/gpu/drm/i915/i915_gem_shrinker.c
++++ b/drivers/gpu/drm/i915/i915_gem_shrinker.c
+@@ -39,7 +39,7 @@ static bool mutex_is_locked_by(struct mutex *mutex, struct task_struct *task)
+ 	if (!mutex_is_locked(mutex))
+ 		return false;
+ 
+-#if defined(CONFIG_SMP) || defined(CONFIG_DEBUG_MUTEXES)
++#if defined(CONFIG_DEBUG_MUTEXES) || defined(CONFIG_MUTEX_SPIN_ON_OWNER)
+ 	return mutex->owner == task;
+ #else
+ 	/* Since UP may be pre-empted, we cannot assume that we own the lock */
+diff --git a/drivers/gpu/drm/ttm/ttm_bo.c b/drivers/gpu/drm/ttm/ttm_bo.c
+index 8d9b7de25613..0c4fd830d64b 100644
+--- a/drivers/gpu/drm/ttm/ttm_bo.c
++++ b/drivers/gpu/drm/ttm/ttm_bo.c
+@@ -1000,9 +1000,9 @@ out_unlock:
+ 	return ret;
+ }
+ 
+-static bool ttm_bo_mem_compat(struct ttm_placement *placement,
+-			      struct ttm_mem_reg *mem,
+-			      uint32_t *new_flags)
++bool ttm_bo_mem_compat(struct ttm_placement *placement,
++		       struct ttm_mem_reg *mem,
++		       uint32_t *new_flags)
+ {
+ 	int i;
+ 
+@@ -1034,6 +1034,7 @@ static bool ttm_bo_mem_compat(struct ttm_placement *placement,
+ 
+ 	return false;
+ }
++EXPORT_SYMBOL(ttm_bo_mem_compat);
+ 
+ int ttm_bo_validate(struct ttm_buffer_object *bo,
+ 			struct ttm_placement *placement,
+diff --git a/drivers/input/joystick/xpad.c b/drivers/input/joystick/xpad.c
+index 61c761156371..a450c4ee1217 100644
+--- a/drivers/input/joystick/xpad.c
++++ b/drivers/input/joystick/xpad.c
+@@ -1025,6 +1025,9 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 	int ep_irq_in_idx;
+ 	int i, error;
+ 
++	if (intf->cur_altsetting->desc.bNumEndpoints != 2)
++		return -ENODEV;
++
+ 	for (i = 0; xpad_device[i].idVendor; i++) {
+ 		if ((le16_to_cpu(udev->descriptor.idVendor) == xpad_device[i].idVendor) &&
+ 		    (le16_to_cpu(udev->descriptor.idProduct) == xpad_device[i].idProduct))
+diff --git a/drivers/media/usb/airspy/airspy.c b/drivers/media/usb/airspy/airspy.c
+index a50750ce511d..ce51bf19cef3 100644
+--- a/drivers/media/usb/airspy/airspy.c
++++ b/drivers/media/usb/airspy/airspy.c
+@@ -1072,7 +1072,7 @@ static int airspy_probe(struct usb_interface *intf,
+ 	if (ret) {
+ 		dev_err(s->dev, "Failed to register as video device (%d)\n",
+ 				ret);
+-		goto err_unregister_v4l2_dev;
++		goto err_free_controls;
+ 	}
+ 	dev_info(s->dev, "Registered as %s\n",
+ 			video_device_node_name(&s->vdev));
+@@ -1081,7 +1081,6 @@ static int airspy_probe(struct usb_interface *intf,
+ 
+ err_free_controls:
+ 	v4l2_ctrl_handler_free(&s->hdl);
+-err_unregister_v4l2_dev:
+ 	v4l2_device_unregister(&s->v4l2_dev);
+ err_free_mem:
+ 	kfree(s);
+diff --git a/drivers/mmc/card/block.c b/drivers/mmc/card/block.c
+index 3705c7e63521..ccefd6ca9c99 100644
+--- a/drivers/mmc/card/block.c
++++ b/drivers/mmc/card/block.c
+@@ -1664,8 +1664,8 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
+ 
+ 	packed_cmd_hdr = packed->cmd_hdr;
+ 	memset(packed_cmd_hdr, 0, sizeof(packed->cmd_hdr));
+-	packed_cmd_hdr[0] = (packed->nr_entries << 16) |
+-		(PACKED_CMD_WR << 8) | PACKED_CMD_VER;
++	packed_cmd_hdr[0] = cpu_to_le32((packed->nr_entries << 16) |
++		(PACKED_CMD_WR << 8) | PACKED_CMD_VER);
+ 	hdr_blocks = mmc_large_sector(card) ? 8 : 1;
+ 
+ 	/*
+@@ -1679,14 +1679,14 @@ static void mmc_blk_packed_hdr_wrq_prep(struct mmc_queue_req *mqrq,
+ 			((brq->data.blocks * brq->data.blksz) >=
+ 			 card->ext_csd.data_tag_unit_size);
+ 		/* Argument of CMD23 */
+-		packed_cmd_hdr[(i * 2)] =
++		packed_cmd_hdr[(i * 2)] = cpu_to_le32(
+ 			(do_rel_wr ? MMC_CMD23_ARG_REL_WR : 0) |
+ 			(do_data_tag ? MMC_CMD23_ARG_TAG_REQ : 0) |
+-			blk_rq_sectors(prq);
++			blk_rq_sectors(prq));
+ 		/* Argument of CMD18 or CMD25 */
+-		packed_cmd_hdr[((i * 2)) + 1] =
++		packed_cmd_hdr[((i * 2)) + 1] = cpu_to_le32(
+ 			mmc_card_blockaddr(card) ?
+-			blk_rq_pos(prq) : blk_rq_pos(prq) << 9;
++			blk_rq_pos(prq) : blk_rq_pos(prq) << 9);
+ 		packed->blocks += blk_rq_sectors(prq);
+ 		i++;
+ 	}
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index e4c079612100..40161dacc9c7 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -222,7 +222,7 @@
+ /* Various constants */
+ 
+ /* Coalescing */
+-#define MVNETA_TXDONE_COAL_PKTS		1
++#define MVNETA_TXDONE_COAL_PKTS		0	/* interrupt per packet */
+ #define MVNETA_RX_COAL_PKTS		32
+ #define MVNETA_RX_COAL_USEC		100
+ 
+diff --git a/drivers/pps/clients/pps_parport.c b/drivers/pps/clients/pps_parport.c
+index 38a8bbe74810..83797d89c30f 100644
+--- a/drivers/pps/clients/pps_parport.c
++++ b/drivers/pps/clients/pps_parport.c
+@@ -195,7 +195,7 @@ static void parport_detach(struct parport *port)
+ 	struct pps_client_pp *device;
+ 
+ 	/* FIXME: oooh, this is ugly! */
+-	if (strcmp(pardev->name, KBUILD_MODNAME))
++	if (!pardev || strcmp(pardev->name, KBUILD_MODNAME))
+ 		/* not our port */
+ 		return;
+ 
+diff --git a/drivers/tty/vt/keyboard.c b/drivers/tty/vt/keyboard.c
+index 8a89f6e7715d..8353ce1991b8 100644
+--- a/drivers/tty/vt/keyboard.c
++++ b/drivers/tty/vt/keyboard.c
+@@ -365,34 +365,22 @@ static void to_utf8(struct vc_data *vc, uint c)
+ 
+ static void do_compute_shiftstate(void)
+ {
+-	unsigned int i, j, k, sym, val;
++	unsigned int k, sym, val;
+ 
+ 	shift_state = 0;
+ 	memset(shift_down, 0, sizeof(shift_down));
+ 
+-	for (i = 0; i < ARRAY_SIZE(key_down); i++) {
+-
+-		if (!key_down[i])
++	for_each_set_bit(k, key_down, min(NR_KEYS, KEY_CNT)) {
++		sym = U(key_maps[0][k]);
++		if (KTYP(sym) != KT_SHIFT && KTYP(sym) != KT_SLOCK)
+ 			continue;
+ 
+-		k = i * BITS_PER_LONG;
+-
+-		for (j = 0; j < BITS_PER_LONG; j++, k++) {
+-
+-			if (!test_bit(k, key_down))
+-				continue;
++		val = KVAL(sym);
++		if (val == KVAL(K_CAPSSHIFT))
++			val = KVAL(K_SHIFT);
+ 
+-			sym = U(key_maps[0][k]);
+-			if (KTYP(sym) != KT_SHIFT && KTYP(sym) != KT_SLOCK)
+-				continue;
+-
+-			val = KVAL(sym);
+-			if (val == KVAL(K_CAPSSHIFT))
+-				val = KVAL(K_SHIFT);
+-
+-			shift_down[val]++;
+-			shift_state |= (1 << val);
+-		}
++		shift_down[val]++;
++		shift_state |= BIT(val);
+ 	}
+ }
+ 
+diff --git a/fs/overlayfs/dir.c b/fs/overlayfs/dir.c
+index a2b1d7ce3e1a..977236a46aa2 100644
+--- a/fs/overlayfs/dir.c
++++ b/fs/overlayfs/dir.c
+@@ -511,6 +511,7 @@ static int ovl_remove_and_whiteout(struct dentry *dentry, bool is_dir)
+ 	struct dentry *upper;
+ 	struct dentry *opaquedir = NULL;
+ 	int err;
++	int flags = 0;
+ 
+ 	if (WARN_ON(!workdir))
+ 		return -EROFS;
+@@ -540,46 +541,39 @@ static int ovl_remove_and_whiteout(struct dentry *dentry, bool is_dir)
+ 	if (err)
+ 		goto out_dput;
+ 
+-	whiteout = ovl_whiteout(workdir, dentry);
+-	err = PTR_ERR(whiteout);
+-	if (IS_ERR(whiteout))
++	upper = lookup_one_len(dentry->d_name.name, upperdir,
++			       dentry->d_name.len);
++	err = PTR_ERR(upper);
++	if (IS_ERR(upper))
+ 		goto out_unlock;
+ 
+-	upper = ovl_dentry_upper(dentry);
+-	if (!upper) {
+-		upper = lookup_one_len(dentry->d_name.name, upperdir,
+-				       dentry->d_name.len);
+-		err = PTR_ERR(upper);
+-		if (IS_ERR(upper))
+-			goto kill_whiteout;
+-
+-		err = ovl_do_rename(wdir, whiteout, udir, upper, 0);
+-		dput(upper);
+-		if (err)
+-			goto kill_whiteout;
+-	} else {
+-		int flags = 0;
++	err = -ESTALE;
++	if ((opaquedir && upper != opaquedir) ||
++	    (!opaquedir && ovl_dentry_upper(dentry) &&
++	     upper != ovl_dentry_upper(dentry))) {
++		goto out_dput_upper;
++	}
+ 
+-		if (opaquedir)
+-			upper = opaquedir;
+-		err = -ESTALE;
+-		if (upper->d_parent != upperdir)
+-			goto kill_whiteout;
++	whiteout = ovl_whiteout(workdir, dentry);
++	err = PTR_ERR(whiteout);
++	if (IS_ERR(whiteout))
++		goto out_dput_upper;
+ 
+-		if (is_dir)
+-			flags |= RENAME_EXCHANGE;
++	if (d_is_dir(upper))
++		flags = RENAME_EXCHANGE;
+ 
+-		err = ovl_do_rename(wdir, whiteout, udir, upper, flags);
+-		if (err)
+-			goto kill_whiteout;
++	err = ovl_do_rename(wdir, whiteout, udir, upper, flags);
++	if (err)
++		goto kill_whiteout;
++	if (flags)
++		ovl_cleanup(wdir, upper);
+ 
+-		if (is_dir)
+-			ovl_cleanup(wdir, upper);
+-	}
+ 	ovl_dentry_version_inc(dentry->d_parent);
+ out_d_drop:
+ 	d_drop(dentry);
+ 	dput(whiteout);
++out_dput_upper:
++	dput(upper);
+ out_unlock:
+ 	unlock_rename(workdir, upperdir);
+ out_dput:
+diff --git a/fs/overlayfs/inode.c b/fs/overlayfs/inode.c
+index edd2a4a5fd3c..97fd65700ae2 100644
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -67,6 +67,10 @@ int ovl_setattr(struct dentry *dentry, struct iattr *attr)
+ 		upperdentry = ovl_dentry_upper(dentry);
+ 
+ 		mutex_lock(&upperdentry->d_inode->i_mutex);
++
++		if (attr->ia_valid & (ATTR_KILL_SUID|ATTR_KILL_SGID))
++			attr->ia_valid &= ~ATTR_MODE;
++
+ 		err = notify_change(upperdentry, attr, NULL);
+ 		if (!err)
+ 			ovl_copyattr(upperdentry->d_inode, dentry->d_inode);
+@@ -411,12 +415,11 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode,
+ 	if (!inode)
+ 		return NULL;
+ 
+-	mode &= S_IFMT;
+-
+ 	inode->i_ino = get_next_ino();
+ 	inode->i_mode = mode;
+ 	inode->i_flags |= S_NOATIME | S_NOCMTIME;
+ 
++	mode &= S_IFMT;
+ 	switch (mode) {
+ 	case S_IFDIR:
+ 		inode->i_private = oe;
+diff --git a/fs/overlayfs/overlayfs.h b/fs/overlayfs/overlayfs.h
+index ea5a40b06e3a..983540910ba8 100644
+--- a/fs/overlayfs/overlayfs.h
++++ b/fs/overlayfs/overlayfs.h
+@@ -181,6 +181,7 @@ static inline void ovl_copyattr(struct inode *from, struct inode *to)
+ {
+ 	to->i_uid = from->i_uid;
+ 	to->i_gid = from->i_gid;
++	to->i_mode = from->i_mode;
+ }
+ 
+ /* dir.c */
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index 8bd374d3cf21..13671bc9a288 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -521,15 +521,19 @@
+ 
+ #define INIT_TEXT							\
+ 	*(.init.text)							\
++	*(.text.startup)						\
+ 	MEM_DISCARD(init.text)
+ 
+ #define EXIT_DATA							\
+ 	*(.exit.data)							\
++	*(.fini_array)							\
++	*(.dtors)							\
+ 	MEM_DISCARD(exit.data)						\
+ 	MEM_DISCARD(exit.rodata)
+ 
+ #define EXIT_TEXT							\
+ 	*(.exit.text)							\
++	*(.text.exit)							\
+ 	MEM_DISCARD(exit.text)
+ 
+ #define EXIT_CALL							\
+diff --git a/include/drm/ttm/ttm_bo_api.h b/include/drm/ttm/ttm_bo_api.h
+index c768ddfbe53c..b7bfa513e6ed 100644
+--- a/include/drm/ttm/ttm_bo_api.h
++++ b/include/drm/ttm/ttm_bo_api.h
+@@ -316,6 +316,20 @@ ttm_bo_reference(struct ttm_buffer_object *bo)
+  */
+ extern int ttm_bo_wait(struct ttm_buffer_object *bo, bool lazy,
+ 		       bool interruptible, bool no_wait);
++
++/**
++ * ttm_bo_mem_compat - Check if proposed placement is compatible with a bo
++ *
++ * @placement:  Return immediately if buffer is busy.
++ * @mem:  The struct ttm_mem_reg indicating the region where the bo resides
++ * @new_flags: Describes compatible placement found
++ *
++ * Returns true if the placement is compatible
++ */
++extern bool ttm_bo_mem_compat(struct ttm_placement *placement,
++			      struct ttm_mem_reg *mem,
++			      uint32_t *new_flags);
++
+ /**
+  * ttm_bo_validate
+  *
+diff --git a/include/linux/bcma/bcma.h b/include/linux/bcma/bcma.h
+index e34f906647d3..567fb450fbfe 100644
+--- a/include/linux/bcma/bcma.h
++++ b/include/linux/bcma/bcma.h
+@@ -154,6 +154,7 @@ struct bcma_host_ops {
+ #define BCMA_CORE_DEFAULT		0xFFF
+ 
+ #define BCMA_MAX_NR_CORES		16
++#define BCMA_CORE_SIZE			0x1000
+ 
+ /* Chip IDs of PCIe devices */
+ #define BCMA_CHIP_ID_BCM4313	0x4313
+diff --git a/include/linux/netfilter/x_tables.h b/include/linux/netfilter/x_tables.h
+index 7741efa43b35..cc615e273f80 100644
+--- a/include/linux/netfilter/x_tables.h
++++ b/include/linux/netfilter/x_tables.h
+@@ -243,6 +243,10 @@ int xt_check_entry_offsets(const void *base, const char *elems,
+ 			   unsigned int target_offset,
+ 			   unsigned int next_offset);
+ 
++unsigned int *xt_alloc_entry_offsets(unsigned int size);
++bool xt_find_jump_offset(const unsigned int *offsets,
++			 unsigned int target, unsigned int size);
++
+ int xt_check_match(struct xt_mtchk_param *, unsigned int size, u_int8_t proto,
+ 		   bool inv_proto);
+ int xt_check_target(struct xt_tgchk_param *, unsigned int size, u_int8_t proto,
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index 5d5174b59802..673dee29a9b9 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -382,6 +382,7 @@ static inline __must_check
+ void **radix_tree_iter_retry(struct radix_tree_iter *iter)
+ {
+ 	iter->next_index = iter->index;
++	iter->tags = 0;
+ 	return NULL;
+ }
+ 
+diff --git a/kernel/time/posix-cpu-timers.c b/kernel/time/posix-cpu-timers.c
+index 0075da74abf0..57d1acb91c56 100644
+--- a/kernel/time/posix-cpu-timers.c
++++ b/kernel/time/posix-cpu-timers.c
+@@ -784,6 +784,7 @@ static void posix_cpu_timer_get(struct k_itimer *timer, struct itimerspec *itp)
+ 			timer->it.cpu.expires = 0;
+ 			sample_to_timespec(timer->it_clock, timer->it.cpu.expires,
+ 					   &itp->it_value);
++			return;
+ 		} else {
+ 			cpu_timer_sample_group(timer->it_clock, p, &now);
+ 			unlock_task_sighand(p, &flags);
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 32c719a4bc3d..f93ada7403bf 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -948,13 +948,10 @@ static void isolate_freepages(struct compact_control *cc)
+ 	 * pages on cc->migratepages. We stop searching if the migrate
+ 	 * and free page scanners meet or enough free pages are isolated.
+ 	 */
+-	for (; block_start_pfn >= low_pfn &&
+-			cc->nr_migratepages > cc->nr_freepages;
++	for (; block_start_pfn >= low_pfn;
+ 				block_end_pfn = block_start_pfn,
+ 				block_start_pfn -= pageblock_nr_pages,
+ 				isolate_start_pfn = block_start_pfn) {
+-		unsigned long isolated;
+-
+ 		/*
+ 		 * This can iterate a massively long zone without finding any
+ 		 * suitable migration targets, so periodically check if we need
+@@ -978,43 +975,43 @@ static void isolate_freepages(struct compact_control *cc)
+ 			continue;
+ 
+ 		/* Found a block suitable for isolating free pages from. */
+-		isolated = isolate_freepages_block(cc, &isolate_start_pfn,
+-						block_end_pfn, freelist, false);
+-		/* If isolation failed early, do not continue needlessly */
+-		if (!isolated && isolate_start_pfn < block_end_pfn &&
+-		    cc->nr_migratepages > cc->nr_freepages)
+-			break;
+-
+-		/*
+-		 * Remember where the free scanner should restart next time,
+-		 * which is where isolate_freepages_block() left off.
+-		 * But if it scanned the whole pageblock, isolate_start_pfn
+-		 * now points at block_end_pfn, which is the start of the next
+-		 * pageblock.
+-		 * In that case we will however want to restart at the start
+-		 * of the previous pageblock.
+-		 */
+-		cc->free_pfn = (isolate_start_pfn < block_end_pfn) ?
+-				isolate_start_pfn :
+-				block_start_pfn - pageblock_nr_pages;
++		isolate_freepages_block(cc, &isolate_start_pfn, block_end_pfn,
++					freelist, false);
+ 
+ 		/*
+-		 * isolate_freepages_block() might have aborted due to async
+-		 * compaction being contended
++		 * If we isolated enough freepages, or aborted due to lock
++		 * contention, terminate.
+ 		 */
+-		if (cc->contended)
++		if ((cc->nr_freepages >= cc->nr_migratepages)
++							|| cc->contended) {
++			if (isolate_start_pfn >= block_end_pfn) {
++				/*
++				 * Restart at previous pageblock if more
++				 * freepages can be isolated next time.
++				 */
++				isolate_start_pfn =
++					block_start_pfn - pageblock_nr_pages;
++			}
+ 			break;
++		} else if (isolate_start_pfn < block_end_pfn) {
++			/*
++			 * If isolation failed early, do not continue
++			 * needlessly.
++			 */
++			break;
++		}
+ 	}
+ 
+ 	/* split_free_page does not map the pages */
+ 	map_pages(freelist);
+ 
+ 	/*
+-	 * If we crossed the migrate scanner, we want to keep it that way
+-	 * so that compact_finished() may detect this
++	 * Record where the free scanner will restart next time. Either we
++	 * broke from the loop and set isolate_start_pfn based on the last
++	 * call to isolate_freepages_block(), or we met the migration scanner
++	 * and the loop terminated due to isolate_start_pfn < low_pfn
+ 	 */
+-	if (block_start_pfn < low_pfn)
+-		cc->free_pfn = cc->migrate_pfn;
++	cc->free_pfn = isolate_start_pfn;
+ }
+ 
+ /*
+diff --git a/net/ceph/osdmap.c b/net/ceph/osdmap.c
+index 4a3125836b64..ddc3573894b0 100644
+--- a/net/ceph/osdmap.c
++++ b/net/ceph/osdmap.c
+@@ -1192,6 +1192,115 @@ struct ceph_osdmap *ceph_osdmap_decode(void **p, void *end)
+ }
+ 
+ /*
++ * Encoding order is (new_up_client, new_state, new_weight).  Need to
++ * apply in the (new_weight, new_state, new_up_client) order, because
++ * an incremental map may look like e.g.
++ *
++ *     new_up_client: { osd=6, addr=... } # set osd_state and addr
++ *     new_state: { osd=6, xorstate=EXISTS } # clear osd_state
++ */
++static int decode_new_up_state_weight(void **p, void *end,
++				      struct ceph_osdmap *map)
++{
++	void *new_up_client;
++	void *new_state;
++	void *new_weight_end;
++	u32 len;
++
++	new_up_client = *p;
++	ceph_decode_32_safe(p, end, len, e_inval);
++	len *= sizeof(u32) + sizeof(struct ceph_entity_addr);
++	ceph_decode_need(p, end, len, e_inval);
++	*p += len;
++
++	new_state = *p;
++	ceph_decode_32_safe(p, end, len, e_inval);
++	len *= sizeof(u32) + sizeof(u8);
++	ceph_decode_need(p, end, len, e_inval);
++	*p += len;
++
++	/* new_weight */
++	ceph_decode_32_safe(p, end, len, e_inval);
++	while (len--) {
++		s32 osd;
++		u32 w;
++
++		ceph_decode_need(p, end, 2*sizeof(u32), e_inval);
++		osd = ceph_decode_32(p);
++		w = ceph_decode_32(p);
++		BUG_ON(osd >= map->max_osd);
++		pr_info("osd%d weight 0x%x %s\n", osd, w,
++		     w == CEPH_OSD_IN ? "(in)" :
++		     (w == CEPH_OSD_OUT ? "(out)" : ""));
++		map->osd_weight[osd] = w;
++
++		/*
++		 * If we are marking in, set the EXISTS, and clear the
++		 * AUTOOUT and NEW bits.
++		 */
++		if (w) {
++			map->osd_state[osd] |= CEPH_OSD_EXISTS;
++			map->osd_state[osd] &= ~(CEPH_OSD_AUTOOUT |
++						 CEPH_OSD_NEW);
++		}
++	}
++	new_weight_end = *p;
++
++	/* new_state (up/down) */
++	*p = new_state;
++	len = ceph_decode_32(p);
++	while (len--) {
++		s32 osd;
++		u8 xorstate;
++		int ret;
++
++		osd = ceph_decode_32(p);
++		xorstate = ceph_decode_8(p);
++		if (xorstate == 0)
++			xorstate = CEPH_OSD_UP;
++		BUG_ON(osd >= map->max_osd);
++		if ((map->osd_state[osd] & CEPH_OSD_UP) &&
++		    (xorstate & CEPH_OSD_UP))
++			pr_info("osd%d down\n", osd);
++		if ((map->osd_state[osd] & CEPH_OSD_EXISTS) &&
++		    (xorstate & CEPH_OSD_EXISTS)) {
++			pr_info("osd%d does not exist\n", osd);
++			map->osd_weight[osd] = CEPH_OSD_IN;
++			ret = set_primary_affinity(map, osd,
++						   CEPH_OSD_DEFAULT_PRIMARY_AFFINITY);
++			if (ret)
++				return ret;
++			memset(map->osd_addr + osd, 0, sizeof(*map->osd_addr));
++			map->osd_state[osd] = 0;
++		} else {
++			map->osd_state[osd] ^= xorstate;
++		}
++	}
++
++	/* new_up_client */
++	*p = new_up_client;
++	len = ceph_decode_32(p);
++	while (len--) {
++		s32 osd;
++		struct ceph_entity_addr addr;
++
++		osd = ceph_decode_32(p);
++		ceph_decode_copy(p, &addr, sizeof(addr));
++		ceph_decode_addr(&addr);
++		BUG_ON(osd >= map->max_osd);
++		pr_info("osd%d up\n", osd);
++		map->osd_state[osd] |= CEPH_OSD_EXISTS | CEPH_OSD_UP;
++		map->osd_addr[osd] = addr;
++	}
++
++	*p = new_weight_end;
++	return 0;
++
++e_inval:
++	return -EINVAL;
++}
++
++/*
+  * decode and apply an incremental map update.
+  */
+ struct ceph_osdmap *osdmap_apply_incremental(void **p, void *end,
+@@ -1290,49 +1399,10 @@ struct ceph_osdmap *osdmap_apply_incremental(void **p, void *end,
+ 			__remove_pg_pool(&map->pg_pools, pi);
+ 	}
+ 
+-	/* new_up */
+-	ceph_decode_32_safe(p, end, len, e_inval);
+-	while (len--) {
+-		u32 osd;
+-		struct ceph_entity_addr addr;
+-		ceph_decode_32_safe(p, end, osd, e_inval);
+-		ceph_decode_copy_safe(p, end, &addr, sizeof(addr), e_inval);
+-		ceph_decode_addr(&addr);
+-		pr_info("osd%d up\n", osd);
+-		BUG_ON(osd >= map->max_osd);
+-		map->osd_state[osd] |= CEPH_OSD_UP;
+-		map->osd_addr[osd] = addr;
+-	}
+-
+-	/* new_state */
+-	ceph_decode_32_safe(p, end, len, e_inval);
+-	while (len--) {
+-		u32 osd;
+-		u8 xorstate;
+-		ceph_decode_32_safe(p, end, osd, e_inval);
+-		xorstate = **(u8 **)p;
+-		(*p)++;  /* clean flag */
+-		if (xorstate == 0)
+-			xorstate = CEPH_OSD_UP;
+-		if (xorstate & CEPH_OSD_UP)
+-			pr_info("osd%d down\n", osd);
+-		if (osd < map->max_osd)
+-			map->osd_state[osd] ^= xorstate;
+-	}
+-
+-	/* new_weight */
+-	ceph_decode_32_safe(p, end, len, e_inval);
+-	while (len--) {
+-		u32 osd, off;
+-		ceph_decode_need(p, end, sizeof(u32)*2, e_inval);
+-		osd = ceph_decode_32(p);
+-		off = ceph_decode_32(p);
+-		pr_info("osd%d weight 0x%x %s\n", osd, off,
+-		     off == CEPH_OSD_IN ? "(in)" :
+-		     (off == CEPH_OSD_OUT ? "(out)" : ""));
+-		if (osd < map->max_osd)
+-			map->osd_weight[osd] = off;
+-	}
++	/* new_up_client, new_state, new_weight */
++	err = decode_new_up_state_weight(p, end, map);
++	if (err)
++		goto bad;
+ 
+ 	/* new_pg_temp */
+ 	err = decode_new_pg_temp(p, end, map);
+diff --git a/net/ipv4/netfilter/arp_tables.c b/net/ipv4/netfilter/arp_tables.c
+index 2953ee9e5fa0..ebf5821caefb 100644
+--- a/net/ipv4/netfilter/arp_tables.c
++++ b/net/ipv4/netfilter/arp_tables.c
+@@ -362,23 +362,12 @@ static inline bool unconditional(const struct arpt_entry *e)
+ 	       memcmp(&e->arp, &uncond, sizeof(uncond)) == 0;
+ }
+ 
+-static bool find_jump_target(const struct xt_table_info *t,
+-			     const struct arpt_entry *target)
+-{
+-	struct arpt_entry *iter;
+-
+-	xt_entry_foreach(iter, t->entries, t->size) {
+-		 if (iter == target)
+-			return true;
+-	}
+-	return false;
+-}
+-
+ /* Figures out from what hook each rule can be called: returns 0 if
+  * there are loops.  Puts hook bitmask in comefrom.
+  */
+ static int mark_source_chains(const struct xt_table_info *newinfo,
+-			      unsigned int valid_hooks, void *entry0)
++			      unsigned int valid_hooks, void *entry0,
++			      unsigned int *offsets)
+ {
+ 	unsigned int hook;
+ 
+@@ -467,10 +456,11 @@ static int mark_source_chains(const struct xt_table_info *newinfo,
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					if (!xt_find_jump_offset(offsets, newpos,
++								 newinfo->number))
++						return 0;
+ 					e = (struct arpt_entry *)
+ 						(entry0 + newpos);
+-					if (!find_jump_target(newinfo, e))
+-						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
+@@ -630,6 +620,7 @@ static int translate_table(struct xt_table_info *newinfo, void *entry0,
+                            const struct arpt_replace *repl)
+ {
+ 	struct arpt_entry *iter;
++	unsigned int *offsets;
+ 	unsigned int i;
+ 	int ret = 0;
+ 
+@@ -643,6 +634,9 @@ static int translate_table(struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	duprintf("translate_table: size %u\n", newinfo->size);
++	offsets = xt_alloc_entry_offsets(newinfo->number);
++	if (!offsets)
++		return -ENOMEM;
+ 	i = 0;
+ 
+ 	/* Walk through entries, checking offsets. */
+@@ -653,20 +647,21 @@ static int translate_table(struct xt_table_info *newinfo, void *entry0,
+ 						 repl->underflow,
+ 						 repl->valid_hooks);
+ 		if (ret != 0)
+-			break;
++			goto out_free;
++		if (i < repl->num_entries)
++			offsets[i] = (void *)iter - entry0;
+ 		++i;
+ 		if (strcmp(arpt_get_target(iter)->u.user.name,
+ 		    XT_ERROR_TARGET) == 0)
+ 			++newinfo->stacksize;
+ 	}
+ 	duprintf("translate_table: ARPT_ENTRY_ITERATE gives %d\n", ret);
+-	if (ret != 0)
+-		return ret;
+ 
++	ret = -EINVAL;
+ 	if (i != repl->num_entries) {
+ 		duprintf("translate_table: %u not %u entries\n",
+ 			 i, repl->num_entries);
+-		return -EINVAL;
++		goto out_free;
+ 	}
+ 
+ 	/* Check hooks all assigned */
+@@ -677,17 +672,20 @@ static int translate_table(struct xt_table_info *newinfo, void *entry0,
+ 		if (newinfo->hook_entry[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid hook entry %u %u\n",
+ 				 i, repl->hook_entry[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 		if (newinfo->underflow[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid underflow %u %u\n",
+ 				 i, repl->underflow[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 	}
+ 
+-	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0))
+-		return -ELOOP;
++	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0, offsets)) {
++		ret = -ELOOP;
++		goto out_free;
++	}
++	kvfree(offsets);
+ 
+ 	/* Finally, each sanity check must pass */
+ 	i = 0;
+@@ -714,6 +712,9 @@ static int translate_table(struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	return ret;
++ out_free:
++	kvfree(offsets);
++	return ret;
+ }
+ 
+ static void get_counters(const struct xt_table_info *t,
+diff --git a/net/ipv4/netfilter/ip_tables.c b/net/ipv4/netfilter/ip_tables.c
+index 3bcf28bf1525..8e729cba1e59 100644
+--- a/net/ipv4/netfilter/ip_tables.c
++++ b/net/ipv4/netfilter/ip_tables.c
+@@ -438,23 +438,12 @@ ipt_do_table(struct sk_buff *skb,
+ #endif
+ }
+ 
+-static bool find_jump_target(const struct xt_table_info *t,
+-			     const struct ipt_entry *target)
+-{
+-	struct ipt_entry *iter;
+-
+-	xt_entry_foreach(iter, t->entries, t->size) {
+-		 if (iter == target)
+-			return true;
+-	}
+-	return false;
+-}
+-
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+ mark_source_chains(const struct xt_table_info *newinfo,
+-		   unsigned int valid_hooks, void *entry0)
++		   unsigned int valid_hooks, void *entry0,
++		   unsigned int *offsets)
+ {
+ 	unsigned int hook;
+ 
+@@ -547,10 +536,11 @@ mark_source_chains(const struct xt_table_info *newinfo,
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					if (!xt_find_jump_offset(offsets, newpos,
++								 newinfo->number))
++						return 0;
+ 					e = (struct ipt_entry *)
+ 						(entry0 + newpos);
+-					if (!find_jump_target(newinfo, e))
+-						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
+@@ -797,6 +787,7 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+                 const struct ipt_replace *repl)
+ {
+ 	struct ipt_entry *iter;
++	unsigned int *offsets;
+ 	unsigned int i;
+ 	int ret = 0;
+ 
+@@ -810,6 +801,9 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	duprintf("translate_table: size %u\n", newinfo->size);
++	offsets = xt_alloc_entry_offsets(newinfo->number);
++	if (!offsets)
++		return -ENOMEM;
+ 	i = 0;
+ 	/* Walk through entries, checking offsets. */
+ 	xt_entry_foreach(iter, entry0, newinfo->size) {
+@@ -819,17 +813,20 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 						 repl->underflow,
+ 						 repl->valid_hooks);
+ 		if (ret != 0)
+-			return ret;
++			goto out_free;
++		if (i < repl->num_entries)
++			offsets[i] = (void *)iter - entry0;
+ 		++i;
+ 		if (strcmp(ipt_get_target(iter)->u.user.name,
+ 		    XT_ERROR_TARGET) == 0)
+ 			++newinfo->stacksize;
+ 	}
+ 
++	ret = -EINVAL;
+ 	if (i != repl->num_entries) {
+ 		duprintf("translate_table: %u not %u entries\n",
+ 			 i, repl->num_entries);
+-		return -EINVAL;
++		goto out_free;
+ 	}
+ 
+ 	/* Check hooks all assigned */
+@@ -840,17 +837,20 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 		if (newinfo->hook_entry[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid hook entry %u %u\n",
+ 				 i, repl->hook_entry[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 		if (newinfo->underflow[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid underflow %u %u\n",
+ 				 i, repl->underflow[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 	}
+ 
+-	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0))
+-		return -ELOOP;
++	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0, offsets)) {
++		ret = -ELOOP;
++		goto out_free;
++	}
++	kvfree(offsets);
+ 
+ 	/* Finally, each sanity check must pass */
+ 	i = 0;
+@@ -877,6 +877,9 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	return ret;
++ out_free:
++	kvfree(offsets);
++	return ret;
+ }
+ 
+ static void
+diff --git a/net/ipv6/netfilter/ip6_tables.c b/net/ipv6/netfilter/ip6_tables.c
+index 5254d76dfce8..98e99fa833f1 100644
+--- a/net/ipv6/netfilter/ip6_tables.c
++++ b/net/ipv6/netfilter/ip6_tables.c
+@@ -451,23 +451,12 @@ ip6t_do_table(struct sk_buff *skb,
+ #endif
+ }
+ 
+-static bool find_jump_target(const struct xt_table_info *t,
+-			     const struct ip6t_entry *target)
+-{
+-	struct ip6t_entry *iter;
+-
+-	xt_entry_foreach(iter, t->entries, t->size) {
+-		 if (iter == target)
+-			return true;
+-	}
+-	return false;
+-}
+-
+ /* Figures out from what hook each rule can be called: returns 0 if
+    there are loops.  Puts hook bitmask in comefrom. */
+ static int
+ mark_source_chains(const struct xt_table_info *newinfo,
+-		   unsigned int valid_hooks, void *entry0)
++		   unsigned int valid_hooks, void *entry0,
++		   unsigned int *offsets)
+ {
+ 	unsigned int hook;
+ 
+@@ -560,10 +549,11 @@ mark_source_chains(const struct xt_table_info *newinfo,
+ 					/* This a jump; chase it. */
+ 					duprintf("Jump rule %u -> %u\n",
+ 						 pos, newpos);
++					if (!xt_find_jump_offset(offsets, newpos,
++								 newinfo->number))
++						return 0;
+ 					e = (struct ip6t_entry *)
+ 						(entry0 + newpos);
+-					if (!find_jump_target(newinfo, e))
+-						return 0;
+ 				} else {
+ 					/* ... this is a fallthru */
+ 					newpos = pos + e->next_offset;
+@@ -810,6 +800,7 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+                 const struct ip6t_replace *repl)
+ {
+ 	struct ip6t_entry *iter;
++	unsigned int *offsets;
+ 	unsigned int i;
+ 	int ret = 0;
+ 
+@@ -823,6 +814,9 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	duprintf("translate_table: size %u\n", newinfo->size);
++	offsets = xt_alloc_entry_offsets(newinfo->number);
++	if (!offsets)
++		return -ENOMEM;
+ 	i = 0;
+ 	/* Walk through entries, checking offsets. */
+ 	xt_entry_foreach(iter, entry0, newinfo->size) {
+@@ -832,17 +826,20 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 						 repl->underflow,
+ 						 repl->valid_hooks);
+ 		if (ret != 0)
+-			return ret;
++			goto out_free;
++		if (i < repl->num_entries)
++			offsets[i] = (void *)iter - entry0;
+ 		++i;
+ 		if (strcmp(ip6t_get_target(iter)->u.user.name,
+ 		    XT_ERROR_TARGET) == 0)
+ 			++newinfo->stacksize;
+ 	}
+ 
++	ret = -EINVAL;
+ 	if (i != repl->num_entries) {
+ 		duprintf("translate_table: %u not %u entries\n",
+ 			 i, repl->num_entries);
+-		return -EINVAL;
++		goto out_free;
+ 	}
+ 
+ 	/* Check hooks all assigned */
+@@ -853,17 +850,20 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 		if (newinfo->hook_entry[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid hook entry %u %u\n",
+ 				 i, repl->hook_entry[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 		if (newinfo->underflow[i] == 0xFFFFFFFF) {
+ 			duprintf("Invalid underflow %u %u\n",
+ 				 i, repl->underflow[i]);
+-			return -EINVAL;
++			goto out_free;
+ 		}
+ 	}
+ 
+-	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0))
+-		return -ELOOP;
++	if (!mark_source_chains(newinfo, repl->valid_hooks, entry0, offsets)) {
++		ret = -ELOOP;
++		goto out_free;
++	}
++	kvfree(offsets);
+ 
+ 	/* Finally, each sanity check must pass */
+ 	i = 0;
+@@ -890,6 +890,9 @@ translate_table(struct net *net, struct xt_table_info *newinfo, void *entry0,
+ 	}
+ 
+ 	return ret;
++ out_free:
++	kvfree(offsets);
++	return ret;
+ }
+ 
+ static void
+diff --git a/net/netfilter/x_tables.c b/net/netfilter/x_tables.c
+index 4b850c639ac5..703fc9ba6f20 100644
+--- a/net/netfilter/x_tables.c
++++ b/net/netfilter/x_tables.c
+@@ -704,6 +704,56 @@ int xt_check_entry_offsets(const void *base,
+ }
+ EXPORT_SYMBOL(xt_check_entry_offsets);
+ 
++/**
++ * xt_alloc_entry_offsets - allocate array to store rule head offsets
++ *
++ * @size: number of entries
++ *
++ * Return: NULL or kmalloc'd or vmalloc'd array
++ */
++unsigned int *xt_alloc_entry_offsets(unsigned int size)
++{
++	unsigned int *off;
++
++	off = kcalloc(size, sizeof(unsigned int), GFP_KERNEL | __GFP_NOWARN);
++
++	if (off)
++		return off;
++
++	if (size < (SIZE_MAX / sizeof(unsigned int)))
++		off = vmalloc(size * sizeof(unsigned int));
++
++	return off;
++}
++EXPORT_SYMBOL(xt_alloc_entry_offsets);
++
++/**
++ * xt_find_jump_offset - check if target is a valid jump offset
++ *
++ * @offsets: array containing all valid rule start offsets of a rule blob
++ * @target: the jump target to search for
++ * @size: entries in @offset
++ */
++bool xt_find_jump_offset(const unsigned int *offsets,
++			 unsigned int target, unsigned int size)
++{
++	int m, low = 0, hi = size;
++
++	while (hi > low) {
++		m = (low + hi) / 2u;
++
++		if (offsets[m] > target)
++			hi = m;
++		else if (offsets[m] < target)
++			low = m + 1;
++		else
++			return true;
++	}
++
++	return false;
++}
++EXPORT_SYMBOL(xt_find_jump_offset);
++
+ int xt_check_target(struct xt_tgchk_param *par,
+ 		    unsigned int size, u_int8_t proto, bool inv_proto)
+ {
+diff --git a/sound/core/control.c b/sound/core/control.c
+index a85d45595d02..b4fe9b002512 100644
+--- a/sound/core/control.c
++++ b/sound/core/control.c
+@@ -160,6 +160,8 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
+ 	
+ 	if (snd_BUG_ON(!card || !id))
+ 		return;
++	if (card->shutdown)
++		return;
+ 	read_lock(&card->ctl_files_rwlock);
+ #if IS_ENABLED(CONFIG_SND_MIXER_OSS)
+ 	card->mixer_oss_change_count++;
+diff --git a/sound/core/pcm.c b/sound/core/pcm.c
+index dfed728d8c87..f6e7fdd354de 100644
+--- a/sound/core/pcm.c
++++ b/sound/core/pcm.c
+@@ -849,6 +849,14 @@ int snd_pcm_new_internal(struct snd_card *card, const char *id, int device,
+ }
+ EXPORT_SYMBOL(snd_pcm_new_internal);
+ 
++static void free_chmap(struct snd_pcm_str *pstr)
++{
++	if (pstr->chmap_kctl) {
++		snd_ctl_remove(pstr->pcm->card, pstr->chmap_kctl);
++		pstr->chmap_kctl = NULL;
++	}
++}
++
+ static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
+ {
+ 	struct snd_pcm_substream *substream, *substream_next;
+@@ -871,6 +879,7 @@ static void snd_pcm_free_stream(struct snd_pcm_str * pstr)
+ 		kfree(setup);
+ 	}
+ #endif
++	free_chmap(pstr);
+ 	if (pstr->substream_count)
+ 		put_device(&pstr->dev);
+ }
+@@ -1138,10 +1147,7 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
+ 	for (cidx = 0; cidx < 2; cidx++) {
+ 		if (!pcm->internal)
+ 			snd_unregister_device(&pcm->streams[cidx].dev);
+-		if (pcm->streams[cidx].chmap_kctl) {
+-			snd_ctl_remove(pcm->card, pcm->streams[cidx].chmap_kctl);
+-			pcm->streams[cidx].chmap_kctl = NULL;
+-		}
++		free_chmap(&pcm->streams[cidx]);
+ 	}
+ 	mutex_unlock(&pcm->open_mutex);
+ 	mutex_unlock(&register_mutex);
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index 9e113bc3b02d..f24a69db0dd8 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -1123,8 +1123,10 @@ static int azx_free(struct azx *chip)
+ 	if (use_vga_switcheroo(hda)) {
+ 		if (chip->disabled && chip->bus)
+ 			snd_hda_unlock_devices(chip->bus);
+-		if (hda->vga_switcheroo_registered)
++		if (hda->vga_switcheroo_registered) {
+ 			vga_switcheroo_unregister_client(chip->pci);
++			vga_switcheroo_fini_domain_pm_ops(chip->card->dev);
++		}
+ 	}
+ 
+ 	if (chip->initialized) {
+@@ -2116,6 +2118,8 @@ static const struct pci_device_id azx_ids[] = {
+ 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
+ 	{ PCI_DEVICE(0x1002, 0x157a),
+ 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
++	{ PCI_DEVICE(0x1002, 0x15b3),
++	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
+ 	{ PCI_DEVICE(0x1002, 0x793b),
+ 	  .driver_data = AZX_DRIVER_ATIHDMI | AZX_DCAPS_PRESET_ATI_HDMI },
+ 	{ PCI_DEVICE(0x1002, 0x7919),
+diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
+index 707bc5405d9f..b3234321aa4b 100644
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -5590,7 +5590,6 @@ static const struct hda_model_fixup alc269_fixup_models[] = {
+ 	{}
+ };
+ #define ALC225_STANDARD_PINS \
+-	{0x12, 0xb7a60130}, \
+ 	{0x21, 0x04211020}
+ 
+ #define ALC255_STANDARD_PINS \
+@@ -5650,10 +5649,24 @@ static const struct hda_model_fixup alc269_fixup_models[] = {
+ static const struct snd_hda_pin_quirk alc269_pin_fixup_tbl[] = {
+ 	SND_HDA_PIN_QUIRK(0x10ec0225, 0x1028, "Dell", ALC225_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		ALC225_STANDARD_PINS,
++		{0x12, 0xb7a60130},
+ 		{0x14, 0x901701a0}),
+ 	SND_HDA_PIN_QUIRK(0x10ec0225, 0x1028, "Dell", ALC225_FIXUP_DELL1_MIC_NO_PRESENCE,
+ 		ALC225_STANDARD_PINS,
++		{0x12, 0xb7a60130},
+ 		{0x14, 0x901701b0}),
++	SND_HDA_PIN_QUIRK(0x10ec0225, 0x1028, "Dell", ALC225_FIXUP_DELL1_MIC_NO_PRESENCE,
++		ALC225_STANDARD_PINS,
++		{0x12, 0xb7a60150},
++		{0x14, 0x901701a0}),
++	SND_HDA_PIN_QUIRK(0x10ec0225, 0x1028, "Dell", ALC225_FIXUP_DELL1_MIC_NO_PRESENCE,
++		ALC225_STANDARD_PINS,
++		{0x12, 0xb7a60150},
++		{0x14, 0x901701b0}),
++	SND_HDA_PIN_QUIRK(0x10ec0225, 0x1028, "Dell", ALC225_FIXUP_DELL1_MIC_NO_PRESENCE,
++		ALC225_STANDARD_PINS,
++		{0x12, 0xb7a60130},
++		{0x1b, 0x90170110}),
+ 	SND_HDA_PIN_QUIRK(0x10ec0255, 0x1028, "Dell", ALC255_FIXUP_DELL2_MIC_NO_PRESENCE,
+ 		ALC255_STANDARD_PINS,
+ 		{0x12, 0x40300000},
