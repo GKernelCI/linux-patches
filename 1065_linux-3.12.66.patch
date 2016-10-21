@@ -1,0 +1,208 @@
+diff --git a/Makefile b/Makefile
+index f9b2fc8a4b7d..eb81ece69d00 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 12
+-SUBLEVEL = 65
++SUBLEVEL = 66
+ EXTRAVERSION =
+ NAME = One Giant Leap for Frogkind
+ 
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index c8a6792e7842..3980c0571d4a 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -8,7 +8,7 @@ targets := vmlinux vmlinux.bin vmlinux.bin.gz vmlinux.bin.bz2 vmlinux.bin.lzma \
+ 	vmlinux.bin.xz vmlinux.bin.lzo vmlinux.bin.lz4
+ 
+ KBUILD_CFLAGS := -m$(BITS) -D__KERNEL__ $(LINUX_INCLUDE) -O2
+-KBUILD_CFLAGS += -fno-strict-aliasing -fPIC
++KBUILD_CFLAGS += -fno-strict-aliasing $(call cc-option, -fPIE, -fPIC)
+ KBUILD_CFLAGS += -DDISABLE_BRANCH_PROFILING
+ cflags-$(CONFIG_X86_32) := -march=i386
+ cflags-$(CONFIG_X86_64) := -mcmodel=small
+@@ -21,6 +21,18 @@ KBUILD_AFLAGS  := $(KBUILD_CFLAGS) -D__ASSEMBLY__
+ GCOV_PROFILE := n
+ 
+ LDFLAGS := -m elf_$(UTS_MACHINE)
++ifeq ($(CONFIG_RELOCATABLE),y)
++# If kernel is relocatable, build compressed kernel as PIE.
++ifeq ($(CONFIG_X86_32),y)
++LDFLAGS += $(call ld-option, -pie) $(call ld-option, --no-dynamic-linker)
++else
++# To build 64-bit compressed kernel as PIE, we disable relocation
++# overflow check to avoid relocation overflow error with a new linker
++# command-line option, -z noreloc-overflow.
++LDFLAGS += $(shell $(LD) --help 2>&1 | grep -q "\-z noreloc-overflow" \
++	&& echo "-z noreloc-overflow -pie --no-dynamic-linker")
++endif
++endif
+ LDFLAGS_vmlinux := -T
+ 
+ hostprogs-y	:= mkpiggy
+diff --git a/arch/x86/boot/compressed/head_32.S b/arch/x86/boot/compressed/head_32.S
+index 36ddc61182af..8e9fde129524 100644
+--- a/arch/x86/boot/compressed/head_32.S
++++ b/arch/x86/boot/compressed/head_32.S
+@@ -30,6 +30,34 @@
+ #include <asm/boot.h>
+ #include <asm/asm-offsets.h>
+ 
++/*
++ * The 32-bit x86 assembler in binutils 2.26 will generate R_386_GOT32X
++ * relocation to get the symbol address in PIC.  When the compressed x86
++ * kernel isn't built as PIC, the linker optimizes R_386_GOT32X
++ * relocations to their fixed symbol addresses.  However, when the
++ * compressed x86 kernel is loaded at a different address, it leads
++ * to the following load failure:
++ *
++ *   Failed to allocate space for phdrs
++ *
++ * during the decompression stage.
++ *
++ * If the compressed x86 kernel is relocatable at run-time, it should be
++ * compiled with -fPIE, instead of -fPIC, if possible and should be built as
++ * Position Independent Executable (PIE) so that linker won't optimize
++ * R_386_GOT32X relocation to its fixed symbol address.  Older
++ * linkers generate R_386_32 relocations against locally defined symbols,
++ * _bss, _ebss, _got and _egot, in PIE.  It isn't wrong, just less
++ * optimal than R_386_RELATIVE.  But the x86 kernel fails to properly handle
++ * R_386_32 relocations when relocating the kernel.  To generate
++ * R_386_RELATIVE relocations, we mark _bss, _ebss, _got and _egot as
++ * hidden:
++ */
++	.hidden _bss
++	.hidden _ebss
++	.hidden _got
++	.hidden _egot
++
+ 	__HEAD
+ ENTRY(startup_32)
+ #ifdef CONFIG_EFI_STUB
+diff --git a/arch/x86/boot/compressed/head_64.S b/arch/x86/boot/compressed/head_64.S
+index a55840367359..ce2925e55148 100644
+--- a/arch/x86/boot/compressed/head_64.S
++++ b/arch/x86/boot/compressed/head_64.S
+@@ -32,6 +32,14 @@
+ #include <asm/processor-flags.h>
+ #include <asm/asm-offsets.h>
+ 
++/*
++ * Locally defined symbols should be marked hidden:
++ */
++	.hidden _bss
++	.hidden _ebss
++	.hidden _got
++	.hidden _egot
++
+ 	__HEAD
+ 	.code32
+ ENTRY(startup_32)
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 5a0b1742f794..78ab0a131cf1 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -2434,7 +2434,6 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
+ 	might_sleep();
+ 
+ 	spin_lock(&_minor_lock);
+-	map = dm_get_live_table(md, &srcu_idx);
+ 	idr_replace(&_minor_idr, MINOR_ALLOCED, MINOR(disk_devt(dm_disk(md))));
+ 	set_bit(DMF_FREEING, &md->flags);
+ 	spin_unlock(&_minor_lock);
+@@ -2444,14 +2443,14 @@ static void __dm_destroy(struct mapped_device *md, bool wait)
+ 	 * do not race with internal suspend.
+ 	 */
+ 	mutex_lock(&md->suspend_lock);
++	map = dm_get_live_table(md, &srcu_idx);
+ 	if (!dm_suspended_md(md)) {
+ 		dm_table_presuspend_targets(map);
+ 		dm_table_postsuspend_targets(map);
+ 	}
+-	mutex_unlock(&md->suspend_lock);
+-
+ 	/* dm_put_live_table must be before msleep, otherwise deadlock is possible */
+ 	dm_put_live_table(md, srcu_idx);
++	mutex_unlock(&md->suspend_lock);
+ 
+ 	/*
+ 	 * Rare, but there may be I/O requests still going to complete,
+diff --git a/drivers/net/wireless/brcm80211/brcmfmac/wl_cfg80211.c b/drivers/net/wireless/brcm80211/brcmfmac/wl_cfg80211.c
+index 571f013cebbb..f2e245bc4520 100644
+--- a/drivers/net/wireless/brcm80211/brcmfmac/wl_cfg80211.c
++++ b/drivers/net/wireless/brcm80211/brcmfmac/wl_cfg80211.c
+@@ -3731,7 +3731,7 @@ brcmf_cfg80211_start_ap(struct wiphy *wiphy, struct net_device *ndev,
+ 				(u8 *)&settings->beacon.head[ie_offset],
+ 				settings->beacon.head_len - ie_offset,
+ 				WLAN_EID_SSID);
+-		if (!ssid_ie)
++		if (!ssid_ie || ssid_ie->len > IEEE80211_MAX_SSID_LEN)
+ 			return -EINVAL;
+ 
+ 		memcpy(ssid_le.SSID, ssid_ie->data, ssid_ie->len);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 79aa518c16a3..5676a670429e 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1749,6 +1749,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
+ #define FOLL_HWPOISON	0x100	/* check page is hwpoisoned */
+ #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
+ #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
++#define FOLL_COW	0x4000	/* internal GUP flag */
+ 
+ typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+ 			void *data);
+diff --git a/lib/ratelimit.c b/lib/ratelimit.c
+index 40e03ea2a967..2c5de86460c5 100644
+--- a/lib/ratelimit.c
++++ b/lib/ratelimit.c
+@@ -49,7 +49,7 @@ int ___ratelimit(struct ratelimit_state *rs, const char *func)
+ 		if (rs->missed)
+ 			printk(KERN_WARNING "%s: %d callbacks suppressed\n",
+ 				func, rs->missed);
+-		rs->begin   = 0;
++		rs->begin   = jiffies;
+ 		rs->printed = 0;
+ 		rs->missed  = 0;
+ 	}
+diff --git a/mm/memory.c b/mm/memory.c
+index 61926356c09a..a0c9c6cb59d1 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -1441,6 +1441,16 @@ int zap_vma_ptes(struct vm_area_struct *vma, unsigned long address,
+ }
+ EXPORT_SYMBOL_GPL(zap_vma_ptes);
+ 
++/*
++ * FOLL_FORCE can write to even unwritable pte's, but only
++ * after we've gone through a COW cycle and they are dirty.
++ */
++static inline bool can_follow_write_pte(pte_t pte, unsigned int flags)
++{
++	return pte_write(pte) ||
++		((flags & FOLL_FORCE) && (flags & FOLL_COW) && pte_dirty(pte));
++}
++
+ /**
+  * follow_page_mask - look up a page descriptor from a user-virtual address
+  * @vma: vm_area_struct mapping @address
+@@ -1550,7 +1560,7 @@ split_fallthrough:
+ 	}
+ 	if ((flags & FOLL_NUMA) && pte_numa(pte))
+ 		goto no_page;
+-	if ((flags & FOLL_WRITE) && !pte_write(pte))
++	if ((flags & FOLL_WRITE) && !can_follow_write_pte(pte, flags))
+ 		goto unlock;
+ 
+ 	page = vm_normal_page(vma, address, pte);
+@@ -1858,7 +1868,7 @@ long __get_user_pages(struct task_struct *tsk, struct mm_struct *mm,
+ 				 */
+ 				if ((ret & VM_FAULT_WRITE) &&
+ 				    !(vma->vm_flags & VM_WRITE))
+-					foll_flags &= ~FOLL_WRITE;
++					foll_flags |= FOLL_COW;
+ 
+ 				cond_resched();
+ 			}
