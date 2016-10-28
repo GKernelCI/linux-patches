@@ -1,0 +1,215 @@
+diff --git a/Makefile b/Makefile
+index 2d4dea4b3107..21f657f2c4e6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 1
+-SUBLEVEL = 34
++SUBLEVEL = 35
+ EXTRAVERSION =
+ NAME = Series 4800
+ 
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index cc1993c5556e..9d781d3ccc09 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -619,8 +619,30 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 		if ((raw_port_status & PORT_RESET) ||
+ 				!(raw_port_status & PORT_PE))
+ 			return 0xffffffff;
+-		if (time_after_eq(jiffies,
+-					bus_state->resume_done[wIndex])) {
++		/* did port event handler already start resume timing? */
++		if (!bus_state->resume_done[wIndex]) {
++			/* If not, maybe we are in a host initated resume? */
++			if (test_bit(wIndex, &bus_state->resuming_ports)) {
++				/* Host initated resume doesn't time the resume
++				 * signalling using resume_done[].
++				 * It manually sets RESUME state, sleeps 20ms
++				 * and sets U0 state. This should probably be
++				 * changed, but not right now.
++				 */
++			} else {
++				/* port resume was discovered now and here,
++				 * start resume timing
++				 */
++				unsigned long timeout = jiffies +
++					msecs_to_jiffies(USB_RESUME_TIMEOUT);
++
++				set_bit(wIndex, &bus_state->resuming_ports);
++				bus_state->resume_done[wIndex] = timeout;
++				mod_timer(&hcd->rh_timer, timeout);
++			}
++		/* Has resume been signalled for USB_RESUME_TIME yet? */
++		} else if (time_after_eq(jiffies,
++					 bus_state->resume_done[wIndex])) {
+ 			int time_left;
+ 
+ 			xhci_dbg(xhci, "Resume USB2 port %d\n",
+@@ -661,13 +683,24 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 		} else {
+ 			/*
+ 			 * The resume has been signaling for less than
+-			 * 20ms. Report the port status as SUSPEND,
+-			 * let the usbcore check port status again
+-			 * and clear resume signaling later.
++			 * USB_RESUME_TIME. Report the port status as SUSPEND,
++			 * let the usbcore check port status again and clear
++			 * resume signaling later.
+ 			 */
+ 			status |= USB_PORT_STAT_SUSPEND;
+ 		}
+ 	}
++	/*
++	 * Clear stale usb2 resume signalling variables in case port changed
++	 * state during resume signalling. For example on error
++	 */
++	if ((bus_state->resume_done[wIndex] ||
++	     test_bit(wIndex, &bus_state->resuming_ports)) &&
++	    (raw_port_status & PORT_PLS_MASK) != XDEV_U3 &&
++	    (raw_port_status & PORT_PLS_MASK) != XDEV_RESUME) {
++		bus_state->resume_done[wIndex] = 0;
++		clear_bit(wIndex, &bus_state->resuming_ports);
++	}
+ 	if ((raw_port_status & PORT_PLS_MASK) == XDEV_U0
+ 			&& (raw_port_status & PORT_POWER)
+ 			&& (bus_state->suspended_ports & (1 << wIndex))) {
+@@ -998,6 +1031,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 				if ((temp & PORT_PE) == 0)
+ 					goto error;
+ 
++				set_bit(wIndex, &bus_state->resuming_ports);
+ 				xhci_set_link_state(xhci, port_array, wIndex,
+ 							XDEV_RESUME);
+ 				spin_unlock_irqrestore(&xhci->lock, flags);
+@@ -1005,6 +1039,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 				spin_lock_irqsave(&xhci->lock, flags);
+ 				xhci_set_link_state(xhci, port_array, wIndex,
+ 							XDEV_U0);
++				clear_bit(wIndex, &bus_state->resuming_ports);
+ 			}
+ 			bus_state->port_c_suspend |= 1 << wIndex;
+ 
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 6a2911743829..2d8e77ff7821 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1605,7 +1605,8 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 			 */
+ 			bogus_port_status = true;
+ 			goto cleanup;
+-		} else {
++		} else if (!test_bit(faked_port_index,
++				     &bus_state->resuming_ports)) {
+ 			xhci_dbg(xhci, "resume HS port %d\n", port_id);
+ 			bus_state->resume_done[faked_port_index] = jiffies +
+ 				msecs_to_jiffies(USB_RESUME_TIMEOUT);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 6b85ec64d302..7cadf0a660e7 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2064,6 +2064,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
+ #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
+ #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
+ #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
++#define FOLL_COW	0x4000	/* internal GUP flag */
+ 
+ typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+ 			void *data);
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index 8fcc801fde15..d9f112bd42a7 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -309,17 +309,34 @@ u32 (*arch_gettimeoffset)(void) = default_arch_gettimeoffset;
+ static inline u32 arch_gettimeoffset(void) { return 0; }
+ #endif
+ 
++static inline s64 timekeeping_delta_to_ns(struct tk_read_base *tkr,
++					  cycle_t delta)
++{
++	s64 nsec;
++
++	nsec = delta * tkr->mult + tkr->xtime_nsec;
++	nsec >>= tkr->shift;
++
++	/* If arch requires, add in get_arch_timeoffset() */
++	return nsec + arch_gettimeoffset();
++}
++
+ static inline s64 timekeeping_get_ns(struct tk_read_base *tkr)
+ {
+ 	cycle_t delta;
+-	s64 nsec;
+ 
+ 	delta = timekeeping_get_delta(tkr);
++	return timekeeping_delta_to_ns(tkr, delta);
++}
+ 
+-	nsec = (delta * tkr->mult + tkr->xtime_nsec) >> tkr->shift;
++static inline s64 timekeeping_cycles_to_ns(struct tk_read_base *tkr,
++					    cycle_t cycles)
++{
++	cycle_t delta;
+ 
+-	/* If arch requires, add in get_arch_timeoffset() */
+-	return nsec + arch_gettimeoffset();
++	/* calculate the delta since the last update_wall_time */
++	delta = clocksource_delta(cycles, tkr->cycle_last, tkr->mask);
++	return timekeeping_delta_to_ns(tkr, delta);
+ }
+ 
+ /**
+@@ -421,8 +438,11 @@ static __always_inline u64 __ktime_get_fast_ns(struct tk_fast *tkf)
+ 		tkr = tkf->base + (seq & 0x01);
+ 		now = ktime_to_ns(tkr->base);
+ 
+-		now += clocksource_delta(tkr->read(tkr->clock),
+-					 tkr->cycle_last, tkr->mask);
++		now += timekeeping_delta_to_ns(tkr,
++				clocksource_delta(
++					tkr->read(tkr->clock),
++					tkr->cycle_last,
++					tkr->mask));
+ 	} while (read_seqcount_retry(&tkf->seq, seq));
+ 
+ 	return now;
+diff --git a/mm/gup.c b/mm/gup.c
+index 6297f6bccfb1..e6de9e74e4ae 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -32,6 +32,16 @@ static struct page *no_page_table(struct vm_area_struct *vma,
+ 	return NULL;
+ }
+ 
++/*
++ * FOLL_FORCE can write to even unwritable pte's, but only
++ * after we've gone through a COW cycle and they are dirty.
++ */
++static inline bool can_follow_write_pte(pte_t pte, unsigned int flags)
++{
++	return pte_write(pte) ||
++		((flags & FOLL_FORCE) && (flags & FOLL_COW) && pte_dirty(pte));
++}
++
+ static struct page *follow_page_pte(struct vm_area_struct *vma,
+ 		unsigned long address, pmd_t *pmd, unsigned int flags)
+ {
+@@ -66,7 +76,7 @@ retry:
+ 	}
+ 	if ((flags & FOLL_NUMA) && pte_protnone(pte))
+ 		goto no_page;
+-	if ((flags & FOLL_WRITE) && !pte_write(pte)) {
++	if ((flags & FOLL_WRITE) && !can_follow_write_pte(pte, flags)) {
+ 		pte_unmap_unlock(ptep, ptl);
+ 		return NULL;
+ 	}
+@@ -315,7 +325,7 @@ static int faultin_page(struct task_struct *tsk, struct vm_area_struct *vma,
+ 	 * reCOWed by userspace write).
+ 	 */
+ 	if ((ret & VM_FAULT_WRITE) && !(vma->vm_flags & VM_WRITE))
+-		*flags &= ~FOLL_WRITE;
++	        *flags |= FOLL_COW;
+ 	return 0;
+ }
+ 
