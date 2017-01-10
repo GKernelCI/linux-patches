@@ -1,0 +1,2732 @@
+diff --git a/Documentation/arm/CCN.txt b/Documentation/arm/CCN.txt
+index 0632b3aad83e..715776f06df6 100644
+--- a/Documentation/arm/CCN.txt
++++ b/Documentation/arm/CCN.txt
+@@ -38,7 +38,7 @@ Example of perf tool use:
+ / # perf list | grep ccn
+   ccn/cycles/                                        [Kernel PMU event]
+ <...>
+-  ccn/xp_valid_flit/                                 [Kernel PMU event]
++  ccn/xp_valid_flit,xp=?,port=?,vc=?,dir=?/          [Kernel PMU event]
+ <...>
+ 
+ / # perf stat -C 0 -e ccn/cycles/,ccn/xp_valid_flit,xp=1,port=0,vc=1,dir=1/ \
+diff --git a/Documentation/filesystems/porting b/Documentation/filesystems/porting
+index e69274de8d0c..0500895b768f 100644
+--- a/Documentation/filesystems/porting
++++ b/Documentation/filesystems/porting
+@@ -287,8 +287,8 @@ implementing on-disk size changes.  Start with a copy of the old inode_setattr
+ and vmtruncate, and the reorder the vmtruncate + foofs_vmtruncate sequence to
+ be in order of zeroing blocks using block_truncate_page or similar helpers,
+ size update and on finally on-disk truncation which should not fail.
+-inode_change_ok now includes the size checks for ATTR_SIZE and must be called
+-in the beginning of ->setattr unconditionally.
++setattr_prepare (which used to be inode_change_ok) now includes the size checks
++for ATTR_SIZE and must be called in the beginning of ->setattr unconditionally.
+ 
+ [mandatory]
+ 
+diff --git a/Documentation/sysctl/fs.txt b/Documentation/sysctl/fs.txt
+index 302b5ed616a6..35e17f748ca7 100644
+--- a/Documentation/sysctl/fs.txt
++++ b/Documentation/sysctl/fs.txt
+@@ -265,6 +265,13 @@ aio-nr can grow to.
+ 
+ ==============================================================
+ 
++mount-max:
++
++This denotes the maximum number of mounts that may exist
++in a mount namespace.
++
++==============================================================
++
+ 
+ 2. /proc/sys/fs/binfmt_misc
+ ----------------------------------------------------------
+diff --git a/Makefile b/Makefile
+index aa9fbee620ff..df72b644f78c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 1
+-SUBLEVEL = 36
++SUBLEVEL = 37
+ EXTRAVERSION =
+ NAME = Series 4800
+ 
+diff --git a/arch/arm/include/asm/dma-mapping.h b/arch/arm/include/asm/dma-mapping.h
+index b52101d37ec7..ee21eecbe0d2 100644
+--- a/arch/arm/include/asm/dma-mapping.h
++++ b/arch/arm/include/asm/dma-mapping.h
+@@ -117,7 +117,7 @@ static inline dma_addr_t virt_to_dma(struct device *dev, void *addr)
+ /* The ARM override for dma_max_pfn() */
+ static inline unsigned long dma_max_pfn(struct device *dev)
+ {
+-	return PHYS_PFN_OFFSET + dma_to_pfn(dev, *dev->dma_mask);
++	return dma_to_pfn(dev, *dev->dma_mask);
+ }
+ #define dma_max_pfn(dev) dma_max_pfn(dev)
+ 
+diff --git a/arch/x86/include/asm/tlbflush.h b/arch/x86/include/asm/tlbflush.h
+index cd791948b286..7e459b7ee708 100644
+--- a/arch/x86/include/asm/tlbflush.h
++++ b/arch/x86/include/asm/tlbflush.h
+@@ -32,7 +32,7 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
+ /* Initialize cr4 shadow for this CPU. */
+ static inline void cr4_init_shadow(void)
+ {
+-	this_cpu_write(cpu_tlbstate.cr4, __read_cr4());
++	this_cpu_write(cpu_tlbstate.cr4, __read_cr4_safe());
+ }
+ 
+ /* Set in this cpu's CR4. */
+diff --git a/arch/x86/purgatory/Makefile b/arch/x86/purgatory/Makefile
+index 2c835e356349..d445c5f1aeb1 100644
+--- a/arch/x86/purgatory/Makefile
++++ b/arch/x86/purgatory/Makefile
+@@ -12,6 +12,7 @@ targets += purgatory.ro
+ 
+ KBUILD_CFLAGS := -fno-strict-aliasing -Wall -Wstrict-prototypes -fno-zero-initialized-in-bss -fno-builtin -ffreestanding -c -MD -Os -mcmodel=large
+ KBUILD_CFLAGS += -m$(BITS)
++KBUILD_CFLAGS += $(call cc-option,-fno-PIE)
+ 
+ $(obj)/purgatory.ro: $(PURGATORY_OBJS) FORCE
+ 		$(call if_changed,ld)
+diff --git a/drivers/bus/arm-ccn.c b/drivers/bus/arm-ccn.c
+index 27fd0dacad5f..4d523cfe51ce 100644
+--- a/drivers/bus/arm-ccn.c
++++ b/drivers/bus/arm-ccn.c
+@@ -183,6 +183,7 @@ struct arm_ccn {
+ 	struct arm_ccn_component *xp;
+ 
+ 	struct arm_ccn_dt dt;
++	int mn_id;
+ };
+ 
+ 
+@@ -322,6 +323,7 @@ struct arm_ccn_pmu_event {
+ static ssize_t arm_ccn_pmu_event_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+ {
++	struct arm_ccn *ccn = pmu_to_arm_ccn(dev_get_drvdata(dev));
+ 	struct arm_ccn_pmu_event *event = container_of(attr,
+ 			struct arm_ccn_pmu_event, attr);
+ 	ssize_t res;
+@@ -336,6 +338,26 @@ static ssize_t arm_ccn_pmu_event_show(struct device *dev,
+ 	if (event->mask)
+ 		res += snprintf(buf + res, PAGE_SIZE - res, ",mask=0x%x",
+ 				event->mask);
++
++	/* Arguments required by an event */
++	switch (event->type) {
++	case CCN_TYPE_CYCLES:
++		break;
++	case CCN_TYPE_XP:
++		res += snprintf(buf + res, PAGE_SIZE - res,
++				",xp=?,port=?,vc=?,dir=?");
++		if (event->event == CCN_EVENT_WATCHPOINT)
++			res += snprintf(buf + res, PAGE_SIZE - res,
++					",cmp_l=?,cmp_h=?,mask=?");
++		break;
++	case CCN_TYPE_MN:
++		res += snprintf(buf + res, PAGE_SIZE - res, ",node=%d", ccn->mn_id);
++		break;
++	default:
++		res += snprintf(buf + res, PAGE_SIZE - res, ",node=?");
++		break;
++	}
++
+ 	res += snprintf(buf + res, PAGE_SIZE - res, "\n");
+ 
+ 	return res;
+@@ -360,9 +382,9 @@ static umode_t arm_ccn_pmu_events_is_visible(struct kobject *kobj,
+ }
+ 
+ static struct arm_ccn_pmu_event arm_ccn_pmu_events[] = {
+-	CCN_EVENT_MN(eobarrier, "dir=0,vc=0,cmp_h=0x1c00", CCN_IDX_MASK_OPCODE),
+-	CCN_EVENT_MN(ecbarrier, "dir=0,vc=0,cmp_h=0x1e00", CCN_IDX_MASK_OPCODE),
+-	CCN_EVENT_MN(dvmop, "dir=0,vc=0,cmp_h=0x2800", CCN_IDX_MASK_OPCODE),
++	CCN_EVENT_MN(eobarrier, "dir=1,vc=0,cmp_h=0x1c00", CCN_IDX_MASK_OPCODE),
++	CCN_EVENT_MN(ecbarrier, "dir=1,vc=0,cmp_h=0x1e00", CCN_IDX_MASK_OPCODE),
++	CCN_EVENT_MN(dvmop, "dir=1,vc=0,cmp_h=0x2800", CCN_IDX_MASK_OPCODE),
+ 	CCN_EVENT_HNI(txdatflits, "dir=1,vc=3", CCN_IDX_MASK_ANY),
+ 	CCN_EVENT_HNI(rxdatflits, "dir=0,vc=3", CCN_IDX_MASK_ANY),
+ 	CCN_EVENT_HNI(txreqflits, "dir=1,vc=0", CCN_IDX_MASK_ANY),
+@@ -649,6 +671,12 @@ static int arm_ccn_pmu_event_init(struct perf_event *event)
+ 
+ 	/* Validate node/xp vs topology */
+ 	switch (type) {
++	case CCN_TYPE_MN:
++		if (node_xp != ccn->mn_id) {
++			dev_warn(ccn->dev, "Invalid MN ID %d!\n", node_xp);
++			return -EINVAL;
++		}
++		break;
+ 	case CCN_TYPE_XP:
+ 		if (node_xp >= ccn->num_xps) {
+ 			dev_warn(ccn->dev, "Invalid XP ID %d!\n", node_xp);
+@@ -1214,6 +1242,8 @@ static int arm_ccn_init_nodes(struct arm_ccn *ccn, int region,
+ 
+ 	switch (type) {
+ 	case CCN_TYPE_MN:
++		ccn->mn_id = id;
++		return 0;
+ 	case CCN_TYPE_DT:
+ 		return 0;
+ 	case CCN_TYPE_XP:
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index cd0554f68316..4ff8c334e7c8 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -55,6 +55,14 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	return submit;
+ }
+ 
++static inline unsigned long __must_check
++copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
++{
++	if (access_ok(VERIFY_READ, from, n))
++		return __copy_from_user_inatomic(to, from, n);
++	return -EFAULT;
++}
++
+ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		struct drm_msm_gem_submit *args, struct drm_file *file)
+ {
+@@ -62,6 +70,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	int ret = 0;
+ 
+ 	spin_lock(&file->table_lock);
++	pagefault_disable();
+ 
+ 	for (i = 0; i < args->nr_bos; i++) {
+ 		struct drm_msm_gem_submit_bo submit_bo;
+@@ -70,10 +79,15 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		void __user *userptr =
+ 			to_user_ptr(args->bos + (i * sizeof(submit_bo)));
+ 
+-		ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
+-		if (ret) {
+-			ret = -EFAULT;
+-			goto out_unlock;
++		ret = copy_from_user_inatomic(&submit_bo, userptr, sizeof(submit_bo));
++		if (unlikely(ret)) {
++			pagefault_enable();
++			spin_unlock(&file->table_lock);
++			ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
++			if (ret)
++				goto out;
++			spin_lock(&file->table_lock);
++			pagefault_disable();
+ 		}
+ 
+ 		if (submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) {
+@@ -113,9 +127,12 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	}
+ 
+ out_unlock:
+-	submit->nr_bos = i;
++	pagefault_enable();
+ 	spin_unlock(&file->table_lock);
+ 
++out:
++	submit->nr_bos = i;
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/mtd/nand/davinci_nand.c b/drivers/mtd/nand/davinci_nand.c
+index feb6d18de78d..16970fccc5cd 100644
+--- a/drivers/mtd/nand/davinci_nand.c
++++ b/drivers/mtd/nand/davinci_nand.c
+@@ -241,6 +241,9 @@ static void nand_davinci_hwctl_4bit(struct mtd_info *mtd, int mode)
+ 	unsigned long flags;
+ 	u32 val;
+ 
++	/* Reset ECC hardware */
++	davinci_nand_readl(info, NAND_4BIT_ECC1_OFFSET);
++
+ 	spin_lock_irqsave(&davinci_nand_lock, flags);
+ 
+ 	/* Start 4-bit ECC calculation for read/write */
+diff --git a/drivers/net/can/dev.c b/drivers/net/can/dev.c
+index ad535a854e5c..eab132778e67 100644
+--- a/drivers/net/can/dev.c
++++ b/drivers/net/can/dev.c
+@@ -21,6 +21,7 @@
+ #include <linux/slab.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_arp.h>
++#include <linux/workqueue.h>
+ #include <linux/can.h>
+ #include <linux/can/dev.h>
+ #include <linux/can/skb.h>
+@@ -471,9 +472,8 @@ EXPORT_SYMBOL_GPL(can_free_echo_skb);
+ /*
+  * CAN device restart for bus-off recovery
+  */
+-static void can_restart(unsigned long data)
++static void can_restart(struct net_device *dev)
+ {
+-	struct net_device *dev = (struct net_device *)data;
+ 	struct can_priv *priv = netdev_priv(dev);
+ 	struct net_device_stats *stats = &dev->stats;
+ 	struct sk_buff *skb;
+@@ -513,6 +513,14 @@ restart:
+ 		netdev_err(dev, "Error %d during restart", err);
+ }
+ 
++static void can_restart_work(struct work_struct *work)
++{
++	struct delayed_work *dwork = to_delayed_work(work);
++	struct can_priv *priv = container_of(dwork, struct can_priv, restart_work);
++
++	can_restart(priv->dev);
++}
++
+ int can_restart_now(struct net_device *dev)
+ {
+ 	struct can_priv *priv = netdev_priv(dev);
+@@ -526,8 +534,8 @@ int can_restart_now(struct net_device *dev)
+ 	if (priv->state != CAN_STATE_BUS_OFF)
+ 		return -EBUSY;
+ 
+-	/* Runs as soon as possible in the timer context */
+-	mod_timer(&priv->restart_timer, jiffies);
++	cancel_delayed_work_sync(&priv->restart_work);
++	can_restart(dev);
+ 
+ 	return 0;
+ }
+@@ -548,8 +556,8 @@ void can_bus_off(struct net_device *dev)
+ 	netif_carrier_off(dev);
+ 
+ 	if (priv->restart_ms)
+-		mod_timer(&priv->restart_timer,
+-			  jiffies + (priv->restart_ms * HZ) / 1000);
++		schedule_delayed_work(&priv->restart_work,
++				      msecs_to_jiffies(priv->restart_ms));
+ }
+ EXPORT_SYMBOL_GPL(can_bus_off);
+ 
+@@ -658,6 +666,7 @@ struct net_device *alloc_candev(int sizeof_priv, unsigned int echo_skb_max)
+ 		return NULL;
+ 
+ 	priv = netdev_priv(dev);
++	priv->dev = dev;
+ 
+ 	if (echo_skb_max) {
+ 		priv->echo_skb_max = echo_skb_max;
+@@ -667,7 +676,7 @@ struct net_device *alloc_candev(int sizeof_priv, unsigned int echo_skb_max)
+ 
+ 	priv->state = CAN_STATE_STOPPED;
+ 
+-	init_timer(&priv->restart_timer);
++	INIT_DELAYED_WORK(&priv->restart_work, can_restart_work);
+ 
+ 	return dev;
+ }
+@@ -748,8 +757,6 @@ int open_candev(struct net_device *dev)
+ 	if (!netif_carrier_ok(dev))
+ 		netif_carrier_on(dev);
+ 
+-	setup_timer(&priv->restart_timer, can_restart, (unsigned long)dev);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(open_candev);
+@@ -764,7 +771,7 @@ void close_candev(struct net_device *dev)
+ {
+ 	struct can_priv *priv = netdev_priv(dev);
+ 
+-	del_timer_sync(&priv->restart_timer);
++	cancel_delayed_work_sync(&priv->restart_work);
+ 	can_flush_echo_skb(dev);
+ }
+ EXPORT_SYMBOL_GPL(close_candev);
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 940f78e41993..d9e873c3a273 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -635,7 +635,7 @@ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head,
+ 		}
+ 	}
+ 
+-	pp = eth_gro_receive(head, skb);
++	pp = call_gro_receive(eth_gro_receive, head, skb);
+ 
+ out:
+ 	skb_gro_remcsum_cleanup(skb, &grc);
+diff --git a/drivers/scsi/arcmsr/arcmsr_hba.c b/drivers/scsi/arcmsr/arcmsr_hba.c
+index 2926295a936d..c9f87cdc85c1 100644
+--- a/drivers/scsi/arcmsr/arcmsr_hba.c
++++ b/drivers/scsi/arcmsr/arcmsr_hba.c
+@@ -2300,7 +2300,8 @@ static int arcmsr_iop_message_xfer(struct AdapterControlBlock *acb,
+ 	}
+ 	case ARCMSR_MESSAGE_WRITE_WQBUFFER: {
+ 		unsigned char *ver_addr;
+-		int32_t user_len, cnt2end;
++		uint32_t user_len;
++		int32_t cnt2end;
+ 		uint8_t *pQbuffer, *ptmpuserbuffer;
+ 		ver_addr = kmalloc(ARCMSR_API_DATA_BUFLEN, GFP_ATOMIC);
+ 		if (!ver_addr) {
+@@ -2309,6 +2310,11 @@ static int arcmsr_iop_message_xfer(struct AdapterControlBlock *acb,
+ 		}
+ 		ptmpuserbuffer = ver_addr;
+ 		user_len = pcmdmessagefld->cmdmessage.Length;
++		if (user_len > ARCMSR_API_DATA_BUFLEN) {
++			retvalue = ARCMSR_MESSAGE_FAIL;
++			kfree(ver_addr);
++			goto message_out;
++		}
+ 		memcpy(ptmpuserbuffer,
+ 			pcmdmessagefld->messagedatabuffer, user_len);
+ 		spin_lock_irqsave(&acb->wqbuffer_lock, flags);
+diff --git a/drivers/scsi/megaraid/megaraid_sas.h b/drivers/scsi/megaraid/megaraid_sas.h
+index 14e5c7cea929..1fcd31c6b37b 100644
+--- a/drivers/scsi/megaraid/megaraid_sas.h
++++ b/drivers/scsi/megaraid/megaraid_sas.h
+@@ -1862,7 +1862,7 @@ struct megasas_instance_template {
+ };
+ 
+ #define MEGASAS_IS_LOGICAL(scp)						\
+-	(scp->device->channel < MEGASAS_MAX_PD_CHANNELS) ? 0 : 1
++	((scp->device->channel < MEGASAS_MAX_PD_CHANNELS) ? 0 : 1)
+ 
+ #define MEGASAS_DEV_INDEX(inst, scp)					\
+ 	((scp->device->channel % 2) * MEGASAS_MAX_DEV_PER_CHANNEL) + 	\
+diff --git a/drivers/staging/lustre/lustre/llite/llite_lib.c b/drivers/staging/lustre/lustre/llite/llite_lib.c
+index a27af7882170..d60425996948 100644
+--- a/drivers/staging/lustre/lustre/llite/llite_lib.c
++++ b/drivers/staging/lustre/lustre/llite/llite_lib.c
+@@ -1323,7 +1323,7 @@ int ll_setattr_raw(struct dentry *dentry, struct iattr *attr, bool hsm_import)
+ 		attr->ia_valid |= ATTR_MTIME | ATTR_CTIME;
+ 	}
+ 
+-	/* POSIX: check before ATTR_*TIME_SET set (from inode_change_ok) */
++	/* POSIX: check before ATTR_*TIME_SET set (from setattr_prepare) */
+ 	if (attr->ia_valid & TIMES_SET_FLAGS) {
+ 		if ((!uid_eq(current_fsuid(), inode->i_uid)) &&
+ 		    !capable(CFS_CAP_FOWNER))
+diff --git a/fs/9p/acl.c b/fs/9p/acl.c
+index 31c010372660..de59b4892bfb 100644
+--- a/fs/9p/acl.c
++++ b/fs/9p/acl.c
+@@ -320,32 +320,26 @@ static int v9fs_xattr_set_acl(struct dentry *dentry, const char *name,
+ 	case ACL_TYPE_ACCESS:
+ 		name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			umode_t mode = inode->i_mode;
+-			retval = posix_acl_equiv_mode(acl, &mode);
+-			if (retval < 0)
++			struct iattr iattr;
++
++			retval = posix_acl_update_mode(inode, &iattr.ia_mode, &acl);
++			if (retval)
+ 				goto err_out;
+-			else {
+-				struct iattr iattr;
+-				if (retval == 0) {
+-					/*
+-					 * ACL can be represented
+-					 * by the mode bits. So don't
+-					 * update ACL.
+-					 */
+-					acl = NULL;
+-					value = NULL;
+-					size = 0;
+-				}
+-				/* Updte the mode bits */
+-				iattr.ia_mode = ((mode & S_IALLUGO) |
+-						 (inode->i_mode & ~S_IALLUGO));
+-				iattr.ia_valid = ATTR_MODE;
+-				/* FIXME should we update ctime ?
+-				 * What is the following setxattr update the
+-				 * mode ?
++			if (!acl) {
++				/*
++				 * ACL can be represented
++				 * by the mode bits. So don't
++				 * update ACL.
+ 				 */
+-				v9fs_vfs_setattr_dotl(dentry, &iattr);
++				value = NULL;
++				size = 0;
+ 			}
++			iattr.ia_valid = ATTR_MODE;
++			/* FIXME should we update ctime ?
++			 * What is the following setxattr update the
++			 * mode ?
++			 */
++			v9fs_vfs_setattr_dotl(dentry, &iattr);
+ 		}
+ 		break;
+ 	case ACL_TYPE_DEFAULT:
+diff --git a/fs/9p/vfs_inode.c b/fs/9p/vfs_inode.c
+index 53f1e8a21707..99c3c4ffe1d9 100644
+--- a/fs/9p/vfs_inode.c
++++ b/fs/9p/vfs_inode.c
+@@ -1094,7 +1094,7 @@ static int v9fs_vfs_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct p9_wstat wstat;
+ 
+ 	p9_debug(P9_DEBUG_VFS, "\n");
+-	retval = inode_change_ok(d_inode(dentry), iattr);
++	retval = setattr_prepare(dentry, iattr);
+ 	if (retval)
+ 		return retval;
+ 
+diff --git a/fs/9p/vfs_inode_dotl.c b/fs/9p/vfs_inode_dotl.c
+index 4d3ecfb55fcf..ce7ab92f7e84 100644
+--- a/fs/9p/vfs_inode_dotl.c
++++ b/fs/9p/vfs_inode_dotl.c
+@@ -560,7 +560,7 @@ int v9fs_vfs_setattr_dotl(struct dentry *dentry, struct iattr *iattr)
+ 
+ 	p9_debug(P9_DEBUG_VFS, "\n");
+ 
+-	retval = inode_change_ok(inode, iattr);
++	retval = setattr_prepare(dentry, iattr);
+ 	if (retval)
+ 		return retval;
+ 
+diff --git a/fs/adfs/inode.c b/fs/adfs/inode.c
+index 335055d828e4..f57baaa511aa 100644
+--- a/fs/adfs/inode.c
++++ b/fs/adfs/inode.c
+@@ -303,7 +303,7 @@ adfs_notify_change(struct dentry *dentry, struct iattr *attr)
+ 	unsigned int ia_valid = attr->ia_valid;
+ 	int error;
+ 	
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 
+ 	/*
+ 	 * we can't change the UID or GID of any file -
+diff --git a/fs/affs/inode.c b/fs/affs/inode.c
+index a022f4accd76..87953b94a5ae 100644
+--- a/fs/affs/inode.c
++++ b/fs/affs/inode.c
+@@ -218,7 +218,7 @@ affs_notify_change(struct dentry *dentry, struct iattr *attr)
+ 
+ 	pr_debug("notify_change(%lu,0x%x)\n", inode->i_ino, attr->ia_valid);
+ 
+-	error = inode_change_ok(inode,attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		goto out;
+ 
+diff --git a/fs/attr.c b/fs/attr.c
+index 6530ced19697..ee697ddc6c2e 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -17,19 +17,22 @@
+ #include <linux/ima.h>
+ 
+ /**
+- * inode_change_ok - check if attribute changes to an inode are allowed
+- * @inode:	inode to check
++ * setattr_prepare - check if attribute changes to a dentry are allowed
++ * @dentry:	dentry to check
+  * @attr:	attributes to change
+  *
+  * Check if we are allowed to change the attributes contained in @attr
+- * in the given inode.  This includes the normal unix access permission
+- * checks, as well as checks for rlimits and others.
++ * in the given dentry.  This includes the normal unix access permission
++ * checks, as well as checks for rlimits and others. The function also clears
++ * SGID bit from mode if user is not allowed to set it. Also file capabilities
++ * and IMA extended attributes are cleared if ATTR_KILL_PRIV is set.
+  *
+  * Should be called as the first thing in ->setattr implementations,
+  * possibly after taking additional locks.
+  */
+-int inode_change_ok(const struct inode *inode, struct iattr *attr)
++int setattr_prepare(struct dentry *dentry, struct iattr *attr)
+ {
++	struct inode *inode = d_inode(dentry);
+ 	unsigned int ia_valid = attr->ia_valid;
+ 
+ 	/*
+@@ -44,7 +47,7 @@ int inode_change_ok(const struct inode *inode, struct iattr *attr)
+ 
+ 	/* If force is set do it anyway. */
+ 	if (ia_valid & ATTR_FORCE)
+-		return 0;
++		goto kill_priv;
+ 
+ 	/* Make sure a caller can chown. */
+ 	if ((ia_valid & ATTR_UID) &&
+@@ -77,9 +80,19 @@ int inode_change_ok(const struct inode *inode, struct iattr *attr)
+ 			return -EPERM;
+ 	}
+ 
++kill_priv:
++	/* User has permission for the change */
++	if (ia_valid & ATTR_KILL_PRIV) {
++		int error;
++
++		error = security_inode_killpriv(dentry);
++		if (error)
++			return error;
++	}
++
+ 	return 0;
+ }
+-EXPORT_SYMBOL(inode_change_ok);
++EXPORT_SYMBOL(setattr_prepare);
+ 
+ /**
+  * inode_newsize_ok - may this inode be truncated to a given size
+@@ -217,13 +230,11 @@ int notify_change(struct dentry * dentry, struct iattr * attr, struct inode **de
+ 	if (!(ia_valid & ATTR_MTIME_SET))
+ 		attr->ia_mtime = now;
+ 	if (ia_valid & ATTR_KILL_PRIV) {
+-		attr->ia_valid &= ~ATTR_KILL_PRIV;
+-		ia_valid &= ~ATTR_KILL_PRIV;
+ 		error = security_inode_need_killpriv(dentry);
+-		if (error > 0)
+-			error = security_inode_killpriv(dentry);
+-		if (error)
++		if (error < 0)
+ 			return error;
++		if (error == 0)
++			ia_valid = attr->ia_valid &= ~ATTR_KILL_PRIV;
+ 	}
+ 
+ 	/*
+diff --git a/fs/btrfs/acl.c b/fs/btrfs/acl.c
+index 9a0124a95851..fb3e64d37cb4 100644
+--- a/fs/btrfs/acl.c
++++ b/fs/btrfs/acl.c
+@@ -83,11 +83,9 @@ static int __btrfs_set_acl(struct btrfs_trans_handle *trans,
+ 	case ACL_TYPE_ACCESS:
+ 		name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			ret = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (ret < 0)
++			ret = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (ret)
+ 				return ret;
+-			if (ret == 0)
+-				acl = NULL;
+ 		}
+ 		ret = 0;
+ 		break;
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index c4771af7fd6f..757a34bdd2b9 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -4975,7 +4975,7 @@ static int btrfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (btrfs_root_readonly(root))
+ 		return -EROFS;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/ceph/acl.c b/fs/ceph/acl.c
+index 64fa248343f6..d7496e3dbfc4 100644
+--- a/fs/ceph/acl.c
++++ b/fs/ceph/acl.c
+@@ -94,11 +94,9 @@ int ceph_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 	case ACL_TYPE_ACCESS:
+ 		name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			ret = posix_acl_equiv_mode(acl, &new_mode);
+-			if (ret < 0)
++			ret = posix_acl_update_mode(inode, &new_mode, &acl);
++			if (ret)
+ 				goto out;
+-			if (ret == 0)
+-				acl = NULL;
+ 		}
+ 		break;
+ 	case ACL_TYPE_DEFAULT:
+diff --git a/fs/ceph/inode.c b/fs/ceph/inode.c
+index e876e1944519..4484aaf5c478 100644
+--- a/fs/ceph/inode.c
++++ b/fs/ceph/inode.c
+@@ -1728,7 +1728,7 @@ int ceph_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (ceph_snap(inode) != CEPH_NOSNAP)
+ 		return -EROFS;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err != 0)
+ 		return err;
+ 
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index 9fb3bc26a2ab..f82dfe7ae3e8 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -2134,7 +2134,7 @@ cifs_setattr_unix(struct dentry *direntry, struct iattr *attrs)
+ 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_PERM)
+ 		attrs->ia_valid |= ATTR_FORCE;
+ 
+-	rc = inode_change_ok(inode, attrs);
++	rc = setattr_prepare(direntry, attrs);
+ 	if (rc < 0)
+ 		goto out;
+ 
+@@ -2274,7 +2274,7 @@ cifs_setattr_nounix(struct dentry *direntry, struct iattr *attrs)
+ 	if (cifs_sb->mnt_cifs_flags & CIFS_MOUNT_NO_PERM)
+ 		attrs->ia_valid |= ATTR_FORCE;
+ 
+-	rc = inode_change_ok(inode, attrs);
++	rc = setattr_prepare(direntry, attrs);
+ 	if (rc < 0) {
+ 		free_xid(xid);
+ 		return rc;
+diff --git a/fs/ecryptfs/inode.c b/fs/ecryptfs/inode.c
+index fc850b55db67..661dd53f0040 100644
+--- a/fs/ecryptfs/inode.c
++++ b/fs/ecryptfs/inode.c
+@@ -942,7 +942,7 @@ static int ecryptfs_setattr(struct dentry *dentry, struct iattr *ia)
+ 	}
+ 	mutex_unlock(&crypt_stat->cs_mutex);
+ 
+-	rc = inode_change_ok(inode, ia);
++	rc = setattr_prepare(dentry, ia);
+ 	if (rc)
+ 		goto out;
+ 	if (ia->ia_valid & ATTR_SIZE) {
+diff --git a/fs/exofs/inode.c b/fs/exofs/inode.c
+index 786e4cc8c889..159c30c18395 100644
+--- a/fs/exofs/inode.c
++++ b/fs/exofs/inode.c
+@@ -1038,7 +1038,7 @@ int exofs_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	if (unlikely(error))
+ 		return error;
+ 
+-	error = inode_change_ok(inode, iattr);
++	error = setattr_prepare(dentry, iattr);
+ 	if (unlikely(error))
+ 		return error;
+ 
+diff --git a/fs/ext2/acl.c b/fs/ext2/acl.c
+index 27695e6f4e46..d6aeb84e90b6 100644
+--- a/fs/ext2/acl.c
++++ b/fs/ext2/acl.c
+@@ -193,15 +193,11 @@ ext2_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 		case ACL_TYPE_ACCESS:
+ 			name_index = EXT2_XATTR_INDEX_POSIX_ACL_ACCESS;
+ 			if (acl) {
+-				error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-				if (error < 0)
++				error = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++				if (error)
+ 					return error;
+-				else {
+-					inode->i_ctime = CURRENT_TIME_SEC;
+-					mark_inode_dirty(inode);
+-					if (error == 0)
+-						acl = NULL;
+-				}
++				inode->i_ctime = CURRENT_TIME_SEC;
++				mark_inode_dirty(inode);
+ 			}
+ 			break;
+ 
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index f460ae36d5b7..f08604366cb5 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -1547,7 +1547,7 @@ int ext2_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, iattr);
++	error = setattr_prepare(dentry, iattr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ext3/inode.c b/fs/ext3/inode.c
+index 2ee2dc4351d1..3613e87c688f 100644
+--- a/fs/ext3/inode.c
++++ b/fs/ext3/inode.c
+@@ -3244,7 +3244,7 @@ int ext3_setattr(struct dentry *dentry, struct iattr *attr)
+ 	int error, rc = 0;
+ 	const unsigned int ia_valid = attr->ia_valid;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ext4/acl.c b/fs/ext4/acl.c
+index 69b1e73026a5..c3fe1e323951 100644
+--- a/fs/ext4/acl.c
++++ b/fs/ext4/acl.c
+@@ -196,15 +196,11 @@ __ext4_set_acl(handle_t *handle, struct inode *inode, int type,
+ 	case ACL_TYPE_ACCESS:
+ 		name_index = EXT4_XATTR_INDEX_POSIX_ACL_ACCESS;
+ 		if (acl) {
+-			error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (error < 0)
++			error = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (error)
+ 				return error;
+-			else {
+-				inode->i_ctime = ext4_current_time(inode);
+-				ext4_mark_inode_dirty(handle, inode);
+-				if (error == 0)
+-					acl = NULL;
+-			}
++			inode->i_ctime = ext4_current_time(inode);
++			ext4_mark_inode_dirty(handle, inode);
+ 		}
+ 		break;
+ 
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 15213a567301..145d6ba4117d 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1008,6 +1008,7 @@ struct ext4_inode_info {
+ /*
+  * Mount flags set via mount options or defaults
+  */
++#define EXT4_MOUNT_NO_MBCACHE		0x00001 /* Disable mbcache */
+ #define EXT4_MOUNT_GRPID		0x00004	/* Create files with directory's group */
+ #define EXT4_MOUNT_DEBUG		0x00008	/* Some debugging messages */
+ #define EXT4_MOUNT_ERRORS_CONT		0x00010	/* Continue on errors */
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 9b55c6f71bf2..5beca5c5413e 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -4751,7 +4751,7 @@ int ext4_setattr(struct dentry *dentry, struct iattr *attr)
+ 	int orphan = 0;
+ 	const unsigned int ia_valid = attr->ia_valid;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index afb3eb3e8b0f..4723d8b02747 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1144,6 +1144,7 @@ enum {
+ 	Opt_nomblk_io_submit, Opt_block_validity, Opt_noblock_validity,
+ 	Opt_inode_readahead_blks, Opt_journal_ioprio,
+ 	Opt_dioread_nolock, Opt_dioread_lock,
++	Opt_no_mbcache,
+ 	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
+ 	Opt_max_dir_size_kb, Opt_nojournal_checksum,
+ };
+@@ -1222,6 +1223,7 @@ static const match_table_t tokens = {
+ 	{Opt_discard, "discard"},
+ 	{Opt_nodiscard, "nodiscard"},
+ 	{Opt_init_itable, "init_itable=%u"},
++	{Opt_no_mbcache, "no_mbcache"},
+ 	{Opt_init_itable, "init_itable"},
+ 	{Opt_noinit_itable, "noinit_itable"},
+ 	{Opt_max_dir_size_kb, "max_dir_size_kb=%u"},
+@@ -1385,6 +1387,7 @@ static const struct mount_opts {
+ 	{Opt_noauto_da_alloc, EXT4_MOUNT_NO_AUTO_DA_ALLOC, MOPT_SET},
+ 	{Opt_auto_da_alloc, EXT4_MOUNT_NO_AUTO_DA_ALLOC, MOPT_CLEAR},
+ 	{Opt_noinit_itable, EXT4_MOUNT_INIT_INODE_TABLE, MOPT_CLEAR},
++	{Opt_no_mbcache, EXT4_MOUNT_NO_MBCACHE, MOPT_SET},
+ 	{Opt_commit, 0, MOPT_GTE0},
+ 	{Opt_max_batch_time, 0, MOPT_GTE0},
+ 	{Opt_min_batch_time, 0, MOPT_GTE0},
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 16e28c08d1e8..cdc26e54400f 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -80,7 +80,7 @@
+ # define ea_bdebug(bh, fmt, ...)	no_printk(fmt, ##__VA_ARGS__)
+ #endif
+ 
+-static void ext4_xattr_cache_insert(struct mb_cache *, struct buffer_head *);
++static void ext4_xattr_cache_insert(struct inode *, struct buffer_head *);
+ static struct buffer_head *ext4_xattr_cache_find(struct inode *,
+ 						 struct ext4_xattr_header *,
+ 						 struct mb_cache_entry **);
+@@ -278,7 +278,6 @@ ext4_xattr_block_get(struct inode *inode, int name_index, const char *name,
+ 	struct ext4_xattr_entry *entry;
+ 	size_t size;
+ 	int error;
+-	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+ 
+ 	ea_idebug(inode, "name=%d.%s, buffer=%p, buffer_size=%ld",
+ 		  name_index, name, buffer, (long)buffer_size);
+@@ -300,7 +299,7 @@ bad_block:
+ 		error = -EIO;
+ 		goto cleanup;
+ 	}
+-	ext4_xattr_cache_insert(ext4_mb_cache, bh);
++	ext4_xattr_cache_insert(inode, bh);
+ 	entry = BFIRST(bh);
+ 	error = ext4_xattr_find_entry(&entry, name_index, name, bh->b_size, 1);
+ 	if (error == -EIO)
+@@ -426,7 +425,6 @@ ext4_xattr_block_list(struct dentry *dentry, char *buffer, size_t buffer_size)
+ 	struct inode *inode = d_inode(dentry);
+ 	struct buffer_head *bh = NULL;
+ 	int error;
+-	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+ 
+ 	ea_idebug(inode, "buffer=%p, buffer_size=%ld",
+ 		  buffer, (long)buffer_size);
+@@ -448,7 +446,7 @@ ext4_xattr_block_list(struct dentry *dentry, char *buffer, size_t buffer_size)
+ 		error = -EIO;
+ 		goto cleanup;
+ 	}
+-	ext4_xattr_cache_insert(ext4_mb_cache, bh);
++	ext4_xattr_cache_insert(inode, bh);
+ 	error = ext4_xattr_list_entries(dentry, BFIRST(bh), buffer, buffer_size);
+ 
+ cleanup:
+@@ -547,7 +545,8 @@ ext4_xattr_release_block(handle_t *handle, struct inode *inode,
+ 	int error = 0;
+ 	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+ 
+-	ce = mb_cache_entry_get(ext4_mb_cache, bh->b_bdev, bh->b_blocknr);
++	if (!test_opt(inode->i_sb, NO_MBCACHE))
++		ce = mb_cache_entry_get(ext4_mb_cache, bh->b_bdev, bh->b_blocknr);
+ 	BUFFER_TRACE(bh, "get_write_access");
+ 	error = ext4_journal_get_write_access(handle, bh);
+ 	if (error)
+@@ -788,8 +787,9 @@ ext4_xattr_block_set(handle_t *handle, struct inode *inode,
+ 	if (i->value && i->value_len > sb->s_blocksize)
+ 		return -ENOSPC;
+ 	if (s->base) {
+-		ce = mb_cache_entry_get(ext4_mb_cache, bs->bh->b_bdev,
+-					bs->bh->b_blocknr);
++		if (!test_opt(inode->i_sb, NO_MBCACHE))
++			ce = mb_cache_entry_get(ext4_mb_cache, bs->bh->b_bdev,
++						bs->bh->b_blocknr);
+ 		BUFFER_TRACE(bs->bh, "get_write_access");
+ 		error = ext4_journal_get_write_access(handle, bs->bh);
+ 		if (error)
+@@ -807,7 +807,7 @@ ext4_xattr_block_set(handle_t *handle, struct inode *inode,
+ 				if (!IS_LAST_ENTRY(s->first))
+ 					ext4_xattr_rehash(header(s->base),
+ 							  s->here);
+-				ext4_xattr_cache_insert(ext4_mb_cache,
++				ext4_xattr_cache_insert(inode,
+ 					bs->bh);
+ 			}
+ 			unlock_buffer(bs->bh);
+@@ -892,7 +892,8 @@ inserted:
+ 				if (error)
+ 					goto cleanup_dquot;
+ 			}
+-			mb_cache_entry_release(ce);
++			if (ce)
++				mb_cache_entry_release(ce);
+ 			ce = NULL;
+ 		} else if (bs->bh && s->base == bs->bh->b_data) {
+ 			/* We were modifying this block in-place. */
+@@ -939,7 +940,7 @@ getblk_failed:
+ 			memcpy(new_bh->b_data, s->base, new_bh->b_size);
+ 			set_buffer_uptodate(new_bh);
+ 			unlock_buffer(new_bh);
+-			ext4_xattr_cache_insert(ext4_mb_cache, new_bh);
++			ext4_xattr_cache_insert(inode, new_bh);
+ 			error = ext4_handle_dirty_xattr_block(handle,
+ 							      inode, new_bh);
+ 			if (error)
+@@ -1529,12 +1530,17 @@ ext4_xattr_put_super(struct super_block *sb)
+  * Returns 0, or a negative error number on failure.
+  */
+ static void
+-ext4_xattr_cache_insert(struct mb_cache *ext4_mb_cache, struct buffer_head *bh)
++ext4_xattr_cache_insert(struct inode *inode, struct buffer_head *bh)
+ {
++	struct super_block *sb = inode->i_sb;
++	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+ 	__u32 hash = le32_to_cpu(BHDR(bh)->h_hash);
+ 	struct mb_cache_entry *ce;
+ 	int error;
+ 
++	if (test_opt(sb, NO_MBCACHE))
++		return;
++
+ 	ce = mb_cache_entry_alloc(ext4_mb_cache, GFP_NOFS);
+ 	if (!ce) {
+ 		ea_bdebug(bh, "out of memory");
+@@ -1609,6 +1615,8 @@ ext4_xattr_cache_find(struct inode *inode, struct ext4_xattr_header *header,
+ 	struct mb_cache_entry *ce;
+ 	struct mb_cache *ext4_mb_cache = EXT4_GET_MB_CACHE(inode);
+ 
++	if (test_opt(inode->i_sb, NO_MBCACHE))
++		return NULL;
+ 	if (!header->h_hash)
+ 		return NULL;  /* never share */
+ 	ea_idebug(inode, "looking for cached blocks [%x]", (int)hash);
+diff --git a/fs/f2fs/acl.c b/fs/f2fs/acl.c
+index 4320ffab3495..c5e4a1856a0f 100644
+--- a/fs/f2fs/acl.c
++++ b/fs/f2fs/acl.c
+@@ -214,12 +214,10 @@ static int __f2fs_set_acl(struct inode *inode, int type,
+ 	case ACL_TYPE_ACCESS:
+ 		name_index = F2FS_XATTR_INDEX_POSIX_ACL_ACCESS;
+ 		if (acl) {
+-			error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (error < 0)
++			error = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (error)
+ 				return error;
+ 			set_acl_inode(fi, inode->i_mode);
+-			if (error == 0)
+-				acl = NULL;
+ 		}
+ 		break;
+ 
+diff --git a/fs/f2fs/file.c b/fs/f2fs/file.c
+index 2b52e48d7482..85e40c0fdcc4 100644
+--- a/fs/f2fs/file.c
++++ b/fs/f2fs/file.c
+@@ -617,7 +617,7 @@ int f2fs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct f2fs_inode_info *fi = F2FS_I(inode);
+ 	int err;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/fat/file.c b/fs/fat/file.c
+index 442d50a0e33e..5d37650483c6 100644
+--- a/fs/fat/file.c
++++ b/fs/fat/file.c
+@@ -388,7 +388,7 @@ int fat_setattr(struct dentry *dentry, struct iattr *attr)
+ 			attr->ia_valid &= ~TIMES_SET_FLAGS;
+ 	}
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	attr->ia_valid = ia_valid;
+ 	if (error) {
+ 		if (sbi->options.quiet)
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 0572bca49f15..88b09a33d117 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1602,9 +1602,10 @@ int fuse_flush_times(struct inode *inode, struct fuse_file *ff)
+  * vmtruncate() doesn't allow for this case, so do the rlimit checking
+  * and the actual truncation by hand.
+  */
+-int fuse_do_setattr(struct inode *inode, struct iattr *attr,
++int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 		    struct file *file)
+ {
++	struct inode *inode = d_inode(dentry);
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_inode *fi = get_fuse_inode(inode);
+ 	FUSE_ARGS(args);
+@@ -1619,7 +1620,7 @@ int fuse_do_setattr(struct inode *inode, struct iattr *attr,
+ 	if (!(fc->flags & FUSE_DEFAULT_PERMISSIONS))
+ 		attr->ia_valid |= ATTR_FORCE;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+@@ -1718,9 +1719,9 @@ static int fuse_setattr(struct dentry *entry, struct iattr *attr)
+ 		return -EACCES;
+ 
+ 	if (attr->ia_valid & ATTR_FILE)
+-		return fuse_do_setattr(inode, attr, attr->ia_file);
++		return fuse_do_setattr(entry, attr, attr->ia_file);
+ 	else
+-		return fuse_do_setattr(inode, attr, NULL);
++		return fuse_do_setattr(entry, attr, NULL);
+ }
+ 
+ static int fuse_getattr(struct vfsmount *mnt, struct dentry *entry,
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index d8f29ef2d819..1f03f0a36e35 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -2797,7 +2797,7 @@ static void fuse_do_truncate(struct file *file)
+ 	attr.ia_file = file;
+ 	attr.ia_valid |= ATTR_FILE;
+ 
+-	fuse_do_setattr(inode, &attr, file);
++	fuse_do_setattr(file->f_path.dentry, &attr, file);
+ }
+ 
+ static inline loff_t fuse_round_up(loff_t off)
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 85f9d8273455..30d2bde45f68 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -913,7 +913,7 @@ bool fuse_write_update_size(struct inode *inode, loff_t pos);
+ int fuse_flush_times(struct inode *inode, struct fuse_file *ff);
+ int fuse_write_inode(struct inode *inode, struct writeback_control *wbc);
+ 
+-int fuse_do_setattr(struct inode *inode, struct iattr *attr,
++int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 		    struct file *file);
+ 
+ void fuse_set_initialized(struct fuse_conn *fc);
+diff --git a/fs/gfs2/acl.c b/fs/gfs2/acl.c
+index 1be3b061c05c..ff0ac96a8e7b 100644
+--- a/fs/gfs2/acl.c
++++ b/fs/gfs2/acl.c
+@@ -79,17 +79,11 @@ int gfs2_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 	if (type == ACL_TYPE_ACCESS) {
+ 		umode_t mode = inode->i_mode;
+ 
+-		error = posix_acl_equiv_mode(acl, &mode);
+-		if (error < 0)
++		error = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++		if (error)
+ 			return error;
+-
+-		if (error == 0)
+-			acl = NULL;
+-
+-		if (mode != inode->i_mode) {
+-			inode->i_mode = mode;
++		if (mode != inode->i_mode)
+ 			mark_inode_dirty(inode);
+-		}
+ 	}
+ 
+ 	if (acl) {
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 1b3ca7a2e3fc..6f7f848a3c4e 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -1759,7 +1759,7 @@ static int gfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+ 		goto out;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		goto out;
+ 
+diff --git a/fs/hfs/inode.c b/fs/hfs/inode.c
+index b99ebddb10cb..6409b8b4afd4 100644
+--- a/fs/hfs/inode.c
++++ b/fs/hfs/inode.c
+@@ -604,7 +604,7 @@ int hfs_inode_setattr(struct dentry *dentry, struct iattr * attr)
+ 	struct hfs_sb_info *hsb = HFS_SB(inode->i_sb);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr); /* basic permission checks */
++	error = setattr_prepare(dentry, attr); /* basic permission checks */
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
+index 6dd107d7421e..d87c8a27e063 100644
+--- a/fs/hfsplus/inode.c
++++ b/fs/hfsplus/inode.c
+@@ -246,7 +246,7 @@ static int hfsplus_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/hfsplus/posix_acl.c b/fs/hfsplus/posix_acl.c
+index df0c9af68d05..71b3087b7e32 100644
+--- a/fs/hfsplus/posix_acl.c
++++ b/fs/hfsplus/posix_acl.c
+@@ -68,8 +68,8 @@ int hfsplus_set_posix_acl(struct inode *inode, struct posix_acl *acl,
+ 	case ACL_TYPE_ACCESS:
+ 		xattr_name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			err = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (err < 0)
++			err = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (err)
+ 				return err;
+ 		}
+ 		err = 0;
+diff --git a/fs/hostfs/hostfs_kern.c b/fs/hostfs/hostfs_kern.c
+index f895a85d9304..81ce4e4ad0f9 100644
+--- a/fs/hostfs/hostfs_kern.c
++++ b/fs/hostfs/hostfs_kern.c
+@@ -812,7 +812,7 @@ static int hostfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 
+ 	int fd = HOSTFS_I(inode)->fd;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/hpfs/inode.c b/fs/hpfs/inode.c
+index 933c73780813..efbed9520fdc 100644
+--- a/fs/hpfs/inode.c
++++ b/fs/hpfs/inode.c
+@@ -272,7 +272,7 @@ int hpfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size > inode->i_size)
+ 		goto out_unlock;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		goto out_unlock;
+ 
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 87724c1d7be6..a533d8c66489 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -400,7 +400,7 @@ static int hugetlbfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 
+ 	BUG_ON(!inode);
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/jffs2/acl.c b/fs/jffs2/acl.c
+index 2f7a3c090489..f9f86f87d32b 100644
+--- a/fs/jffs2/acl.c
++++ b/fs/jffs2/acl.c
+@@ -235,9 +235,10 @@ int jffs2_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 	case ACL_TYPE_ACCESS:
+ 		xprefix = JFFS2_XPREFIX_ACL_ACCESS;
+ 		if (acl) {
+-			umode_t mode = inode->i_mode;
+-			rc = posix_acl_equiv_mode(acl, &mode);
+-			if (rc < 0)
++			umode_t mode;
++
++			rc = posix_acl_update_mode(inode, &mode, &acl);
++			if (rc)
+ 				return rc;
+ 			if (inode->i_mode != mode) {
+ 				struct iattr attr;
+@@ -249,8 +250,6 @@ int jffs2_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 				if (rc < 0)
+ 					return rc;
+ 			}
+-			if (rc == 0)
+-				acl = NULL;
+ 		}
+ 		break;
+ 	case ACL_TYPE_DEFAULT:
+diff --git a/fs/jffs2/fs.c b/fs/jffs2/fs.c
+index fe5ea080b4ec..6273abad377f 100644
+--- a/fs/jffs2/fs.c
++++ b/fs/jffs2/fs.c
+@@ -193,7 +193,7 @@ int jffs2_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int rc;
+ 
+-	rc = inode_change_ok(inode, iattr);
++	rc = setattr_prepare(dentry, iattr);
+ 	if (rc)
+ 		return rc;
+ 
+diff --git a/fs/jfs/acl.c b/fs/jfs/acl.c
+index 0c8ca830b113..9fad9f4fe883 100644
+--- a/fs/jfs/acl.c
++++ b/fs/jfs/acl.c
+@@ -84,13 +84,11 @@ static int __jfs_set_acl(tid_t tid, struct inode *inode, int type,
+ 	case ACL_TYPE_ACCESS:
+ 		ea_name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			rc = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (rc < 0)
++			rc = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (rc)
+ 				return rc;
+ 			inode->i_ctime = CURRENT_TIME;
+ 			mark_inode_dirty(inode);
+-			if (rc == 0)
+-				acl = NULL;
+ 		}
+ 		break;
+ 	case ACL_TYPE_DEFAULT:
+diff --git a/fs/jfs/file.c b/fs/jfs/file.c
+index e98d39d75cf4..66d6362a9007 100644
+--- a/fs/jfs/file.c
++++ b/fs/jfs/file.c
+@@ -103,7 +103,7 @@ int jfs_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int rc;
+ 
+-	rc = inode_change_ok(inode, iattr);
++	rc = setattr_prepare(dentry, iattr);
+ 	if (rc)
+ 		return rc;
+ 
+diff --git a/fs/kernfs/inode.c b/fs/kernfs/inode.c
+index 756dd56aaf60..a17c850a4958 100644
+--- a/fs/kernfs/inode.c
++++ b/fs/kernfs/inode.c
+@@ -119,7 +119,7 @@ int kernfs_iop_setattr(struct dentry *dentry, struct iattr *iattr)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&kernfs_mutex);
+-	error = inode_change_ok(inode, iattr);
++	error = setattr_prepare(dentry, iattr);
+ 	if (error)
+ 		goto out;
+ 
+diff --git a/fs/libfs.c b/fs/libfs.c
+index f4641fd27bda..50edbdc23cef 100644
+--- a/fs/libfs.c
++++ b/fs/libfs.c
+@@ -371,7 +371,7 @@ int simple_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, iattr);
++	error = setattr_prepare(dentry, iattr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/logfs/file.c b/fs/logfs/file.c
+index 1a6f0167b16a..3abe1414c3f4 100644
+--- a/fs/logfs/file.c
++++ b/fs/logfs/file.c
+@@ -244,7 +244,7 @@ static int logfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int err = 0;
+ 
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/minix/file.c b/fs/minix/file.c
+index 94f0eb9a6e2c..a6a4797aa0d4 100644
+--- a/fs/minix/file.c
++++ b/fs/minix/file.c
+@@ -26,7 +26,7 @@ static int minix_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/mount.h b/fs/mount.h
+index 6a61c2b3e385..2152c16ddf74 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -13,6 +13,8 @@ struct mnt_namespace {
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	u64 event;
++	unsigned int		mounts; /* # of mounts in the namespace */
++	unsigned int		pending_mounts;
+ };
+ 
+ struct mnt_pcp {
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 556721fb0cf6..f853aaf92ec9 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -27,6 +27,9 @@
+ #include "pnode.h"
+ #include "internal.h"
+ 
++/* Maximum number of mounts in a mount namespace */
++unsigned int sysctl_mount_max __read_mostly = 100000;
++
+ static unsigned int m_hash_mask __read_mostly;
+ static unsigned int m_hash_shift __read_mostly;
+ static unsigned int mp_hash_mask __read_mostly;
+@@ -888,6 +891,9 @@ static void commit_tree(struct mount *mnt, struct mount *shadows)
+ 
+ 	list_splice(&head, n->list.prev);
+ 
++	n->mounts += n->pending_mounts;
++	n->pending_mounts = 0;
++
+ 	attach_shadowed(mnt, parent, shadows);
+ 	touch_mnt_namespace(n);
+ }
+@@ -1408,11 +1414,16 @@ static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
+ 		propagate_umount(&tmp_list);
+ 
+ 	while (!list_empty(&tmp_list)) {
++		struct mnt_namespace *ns;
+ 		bool disconnect;
+ 		p = list_first_entry(&tmp_list, struct mount, mnt_list);
+ 		list_del_init(&p->mnt_expire);
+ 		list_del_init(&p->mnt_list);
+-		__touch_mnt_namespace(p->mnt_ns);
++		ns = p->mnt_ns;
++		if (ns) {
++			ns->mounts--;
++			__touch_mnt_namespace(ns);
++		}
+ 		p->mnt_ns = NULL;
+ 		if (how & UMOUNT_SYNC)
+ 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
+@@ -1821,6 +1832,28 @@ static int invent_group_ids(struct mount *mnt, bool recurse)
+ 	return 0;
+ }
+ 
++int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
++{
++	unsigned int max = READ_ONCE(sysctl_mount_max);
++	unsigned int mounts = 0, old, pending, sum;
++	struct mount *p;
++
++	for (p = mnt; p; p = next_mnt(p, mnt))
++		mounts++;
++
++	old = ns->mounts;
++	pending = ns->pending_mounts;
++	sum = old + pending;
++	if ((old > sum) ||
++	    (pending > sum) ||
++	    (max < sum) ||
++	    (mounts > (max - sum)))
++		return -ENOSPC;
++
++	ns->pending_mounts = pending + mounts;
++	return 0;
++}
++
+ /*
+  *  @source_mnt : mount tree to be attached
+  *  @nd         : place the mount tree @source_mnt is attached
+@@ -1890,10 +1923,18 @@ static int attach_recursive_mnt(struct mount *source_mnt,
+ 			struct path *parent_path)
+ {
+ 	HLIST_HEAD(tree_list);
++	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+ 	struct mount *child, *p;
+ 	struct hlist_node *n;
+ 	int err;
+ 
++	/* Is there space to add these mounts to the mount namespace? */
++	if (!parent_path) {
++		err = count_mounts(ns, source_mnt);
++		if (err)
++			goto out;
++	}
++
+ 	if (IS_MNT_SHARED(dest_mnt)) {
+ 		err = invent_group_ids(source_mnt, true);
+ 		if (err)
+@@ -1930,11 +1971,13 @@ static int attach_recursive_mnt(struct mount *source_mnt,
+  out_cleanup_ids:
+ 	while (!hlist_empty(&tree_list)) {
+ 		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
++		child->mnt_parent->mnt_ns->pending_mounts = 0;
+ 		umount_tree(child, UMOUNT_SYNC);
+ 	}
+ 	unlock_mount_hash();
+ 	cleanup_group_ids(source_mnt, NULL);
+  out:
++	ns->pending_mounts = 0;
+ 	return err;
+ }
+ 
+@@ -2758,6 +2801,8 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
+ 	init_waitqueue_head(&new_ns->poll);
+ 	new_ns->event = 0;
+ 	new_ns->user_ns = get_user_ns(user_ns);
++	new_ns->mounts = 0;
++	new_ns->pending_mounts = 0;
+ 	return new_ns;
+ }
+ 
+@@ -2807,6 +2852,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
+ 	q = new;
+ 	while (p) {
+ 		q->mnt_ns = new_ns;
++		new_ns->mounts++;
+ 		if (new_fs) {
+ 			if (&p->mnt == new_fs->root.mnt) {
+ 				new_fs->root.mnt = mntget(&q->mnt);
+@@ -2845,6 +2891,7 @@ static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
+ 		struct mount *mnt = real_mount(m);
+ 		mnt->mnt_ns = new_ns;
+ 		new_ns->root = mnt;
++		new_ns->mounts++;
+ 		list_add(&mnt->mnt_list, &new_ns->list);
+ 	} else {
+ 		mntput(m);
+diff --git a/fs/ncpfs/inode.c b/fs/ncpfs/inode.c
+index 9605a2f63549..7b1261bc2dee 100644
+--- a/fs/ncpfs/inode.c
++++ b/fs/ncpfs/inode.c
+@@ -884,7 +884,7 @@ int ncp_notify_change(struct dentry *dentry, struct iattr *attr)
+ 	/* ageing the dentry to force validation */
+ 	ncp_age_dentry(server, dentry);
+ 
+-	result = inode_change_ok(inode, attr);
++	result = setattr_prepare(dentry, attr);
+ 	if (result < 0)
+ 		goto out;
+ 
+diff --git a/fs/nfsd/nfsproc.c b/fs/nfsd/nfsproc.c
+index aecbcd34d336..44f6f4f5eee0 100644
+--- a/fs/nfsd/nfsproc.c
++++ b/fs/nfsd/nfsproc.c
+@@ -59,13 +59,59 @@ static __be32
+ nfsd_proc_setattr(struct svc_rqst *rqstp, struct nfsd_sattrargs *argp,
+ 					  struct nfsd_attrstat  *resp)
+ {
++	struct iattr *iap = &argp->attrs;
++	struct svc_fh *fhp;
+ 	__be32 nfserr;
++
+ 	dprintk("nfsd: SETATTR  %s, valid=%x, size=%ld\n",
+ 		SVCFH_fmt(&argp->fh),
+ 		argp->attrs.ia_valid, (long) argp->attrs.ia_size);
+ 
+-	fh_copy(&resp->fh, &argp->fh);
+-	nfserr = nfsd_setattr(rqstp, &resp->fh, &argp->attrs,0, (time_t)0);
++	fhp = fh_copy(&resp->fh, &argp->fh);
++
++	/*
++	 * NFSv2 does not differentiate between "set-[ac]time-to-now"
++	 * which only requires access, and "set-[ac]time-to-X" which
++	 * requires ownership.
++	 * So if it looks like it might be "set both to the same time which
++	 * is close to now", and if setattr_prepare fails, then we
++	 * convert to "set to now" instead of "set to explicit time"
++	 *
++	 * We only call setattr_prepare as the last test as technically
++	 * it is not an interface that we should be using.
++	 */
++#define BOTH_TIME_SET (ATTR_ATIME_SET | ATTR_MTIME_SET)
++#define	MAX_TOUCH_TIME_ERROR (30*60)
++	if ((iap->ia_valid & BOTH_TIME_SET) == BOTH_TIME_SET &&
++	    iap->ia_mtime.tv_sec == iap->ia_atime.tv_sec) {
++		/*
++		 * Looks probable.
++		 *
++		 * Now just make sure time is in the right ballpark.
++		 * Solaris, at least, doesn't seem to care what the time
++		 * request is.  We require it be within 30 minutes of now.
++		 */
++		time_t delta = iap->ia_atime.tv_sec - get_seconds();
++
++		nfserr = fh_verify(rqstp, fhp, 0, NFSD_MAY_NOP);
++		if (nfserr)
++			goto done;
++
++		if (delta < 0)
++			delta = -delta;
++		if (delta < MAX_TOUCH_TIME_ERROR &&
++		    setattr_prepare(fhp->fh_dentry, iap) != 0) {
++			/*
++			 * Turn off ATTR_[AM]TIME_SET but leave ATTR_[AM]TIME.
++			 * This will cause notify_change to set these times
++			 * to "now"
++			 */
++			iap->ia_valid &= ~BOTH_TIME_SET;
++		}
++	}
++
++	nfserr = nfsd_setattr(rqstp, fhp, iap, 0, (time_t)0);
++done:
+ 	return nfsd_return_attrs(nfserr, resp);
+ }
+ 
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 84d770be056e..92de3747ea8b 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -302,42 +302,6 @@ commit_metadata(struct svc_fh *fhp)
+ static void
+ nfsd_sanitize_attrs(struct inode *inode, struct iattr *iap)
+ {
+-	/*
+-	 * NFSv2 does not differentiate between "set-[ac]time-to-now"
+-	 * which only requires access, and "set-[ac]time-to-X" which
+-	 * requires ownership.
+-	 * So if it looks like it might be "set both to the same time which
+-	 * is close to now", and if inode_change_ok fails, then we
+-	 * convert to "set to now" instead of "set to explicit time"
+-	 *
+-	 * We only call inode_change_ok as the last test as technically
+-	 * it is not an interface that we should be using.
+-	 */
+-#define BOTH_TIME_SET (ATTR_ATIME_SET | ATTR_MTIME_SET)
+-#define	MAX_TOUCH_TIME_ERROR (30*60)
+-	if ((iap->ia_valid & BOTH_TIME_SET) == BOTH_TIME_SET &&
+-	    iap->ia_mtime.tv_sec == iap->ia_atime.tv_sec) {
+-		/*
+-		 * Looks probable.
+-		 *
+-		 * Now just make sure time is in the right ballpark.
+-		 * Solaris, at least, doesn't seem to care what the time
+-		 * request is.  We require it be within 30 minutes of now.
+-		 */
+-		time_t delta = iap->ia_atime.tv_sec - get_seconds();
+-		if (delta < 0)
+-			delta = -delta;
+-		if (delta < MAX_TOUCH_TIME_ERROR &&
+-		    inode_change_ok(inode, iap) != 0) {
+-			/*
+-			 * Turn off ATTR_[AM]TIME_SET but leave ATTR_[AM]TIME.
+-			 * This will cause notify_change to set these times
+-			 * to "now"
+-			 */
+-			iap->ia_valid &= ~BOTH_TIME_SET;
+-		}
+-	}
+-
+ 	/* sanitize the mode change */
+ 	if (iap->ia_valid & ATTR_MODE) {
+ 		iap->ia_mode &= S_IALLUGO;
+diff --git a/fs/nilfs2/inode.c b/fs/nilfs2/inode.c
+index 258d9fe2521a..b40df2bb5ee4 100644
+--- a/fs/nilfs2/inode.c
++++ b/fs/nilfs2/inode.c
+@@ -839,7 +839,7 @@ int nilfs_setattr(struct dentry *dentry, struct iattr *iattr)
+ 	struct super_block *sb = inode->i_sb;
+ 	int err;
+ 
+-	err = inode_change_ok(inode, iattr);
++	err = setattr_prepare(dentry, iattr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/ntfs/inode.c b/fs/ntfs/inode.c
+index d284f07eda77..c178763893f3 100644
+--- a/fs/ntfs/inode.c
++++ b/fs/ntfs/inode.c
+@@ -2893,7 +2893,7 @@ int ntfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	int err;
+ 	unsigned int ia_valid = attr->ia_valid;
+ 
+-	err = inode_change_ok(vi, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		goto out;
+ 	/* We do not support NTFS ACLs yet. */
+diff --git a/fs/ocfs2/acl.c b/fs/ocfs2/acl.c
+index 762e5a3aecd3..c7641f656494 100644
+--- a/fs/ocfs2/acl.c
++++ b/fs/ocfs2/acl.c
+@@ -241,13 +241,11 @@ int ocfs2_set_acl(handle_t *handle,
+ 	case ACL_TYPE_ACCESS:
+ 		name_index = OCFS2_XATTR_INDEX_POSIX_ACL_ACCESS;
+ 		if (acl) {
+-			umode_t mode = inode->i_mode;
+-			ret = posix_acl_equiv_mode(acl, &mode);
+-			if (ret < 0)
+-				return ret;
++			umode_t mode;
+ 
+-			if (ret == 0)
+-				acl = NULL;
++			ret = posix_acl_update_mode(inode, &mode, &acl);
++			if (ret)
++				return ret;
+ 
+ 			ret = ocfs2_acl_set_mode(inode, di_bh,
+ 						 handle, mode);
+diff --git a/fs/ocfs2/dlmfs/dlmfs.c b/fs/ocfs2/dlmfs/dlmfs.c
+index b5cf27dcb18a..43ac2289c613 100644
+--- a/fs/ocfs2/dlmfs/dlmfs.c
++++ b/fs/ocfs2/dlmfs/dlmfs.c
+@@ -211,7 +211,7 @@ static int dlmfs_file_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 
+ 	attr->ia_valid &= ~ATTR_SIZE;
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
+index e00be7f509db..bc06b982e9ea 100644
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -1150,7 +1150,7 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (!(attr->ia_valid & OCFS2_VALID_ATTRS))
+ 		return 0;
+ 
+-	status = inode_change_ok(inode, attr);
++	status = setattr_prepare(dentry, attr);
+ 	if (status)
+ 		return status;
+ 
+diff --git a/fs/omfs/file.c b/fs/omfs/file.c
+index d9e26cfbb793..bf83e6644333 100644
+--- a/fs/omfs/file.c
++++ b/fs/omfs/file.c
+@@ -349,7 +349,7 @@ static int omfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/overlayfs/inode.c b/fs/overlayfs/inode.c
+index 0bb8347c0d8b..d293034ae2cb 100644
+--- a/fs/overlayfs/inode.c
++++ b/fs/overlayfs/inode.c
+@@ -54,7 +54,7 @@ int ovl_setattr(struct dentry *dentry, struct iattr *attr)
+ 	 * inode_newsize_ok() will always check against MAX_LFS_FILESIZE and not
+ 	 * check for a swapfile (which this won't be anyway).
+ 	 */
+-	err = inode_change_ok(dentry->d_inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/pnode.c b/fs/pnode.c
+index 99899705b105..234a9ac49958 100644
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@ -259,7 +259,7 @@ static int propagate_one(struct mount *m)
+ 		read_sequnlock_excl(&mount_lock);
+ 	}
+ 	hlist_add_head(&child->mnt_hash, list);
+-	return 0;
++	return count_mounts(m->mnt_ns, child);
+ }
+ 
+ /*
+diff --git a/fs/pnode.h b/fs/pnode.h
+index 0fcdbe7ca648..550f5a8b4fcf 100644
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -52,4 +52,5 @@ void mnt_set_mountpoint(struct mount *, struct mountpoint *,
+ struct mount *copy_tree(struct mount *, struct dentry *, int);
+ bool is_path_reachable(struct mount *, struct dentry *,
+ 			 const struct path *root);
++int count_mounts(struct mnt_namespace *ns, struct mount *mnt);
+ #endif /* _LINUX_PNODE_H */
+diff --git a/fs/posix_acl.c b/fs/posix_acl.c
+index a9dafa83678c..0ef1c3722504 100644
+--- a/fs/posix_acl.c
++++ b/fs/posix_acl.c
+@@ -598,6 +598,37 @@ no_mem:
+ }
+ EXPORT_SYMBOL_GPL(posix_acl_create);
+ 
++/**
++ * posix_acl_update_mode  -  update mode in set_acl
++ *
++ * Update the file mode when setting an ACL: compute the new file permission
++ * bits based on the ACL.  In addition, if the ACL is equivalent to the new
++ * file mode, set *acl to NULL to indicate that no ACL should be set.
++ *
++ * As with chmod, clear the setgit bit if the caller is not in the owning group
++ * or capable of CAP_FSETID (see inode_change_ok).
++ *
++ * Called from set_acl inode operations.
++ */
++int posix_acl_update_mode(struct inode *inode, umode_t *mode_p,
++			  struct posix_acl **acl)
++{
++	umode_t mode = inode->i_mode;
++	int error;
++
++	error = posix_acl_equiv_mode(*acl, &mode);
++	if (error < 0)
++		return error;
++	if (error == 0)
++		*acl = NULL;
++	if (!in_group_p(inode->i_gid) &&
++	    !capable_wrt_inode_uidgid(inode, CAP_FSETID))
++		mode &= ~S_ISGID;
++	*mode_p = mode;
++	return 0;
++}
++EXPORT_SYMBOL(posix_acl_update_mode);
++
+ /*
+  * Fix up the uids and gids in posix acl extended attributes in place.
+  */
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 239dca3fb676..fab32ad5d96d 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -517,7 +517,7 @@ int proc_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (attr->ia_valid & ATTR_MODE)
+ 		return -EPERM;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/proc/generic.c b/fs/proc/generic.c
+index e5dee5c3188e..d99099fe62d4 100644
+--- a/fs/proc/generic.c
++++ b/fs/proc/generic.c
+@@ -105,7 +105,7 @@ static int proc_notify_change(struct dentry *dentry, struct iattr *iattr)
+ 	struct proc_dir_entry *de = PDE(inode);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, iattr);
++	error = setattr_prepare(dentry, iattr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index fdda62e6115e..0dea606074c7 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -753,7 +753,7 @@ static int proc_sys_setattr(struct dentry *dentry, struct iattr *attr)
+ 	if (attr->ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID))
+ 		return -EPERM;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ramfs/file-nommu.c b/fs/ramfs/file-nommu.c
+index ba1323a94924..aab2593f3179 100644
+--- a/fs/ramfs/file-nommu.c
++++ b/fs/ramfs/file-nommu.c
+@@ -168,7 +168,7 @@ static int ramfs_nommu_setattr(struct dentry *dentry, struct iattr *ia)
+ 	int ret = 0;
+ 
+ 	/* POSIX UID/GID verification for setting inode attributes */
+-	ret = inode_change_ok(inode, ia);
++	ret = setattr_prepare(dentry, ia);
+ 	if (ret)
+ 		return ret;
+ 
+diff --git a/fs/reiserfs/inode.c b/fs/reiserfs/inode.c
+index f6f2fbad9777..7da1232a78e3 100644
+--- a/fs/reiserfs/inode.c
++++ b/fs/reiserfs/inode.c
+@@ -3312,7 +3312,7 @@ int reiserfs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	unsigned int ia_valid;
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/reiserfs/xattr_acl.c b/fs/reiserfs/xattr_acl.c
+index 4b34b9dc03dd..9b1824f35501 100644
+--- a/fs/reiserfs/xattr_acl.c
++++ b/fs/reiserfs/xattr_acl.c
+@@ -246,13 +246,9 @@ __reiserfs_set_acl(struct reiserfs_transaction_handle *th, struct inode *inode,
+ 	case ACL_TYPE_ACCESS:
+ 		name = POSIX_ACL_XATTR_ACCESS;
+ 		if (acl) {
+-			error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-			if (error < 0)
++			error = posix_acl_update_mode(inode, &inode->i_mode, &acl);
++			if (error)
+ 				return error;
+-			else {
+-				if (error == 0)
+-					acl = NULL;
+-			}
+ 		}
+ 		break;
+ 	case ACL_TYPE_DEFAULT:
+diff --git a/fs/sysv/file.c b/fs/sysv/file.c
+index 82ddc09061e2..7ba997e31aeb 100644
+--- a/fs/sysv/file.c
++++ b/fs/sysv/file.c
+@@ -33,7 +33,7 @@ static int sysv_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ubifs/file.c b/fs/ubifs/file.c
+index 75e9b2db14ab..2dc8ce485c51 100644
+--- a/fs/ubifs/file.c
++++ b/fs/ubifs/file.c
+@@ -1263,7 +1263,7 @@ int ubifs_setattr(struct dentry *dentry, struct iattr *attr)
+ 
+ 	dbg_gen("ino %lu, mode %#x, ia_valid %#x",
+ 		inode->i_ino, inode->i_mode, attr->ia_valid);
+-	err = inode_change_ok(inode, attr);
++	err = setattr_prepare(dentry, attr);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/udf/file.c b/fs/udf/file.c
+index 7a95b8fed302..889f1e5da507 100644
+--- a/fs/udf/file.c
++++ b/fs/udf/file.c
+@@ -252,7 +252,7 @@ static int udf_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/ufs/truncate.c b/fs/ufs/truncate.c
+index 21154704c168..a958b36f40bb 100644
+--- a/fs/ufs/truncate.c
++++ b/fs/ufs/truncate.c
+@@ -496,7 +496,7 @@ int ufs_setattr(struct dentry *dentry, struct iattr *attr)
+ 	unsigned int ia_valid = attr->ia_valid;
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/utimes.c b/fs/utimes.c
+index aa138d64560a..61abc3051377 100644
+--- a/fs/utimes.c
++++ b/fs/utimes.c
+@@ -81,7 +81,7 @@ static int utimes_common(struct path *path, struct timespec *times)
+ 			newattrs.ia_valid |= ATTR_MTIME_SET;
+ 		}
+ 		/*
+-		 * Tell inode_change_ok(), that this is an explicit time
++		 * Tell setattr_prepare(), that this is an explicit time
+ 		 * update, even if neither ATTR_ATIME_SET nor ATTR_MTIME_SET
+ 		 * were used.
+ 		 */
+@@ -90,7 +90,7 @@ static int utimes_common(struct path *path, struct timespec *times)
+ 		/*
+ 		 * If times is NULL (or both times are UTIME_NOW),
+ 		 * then we need to check permissions, because
+-		 * inode_change_ok() won't do it.
++		 * setattr_prepare() won't do it.
+ 		 */
+ 		error = -EACCES;
+                 if (IS_IMMUTABLE(inode))
+diff --git a/fs/xfs/xfs_acl.c b/fs/xfs/xfs_acl.c
+index 4b641676f258..e80dbfa2a7b9 100644
+--- a/fs/xfs/xfs_acl.c
++++ b/fs/xfs/xfs_acl.c
+@@ -284,16 +284,11 @@ xfs_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 		return error;
+ 
+ 	if (type == ACL_TYPE_ACCESS) {
+-		umode_t mode = inode->i_mode;
+-		error = posix_acl_equiv_mode(acl, &mode);
+-
+-		if (error <= 0) {
+-			acl = NULL;
+-
+-			if (error < 0)
+-				return error;
+-		}
++		umode_t mode;
+ 
++		error = posix_acl_update_mode(inode, &mode, &acl);
++		if (error)
++			return error;
+ 		error = xfs_set_mode(inode, mode);
+ 		if (error)
+ 			return error;
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 3b7591224f4a..550f8c4733ee 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -973,7 +973,7 @@ xfs_file_fallocate(
+ 
+ 		iattr.ia_valid = ATTR_SIZE;
+ 		iattr.ia_size = new_size;
+-		error = xfs_setattr_size(ip, &iattr);
++		error = xfs_vn_setattr_size(file->f_path.dentry, &iattr);
+ 		if (error)
+ 			goto out_unlock;
+ 	}
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index c29f34253e2b..6b67d617c092 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -1766,7 +1766,7 @@ xfs_inactive_truncate(
+ 	/*
+ 	 * Log the inode size first to prevent stale data exposure in the event
+ 	 * of a system crash before the truncate completes. See the related
+-	 * comment in xfs_setattr_size() for details.
++	 * comment in xfs_vn_setattr_size() for details.
+ 	 */
+ 	ip->i_d.di_size = 0;
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 87f67c6b654c..82e49109d0b6 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -720,7 +720,7 @@ xfs_ioc_space(
+ 		iattr.ia_valid = ATTR_SIZE;
+ 		iattr.ia_size = bf->l_start;
+ 
+-		error = xfs_setattr_size(ip, &iattr);
++		error = xfs_vn_setattr_size(filp->f_path.dentry, &iattr);
+ 		break;
+ 	default:
+ 		ASSERT(0);
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index f4cd7204e236..4e4d6511185b 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -537,6 +537,30 @@ xfs_setattr_time(
+ 	}
+ }
+ 
++static int
++xfs_vn_change_ok(
++	struct dentry	*dentry,
++	struct iattr	*iattr)
++{
++	struct inode		*inode = d_inode(dentry);
++	struct xfs_inode	*ip = XFS_I(inode);
++	struct xfs_mount	*mp = ip->i_mount;
++
++	if (mp->m_flags & XFS_MOUNT_RDONLY)
++		return -EROFS;
++
++	if (XFS_FORCED_SHUTDOWN(mp))
++		return -EIO;
++
++	return setattr_prepare(dentry, iattr);
++}
++
++/*
++ * Set non-size attributes of an inode.
++ *
++ * Caution: The caller of this function is responsible for calling
++ * setattr_prepare() or otherwise verifying the change is fine.
++ */
+ int
+ xfs_setattr_nonsize(
+ 	struct xfs_inode	*ip,
+@@ -553,21 +577,6 @@ xfs_setattr_nonsize(
+ 	struct xfs_dquot	*udqp = NULL, *gdqp = NULL;
+ 	struct xfs_dquot	*olddquot1 = NULL, *olddquot2 = NULL;
+ 
+-	trace_xfs_setattr(ip);
+-
+-	/* If acls are being inherited, we already have this checked */
+-	if (!(flags & XFS_ATTR_NOACL)) {
+-		if (mp->m_flags & XFS_MOUNT_RDONLY)
+-			return -EROFS;
+-
+-		if (XFS_FORCED_SHUTDOWN(mp))
+-			return -EIO;
+-
+-		error = inode_change_ok(inode, iattr);
+-		if (error)
+-			return error;
+-	}
+-
+ 	ASSERT((mask & ATTR_SIZE) == 0);
+ 
+ 	/*
+@@ -741,8 +750,27 @@ out_dqrele:
+ 	return error;
+ }
+ 
++int
++xfs_vn_setattr_nonsize(
++	struct dentry		*dentry,
++	struct iattr		*iattr)
++{
++	struct xfs_inode	*ip = XFS_I(d_inode(dentry));
++	int error;
++
++	trace_xfs_setattr(ip);
++
++	error = xfs_vn_change_ok(dentry, iattr);
++	if (error)
++		return error;
++	return xfs_setattr_nonsize(ip, iattr, 0);
++}
++
+ /*
+  * Truncate file.  Must have write permission and not be a directory.
++ *
++ * Caution: The caller of this function is responsible for calling
++ * setattr_prepare() or otherwise verifying the change is fine.
+  */
+ int
+ xfs_setattr_size(
+@@ -758,18 +786,6 @@ xfs_setattr_size(
+ 	uint			commit_flags = 0;
+ 	bool			did_zeroing = false;
+ 
+-	trace_xfs_setattr(ip);
+-
+-	if (mp->m_flags & XFS_MOUNT_RDONLY)
+-		return -EROFS;
+-
+-	if (XFS_FORCED_SHUTDOWN(mp))
+-		return -EIO;
+-
+-	error = inode_change_ok(inode, iattr);
+-	if (error)
+-		return error;
+-
+ 	ASSERT(xfs_isilocked(ip, XFS_IOLOCK_EXCL));
+ 	ASSERT(xfs_isilocked(ip, XFS_MMAPLOCK_EXCL));
+ 	ASSERT(S_ISREG(ip->i_d.di_mode));
+@@ -941,16 +957,32 @@ out_trans_cancel:
+ 	goto out_unlock;
+ }
+ 
++int
++xfs_vn_setattr_size(
++	struct dentry		*dentry,
++	struct iattr		*iattr)
++{
++	struct xfs_inode	*ip = XFS_I(d_inode(dentry));
++	int error;
++
++	trace_xfs_setattr(ip);
++
++	error = xfs_vn_change_ok(dentry, iattr);
++	if (error)
++		return error;
++	return xfs_setattr_size(ip, iattr);
++}
++
+ STATIC int
+ xfs_vn_setattr(
+ 	struct dentry		*dentry,
+ 	struct iattr		*iattr)
+ {
+-	struct xfs_inode	*ip = XFS_I(d_inode(dentry));
+ 	int			error;
+ 
+ 	if (iattr->ia_valid & ATTR_SIZE) {
+-		uint		iolock = XFS_IOLOCK_EXCL;
++		struct xfs_inode	*ip = XFS_I(d_inode(dentry));
++		uint			iolock = XFS_IOLOCK_EXCL;
+ 
+ 		xfs_ilock(ip, iolock);
+ 		error = xfs_break_layouts(d_inode(dentry), &iolock, true);
+@@ -958,11 +990,11 @@ xfs_vn_setattr(
+ 			xfs_ilock(ip, XFS_MMAPLOCK_EXCL);
+ 			iolock |= XFS_MMAPLOCK_EXCL;
+ 
+-			error = xfs_setattr_size(ip, iattr);
++			error = xfs_vn_setattr_size(dentry, iattr);
+ 		}
+ 		xfs_iunlock(ip, iolock);
+ 	} else {
+-		error = xfs_setattr_nonsize(ip, iattr, 0);
++		error = xfs_vn_setattr_nonsize(dentry, iattr);
+ 	}
+ 
+ 	return error;
+diff --git a/fs/xfs/xfs_iops.h b/fs/xfs/xfs_iops.h
+index a0f84abb0d09..0259a383721a 100644
+--- a/fs/xfs/xfs_iops.h
++++ b/fs/xfs/xfs_iops.h
+@@ -33,6 +33,7 @@ extern ssize_t xfs_vn_listxattr(struct dentry *, char *data, size_t size);
+ extern void xfs_setattr_time(struct xfs_inode *ip, struct iattr *iattr);
+ extern int xfs_setattr_nonsize(struct xfs_inode *ip, struct iattr *vap,
+ 			       int flags);
+-extern int xfs_setattr_size(struct xfs_inode *ip, struct iattr *vap);
++extern int xfs_vn_setattr_nonsize(struct dentry *dentry, struct iattr *vap);
++extern int xfs_vn_setattr_size(struct dentry *dentry, struct iattr *vap);
+ 
+ #endif /* __XFS_IOPS_H__ */
+diff --git a/include/linux/can/dev.h b/include/linux/can/dev.h
+index 5e13b987d9e2..678e97fa3869 100644
+--- a/include/linux/can/dev.h
++++ b/include/linux/can/dev.h
+@@ -31,6 +31,7 @@ enum can_mode {
+  * CAN common private data
+  */
+ struct can_priv {
++	struct net_device *dev;
+ 	struct can_device_stats can_stats;
+ 
+ 	struct can_bittiming bittiming, data_bittiming;
+@@ -46,7 +47,7 @@ struct can_priv {
+ 	u32 ctrlmode_static;	/* static enabled options for driver/hardware */
+ 
+ 	int restart_ms;
+-	struct timer_list restart_timer;
++	struct delayed_work restart_work;
+ 
+ 	int (*do_set_bittiming)(struct net_device *dev);
+ 	int (*do_set_data_bittiming)(struct net_device *dev);
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index ae327f6a53f6..31c3d818c981 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2816,7 +2816,7 @@ extern int buffer_migrate_page(struct address_space *,
+ #define buffer_migrate_page NULL
+ #endif
+ 
+-extern int inode_change_ok(const struct inode *, struct iattr *);
++extern int setattr_prepare(struct dentry *, struct iattr *);
+ extern int inode_newsize_ok(const struct inode *, loff_t offset);
+ extern void setattr_copy(struct inode *inode, const struct iattr *attr);
+ 
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index f822c3c11377..dc6cd800cd5d 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -95,4 +95,6 @@ extern void mark_mounts_for_expiry(struct list_head *mounts);
+ 
+ extern dev_t name_to_dev_t(const char *name);
+ 
++extern unsigned int sysctl_mount_max;
++
+ #endif /* _LINUX_MOUNT_H */
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 6c86c7edafa7..ddd47c3a757d 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1957,7 +1957,10 @@ struct napi_gro_cb {
+ 	/* Used in foo-over-udp, set in udp[46]_gro_receive */
+ 	u8	is_ipv6:1;
+ 
+-	/* 7 bit hole */
++	/* Number of gro_receive callbacks this packet already went through */
++	u8 recursion_counter:4;
++
++	/* 3 bit hole */
+ 
+ 	/* used to support CHECKSUM_COMPLETE for tunneling protocols */
+ 	__wsum	csum;
+@@ -1968,6 +1971,25 @@ struct napi_gro_cb {
+ 
+ #define NAPI_GRO_CB(skb) ((struct napi_gro_cb *)(skb)->cb)
+ 
++#define GRO_RECURSION_LIMIT 15
++static inline int gro_recursion_inc_test(struct sk_buff *skb)
++{
++	return ++NAPI_GRO_CB(skb)->recursion_counter == GRO_RECURSION_LIMIT;
++}
++
++typedef struct sk_buff **(*gro_receive_t)(struct sk_buff **, struct sk_buff *);
++static inline struct sk_buff **call_gro_receive(gro_receive_t cb,
++						struct sk_buff **head,
++						struct sk_buff *skb)
++{
++	if (gro_recursion_inc_test(skb)) {
++		NAPI_GRO_CB(skb)->flush |= 1;
++		return NULL;
++	}
++
++	return cb(head, skb);
++}
++
+ struct packet_type {
+ 	__be16			type;	/* This is really htons(ether_type). */
+ 	struct net_device	*dev;	/* NULL is wildcarded here	     */
+diff --git a/include/linux/posix_acl.h b/include/linux/posix_acl.h
+index 3e96a6a76103..d1a8ad7e5ae4 100644
+--- a/include/linux/posix_acl.h
++++ b/include/linux/posix_acl.h
+@@ -95,6 +95,7 @@ extern int set_posix_acl(struct inode *, int, struct posix_acl *);
+ extern int posix_acl_chmod(struct inode *, umode_t);
+ extern int posix_acl_create(struct inode *, umode_t *, struct posix_acl **,
+ 		struct posix_acl **);
++extern int posix_acl_update_mode(struct inode *, umode_t *, struct posix_acl **);
+ 
+ extern int simple_set_acl(struct inode *, struct posix_acl *, int);
+ extern int simple_acl_create(struct inode *, struct inode *);
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 6d204f3f9df8..3d3a365233f0 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1434,6 +1434,8 @@ static inline void tcp_check_send_head(struct sock *sk, struct sk_buff *skb_unli
+ {
+ 	if (sk->sk_send_head == skb_unlinked)
+ 		sk->sk_send_head = NULL;
++	if (tcp_sk(sk)->highest_sack == skb_unlinked)
++		tcp_sk(sk)->highest_sack = NULL;
+ }
+ 
+ static inline void tcp_init_send_head(struct sock *sk)
+diff --git a/kernel/cpuset.c b/kernel/cpuset.c
+index 388fc6f78c6f..71403502411b 100644
+--- a/kernel/cpuset.c
++++ b/kernel/cpuset.c
+@@ -323,8 +323,7 @@ static struct file_system_type cpuset_fs_type = {
+ /*
+  * Return in pmask the portion of a cpusets's cpus_allowed that
+  * are online.  If none are online, walk up the cpuset hierarchy
+- * until we find one that does have some online cpus.  The top
+- * cpuset always has some cpus online.
++ * until we find one that does have some online cpus.
+  *
+  * One way or another, we guarantee to return some non-empty subset
+  * of cpu_online_mask.
+@@ -333,8 +332,20 @@ static struct file_system_type cpuset_fs_type = {
+  */
+ static void guarantee_online_cpus(struct cpuset *cs, struct cpumask *pmask)
+ {
+-	while (!cpumask_intersects(cs->effective_cpus, cpu_online_mask))
++	while (!cpumask_intersects(cs->effective_cpus, cpu_online_mask)) {
+ 		cs = parent_cs(cs);
++		if (unlikely(!cs)) {
++			/*
++			 * The top cpuset doesn't have any online cpu as a
++			 * consequence of a race between cpuset_hotplug_work
++			 * and cpu hotplug notifier.  But we know the top
++			 * cpuset's effective_cpus is on its way to to be
++			 * identical to cpu_online_mask.
++			 */
++			cpumask_copy(pmask, cpu_online_mask);
++			return;
++		}
++	}
+ 	cpumask_and(pmask, cs->effective_cpus, cpu_online_mask);
+ }
+ 
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index 261ee21e62db..9650e7aee267 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -20,6 +20,7 @@
+ #include <linux/uio.h>
+ #include <linux/audit.h>
+ #include <linux/pid_namespace.h>
++#include <linux/user_namespace.h>
+ #include <linux/syscalls.h>
+ #include <linux/uaccess.h>
+ #include <linux/regset.h>
+@@ -207,12 +208,34 @@ static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
+ 	return ret;
+ }
+ 
+-static int ptrace_has_cap(struct user_namespace *ns, unsigned int mode)
++static bool ptrace_has_cap(const struct cred *tcred, unsigned int mode)
+ {
++	struct user_namespace *tns = tcred->user_ns;
++
++	/* When a root-owned process enters a user namespace created by a
++	 * malicious user, the user shouldn't be able to execute code under
++	 * uid 0 by attaching to the root-owned process via ptrace.
++	 * Therefore, similar to the capable_wrt_inode_uidgid() check,
++	 * verify that all the uids and gids of the target process are
++	 * mapped into a namespace below the current one in which the caller
++	 * is capable.
++	 * No fsuid/fsgid check because __ptrace_may_access doesn't do it
++	 * either.
++	 */
++	while (
++	    !kuid_has_mapping(tns, tcred->euid) ||
++	    !kuid_has_mapping(tns, tcred->suid) ||
++	    !kuid_has_mapping(tns, tcred->uid)  ||
++	    !kgid_has_mapping(tns, tcred->egid) ||
++	    !kgid_has_mapping(tns, tcred->sgid) ||
++	    !kgid_has_mapping(tns, tcred->gid)) {
++		tns = tns->parent;
++	}
++
+ 	if (mode & PTRACE_MODE_NOAUDIT)
+-		return has_ns_capability_noaudit(current, ns, CAP_SYS_PTRACE);
++		return has_ns_capability_noaudit(current, tns, CAP_SYS_PTRACE);
+ 	else
+-		return has_ns_capability(current, ns, CAP_SYS_PTRACE);
++		return has_ns_capability(current, tns, CAP_SYS_PTRACE);
+ }
+ 
+ /* Returns 0 on success, -errno on denial. */
+@@ -264,7 +287,7 @@ static int __ptrace_may_access(struct task_struct *task, unsigned int mode)
+ 	    gid_eq(caller_gid, tcred->sgid) &&
+ 	    gid_eq(caller_gid, tcred->gid))
+ 		goto ok;
+-	if (ptrace_has_cap(tcred->user_ns, mode))
++	if (ptrace_has_cap(tcred, mode))
+ 		goto ok;
+ 	rcu_read_unlock();
+ 	return -EPERM;
+@@ -275,7 +298,7 @@ ok:
+ 		dumpable = get_dumpable(task->mm);
+ 	rcu_read_lock();
+ 	if (dumpable != SUID_DUMP_USER &&
+-	    !ptrace_has_cap(__task_cred(task)->user_ns, mode)) {
++	    !ptrace_has_cap(__task_cred(task), mode)) {
+ 		rcu_read_unlock();
+ 		return -EPERM;
+ 	}
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 7d4900404c94..cebbff5f34fe 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -64,6 +64,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/kexec.h>
++#include <linux/mount.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/processor.h>
+@@ -1709,6 +1710,14 @@ static struct ctl_table fs_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+ 	},
++	{
++		.procname	= "mount-max",
++		.data		= &sysctl_mount_max,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one,
++	},
+ 	{ }
+ };
+ 
+diff --git a/mm/ksm.c b/mm/ksm.c
+index 7ee101eaacdf..22a2883eb822 100644
+--- a/mm/ksm.c
++++ b/mm/ksm.c
+@@ -283,7 +283,8 @@ static inline struct rmap_item *alloc_rmap_item(void)
+ {
+ 	struct rmap_item *rmap_item;
+ 
+-	rmap_item = kmem_cache_zalloc(rmap_item_cache, GFP_KERNEL);
++	rmap_item = kmem_cache_zalloc(rmap_item_cache, GFP_KERNEL |
++						__GFP_NORETRY | __GFP_NOWARN);
+ 	if (rmap_item)
+ 		ksm_rmap_items++;
+ 	return rmap_item;
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 46511ad90bc5..feaaf6ea1b86 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -548,7 +548,7 @@ static int shmem_setattr(struct dentry *dentry, struct iattr *attr)
+ 	struct shmem_inode_info *info = SHMEM_I(inode);
+ 	int error;
+ 
+-	error = inode_change_ok(inode, attr);
++	error = setattr_prepare(dentry, attr);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/net/bluetooth/rfcomm/sock.c b/net/bluetooth/rfcomm/sock.c
+index 825e8fb5114b..f9e9a8148a43 100644
+--- a/net/bluetooth/rfcomm/sock.c
++++ b/net/bluetooth/rfcomm/sock.c
+@@ -334,16 +334,19 @@ static int rfcomm_sock_create(struct net *net, struct socket *sock,
+ 
+ static int rfcomm_sock_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+ {
+-	struct sockaddr_rc *sa = (struct sockaddr_rc *) addr;
++	struct sockaddr_rc sa;
+ 	struct sock *sk = sock->sk;
+-	int chan = sa->rc_channel;
+-	int err = 0;
+-
+-	BT_DBG("sk %p %pMR", sk, &sa->rc_bdaddr);
++	int len, err = 0;
+ 
+ 	if (!addr || addr->sa_family != AF_BLUETOOTH)
+ 		return -EINVAL;
+ 
++	memset(&sa, 0, sizeof(sa));
++	len = min_t(unsigned int, sizeof(sa), addr_len);
++	memcpy(&sa, addr, len);
++
++	BT_DBG("sk %p %pMR", sk, &sa.rc_bdaddr);
++
+ 	lock_sock(sk);
+ 
+ 	if (sk->sk_state != BT_OPEN) {
+@@ -358,12 +361,13 @@ static int rfcomm_sock_bind(struct socket *sock, struct sockaddr *addr, int addr
+ 
+ 	write_lock(&rfcomm_sk_list.lock);
+ 
+-	if (chan && __rfcomm_get_listen_sock_by_addr(chan, &sa->rc_bdaddr)) {
++	if (sa.rc_channel &&
++	    __rfcomm_get_listen_sock_by_addr(sa.rc_channel, &sa.rc_bdaddr)) {
+ 		err = -EADDRINUSE;
+ 	} else {
+ 		/* Save source address */
+-		bacpy(&rfcomm_pi(sk)->src, &sa->rc_bdaddr);
+-		rfcomm_pi(sk)->channel = chan;
++		bacpy(&rfcomm_pi(sk)->src, &sa.rc_bdaddr);
++		rfcomm_pi(sk)->channel = sa.rc_channel;
+ 		sk->sk_state = BT_BOUND;
+ 	}
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 185a3398c651..56d820fc2707 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4060,6 +4060,7 @@ static enum gro_result dev_gro_receive(struct napi_struct *napi, struct sk_buff
+ 		NAPI_GRO_CB(skb)->flush = 0;
+ 		NAPI_GRO_CB(skb)->free = 0;
+ 		NAPI_GRO_CB(skb)->udp_mark = 0;
++		NAPI_GRO_CB(skb)->recursion_counter = 0;
+ 		NAPI_GRO_CB(skb)->gro_remcsum_start = 0;
+ 
+ 		/* Setup for GRO checksum validation */
+diff --git a/net/ethernet/eth.c b/net/ethernet/eth.c
+index f3bad41d725f..76f8389eacd2 100644
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -434,7 +434,7 @@ struct sk_buff **eth_gro_receive(struct sk_buff **head,
+ 
+ 	skb_gro_pull(skb, sizeof(*eh));
+ 	skb_gro_postpull_rcsum(skb, eh, sizeof(*eh));
+-	pp = ptype->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 0cc98b135b8f..2095cd6c31fd 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1377,7 +1377,7 @@ static struct sk_buff **inet_gro_receive(struct sk_buff **head,
+ 	skb_gro_pull(skb, sizeof(*iph));
+ 	skb_set_transport_header(skb, skb_gro_offset(skb));
+ 
+-	pp = ops->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/ipv4/fou.c b/net/ipv4/fou.c
+index 4b67937692c9..b22a75c0a3d9 100644
+--- a/net/ipv4/fou.c
++++ b/net/ipv4/fou.c
+@@ -188,7 +188,7 @@ static struct sk_buff **fou_gro_receive(struct sk_buff **head,
+ 	if (!ops || !ops->callbacks.gro_receive)
+ 		goto out_unlock;
+ 
+-	pp = ops->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+@@ -355,7 +355,7 @@ static struct sk_buff **gue_gro_receive(struct sk_buff **head,
+ 	if (WARN_ON(!ops || !ops->callbacks.gro_receive))
+ 		goto out_unlock;
+ 
+-	pp = ops->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/ipv4/gre_offload.c b/net/ipv4/gre_offload.c
+index 5a8ee3282550..53300b88d569 100644
+--- a/net/ipv4/gre_offload.c
++++ b/net/ipv4/gre_offload.c
+@@ -214,7 +214,7 @@ static struct sk_buff **gre_gro_receive(struct sk_buff **head,
+ 	/* Adjusted NAPI_GRO_CB(skb)->csum after skb_gro_pull()*/
+ 	skb_gro_postpull_rcsum(skb, greh, grehlen);
+ 
+-	pp = ptype->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ptype->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index f6ee0d561aab..3dac3d4aa26f 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -659,6 +659,10 @@ int ping_common_sendmsg(int family, struct msghdr *msg, size_t len,
+ 	if (len > 0xFFFF)
+ 		return -EMSGSIZE;
+ 
++	/* Must have at least a full ICMP header. */
++	if (len < icmph_len)
++		return -EINVAL;
++
+ 	/*
+ 	 *	Check the flags.
+ 	 */
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index f9386160cbee..2af7b7e1a0f6 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -339,8 +339,13 @@ unflush:
+ 	skb_gro_pull(skb, sizeof(struct udphdr)); /* pull encapsulating udp header */
+ 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
+ 	NAPI_GRO_CB(skb)->proto = uo_priv->offload->ipproto;
+-	pp = uo_priv->offload->callbacks.gro_receive(head, skb,
+-						     uo_priv->offload);
++
++	if (gro_recursion_inc_test(skb)) {
++		pp = NULL;
++	} else {
++		pp = uo_priv->offload->callbacks.gro_receive(head, skb,
++							     uo_priv->offload);
++	}
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/ipv6/ip6_offload.c b/net/ipv6/ip6_offload.c
+index 08b62047c67f..db0b8428d248 100644
+--- a/net/ipv6/ip6_offload.c
++++ b/net/ipv6/ip6_offload.c
+@@ -247,7 +247,7 @@ static struct sk_buff **ipv6_gro_receive(struct sk_buff **head,
+ 
+ 	skb_gro_postpull_rcsum(skb, iph, nlen);
+ 
+-	pp = ops->callbacks.gro_receive(head, skb);
++	pp = call_gro_receive(ops->callbacks.gro_receive, head, skb);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index a3654d929814..b9d1baaa8bdc 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -3344,19 +3344,25 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
+ 
+ 		if (optlen != sizeof(val))
+ 			return -EINVAL;
+-		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec)
+-			return -EBUSY;
+ 		if (copy_from_user(&val, optval, sizeof(val)))
+ 			return -EFAULT;
+ 		switch (val) {
+ 		case TPACKET_V1:
+ 		case TPACKET_V2:
+ 		case TPACKET_V3:
+-			po->tp_version = val;
+-			return 0;
++			break;
+ 		default:
+ 			return -EINVAL;
+ 		}
++		lock_sock(sk);
++		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
++			ret = -EBUSY;
++		} else {
++			po->tp_version = val;
++			ret = 0;
++		}
++		release_sock(sk);
++		return ret;
+ 	}
+ 	case PACKET_RESERVE:
+ 	{
+@@ -3819,6 +3825,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 	/* Added to avoid minimal code churn */
+ 	struct tpacket_req *req = &req_u->req;
+ 
++	lock_sock(sk);
+ 	/* Opening a Tx-ring is NOT supported in TPACKET_V3 */
+ 	if (!closing && tx_ring && (po->tp_version > TPACKET_V2)) {
+ 		WARN(1, "Tx-ring is not supported.\n");
+@@ -3900,7 +3907,6 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 			goto out;
+ 	}
+ 
+-	lock_sock(sk);
+ 
+ 	/* Detach socket from network */
+ 	spin_lock(&po->bind_lock);
+@@ -3949,11 +3955,11 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 		if (!tx_ring)
+ 			prb_shutdown_retire_blk_timer(po, tx_ring, rb_queue);
+ 	}
+-	release_sock(sk);
+ 
+ 	if (pg_vec)
+ 		free_pg_vec(pg_vec, order, req->tp_block_nr);
+ out:
++	release_sock(sk);
+ 	return err;
+ }
+ 
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 70e3dacbf84a..bf7d6a44c6f2 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -386,6 +386,10 @@ int tipc_enable_l2_media(struct net *net, struct tipc_bearer *b,
+ 	dev = dev_get_by_name(net, driver_name);
+ 	if (!dev)
+ 		return -ENODEV;
++	if (tipc_mtu_bad(dev, 0)) {
++		dev_put(dev);
++		return -EINVAL;
++	}
+ 
+ 	/* Associate TIPC bearer with L2 bearer */
+ 	rcu_assign_pointer(b->media_ptr, dev);
+@@ -524,14 +528,17 @@ static int tipc_l2_device_event(struct notifier_block *nb, unsigned long evt,
+ 	if (!b_ptr)
+ 		return NOTIFY_DONE;
+ 
+-	b_ptr->mtu = dev->mtu;
+-
+ 	switch (evt) {
+ 	case NETDEV_CHANGE:
+ 		if (netif_carrier_ok(dev))
+ 			break;
+ 	case NETDEV_DOWN:
+ 	case NETDEV_CHANGEMTU:
++		if (tipc_mtu_bad(dev, 0)) {
++			bearer_disable(net, b_ptr, false);
++			break;
++		}
++		b_ptr->mtu = dev->mtu;
+ 		tipc_reset_bearer(net, b_ptr);
+ 		break;
+ 	case NETDEV_CHANGEADDR:
+diff --git a/net/tipc/bearer.h b/net/tipc/bearer.h
+index 5cad243ee8fc..b7302b012624 100644
+--- a/net/tipc/bearer.h
++++ b/net/tipc/bearer.h
+@@ -38,6 +38,7 @@
+ #define _TIPC_BEARER_H
+ 
+ #include "netlink.h"
++#include "msg.h"
+ #include <net/genetlink.h>
+ 
+ #define MAX_BEARERS	2
+@@ -61,6 +62,9 @@
+ #define TIPC_MEDIA_TYPE_IB	2
+ #define TIPC_MEDIA_TYPE_UDP	3
+ 
++/* minimum bearer MTU */
++#define TIPC_MIN_BEARER_MTU	(MAX_H_SIZE + INT_H_SIZE)
++
+ /**
+  * struct tipc_node_map - set of node identifiers
+  * @count: # of nodes in set
+@@ -218,4 +222,13 @@ void tipc_bearer_stop(struct net *net);
+ void tipc_bearer_send(struct net *net, u32 bearer_id, struct sk_buff *buf,
+ 		      struct tipc_media_addr *dest);
+ 
++/* check if device MTU is too low for tipc headers */
++static inline bool tipc_mtu_bad(struct net_device *dev, unsigned int reserve)
++{
++	if (dev->mtu >= TIPC_MIN_BEARER_MTU + reserve)
++		return false;
++	netdev_warn(dev, "MTU too low for tipc bearer\n");
++	return true;
++}
++
+ #endif	/* _TIPC_BEARER_H */
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index f8dfee5072c0..e14f23542a1a 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -374,6 +374,11 @@ static int tipc_udp_enable(struct net *net, struct tipc_bearer *b,
+ 		udp_conf.local_ip.s_addr = htonl(INADDR_ANY);
+ 		udp_conf.use_udp_checksums = false;
+ 		ub->ifindex = dev->ifindex;
++		if (tipc_mtu_bad(dev, sizeof(struct iphdr) +
++				      sizeof(struct udphdr))) {
++			err = -EINVAL;
++			goto err;
++		}
+ 		b->mtu = dev->mtu - sizeof(struct iphdr)
+ 			- sizeof(struct udphdr);
+ #if IS_ENABLED(CONFIG_IPV6)
+diff --git a/scripts/gcc-x86_64-has-stack-protector.sh b/scripts/gcc-x86_64-has-stack-protector.sh
+index 973e8c141567..17867e723a51 100755
+--- a/scripts/gcc-x86_64-has-stack-protector.sh
++++ b/scripts/gcc-x86_64-has-stack-protector.sh
+@@ -1,6 +1,6 @@
+ #!/bin/sh
+ 
+-echo "int foo(void) { char X[200]; return 3; }" | $* -S -x c -c -O0 -mcmodel=kernel -fstack-protector - -o - 2> /dev/null | grep -q "%gs"
++echo "int foo(void) { char X[200]; return 3; }" | $* -S -x c -c -O0 -mcmodel=kernel -fno-PIE -fstack-protector - -o - 2> /dev/null | grep -q "%gs"
+ if [ "$?" -eq "0" ] ; then
+ 	echo y
+ else
