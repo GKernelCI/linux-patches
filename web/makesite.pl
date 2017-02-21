@@ -263,7 +263,8 @@ sub make_releases_index {
 	opendir(DIR, $webscript_path.'/generated');
 	@infopages = grep { /-info\.htm$/ } readdir DIR;
 	foreach $info (@infopages) {
-		$info =~ m/^(\d\.\d\.\d+)-\d+-info\.htm$/;
+		#$info =~ m/^(\d\.\d\.\d+)-\d+-info\.htm$/;
+		$info =~ m/^(\d\.\d+)-\d+-info\.htm$/;
 		$kernels{$1} = 1;
 	}
 
@@ -277,6 +278,7 @@ sub make_releases_index {
 	print INDEX '<h1>genpatches Releases</h1>';
 
 	foreach $kernel (sort keys %kernels) {
+		print("kernel: $kernel\n");
         if ($kernel == "") {
             next;
         }
