@@ -1,0 +1,1808 @@
+diff --git a/Makefile b/Makefile
+index c8b8e902d5a4..af101b556ba0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 15
+-SUBLEVEL = 0
++SUBLEVEL = 1
+ EXTRAVERSION =
+ NAME = Fearless Coyote
+ 
+diff --git a/arch/x86/crypto/aesni-intel_asm.S b/arch/x86/crypto/aesni-intel_asm.S
+index 3d09e3aca18d..12e8484a8ee7 100644
+--- a/arch/x86/crypto/aesni-intel_asm.S
++++ b/arch/x86/crypto/aesni-intel_asm.S
+@@ -90,30 +90,6 @@ SHIFT_MASK: .octa 0x0f0e0d0c0b0a09080706050403020100
+ ALL_F:      .octa 0xffffffffffffffffffffffffffffffff
+             .octa 0x00000000000000000000000000000000
+ 
+-.section .rodata
+-.align 16
+-.type aad_shift_arr, @object
+-.size aad_shift_arr, 272
+-aad_shift_arr:
+-        .octa     0xffffffffffffffffffffffffffffffff
+-        .octa     0xffffffffffffffffffffffffffffff0C
+-        .octa     0xffffffffffffffffffffffffffff0D0C
+-        .octa     0xffffffffffffffffffffffffff0E0D0C
+-        .octa     0xffffffffffffffffffffffff0F0E0D0C
+-        .octa     0xffffffffffffffffffffff0C0B0A0908
+-        .octa     0xffffffffffffffffffff0D0C0B0A0908
+-        .octa     0xffffffffffffffffff0E0D0C0B0A0908
+-        .octa     0xffffffffffffffff0F0E0D0C0B0A0908
+-        .octa     0xffffffffffffff0C0B0A090807060504
+-        .octa     0xffffffffffff0D0C0B0A090807060504
+-        .octa     0xffffffffff0E0D0C0B0A090807060504
+-        .octa     0xffffffff0F0E0D0C0B0A090807060504
+-        .octa     0xffffff0C0B0A09080706050403020100
+-        .octa     0xffff0D0C0B0A09080706050403020100
+-        .octa     0xff0E0D0C0B0A09080706050403020100
+-        .octa     0x0F0E0D0C0B0A09080706050403020100
+-
+-
+ .text
+ 
+ 
+@@ -257,6 +233,37 @@ aad_shift_arr:
+ 	pxor      \TMP1, \GH            # result is in TMP1
+ .endm
+ 
++# Reads DLEN bytes starting at DPTR and stores in XMMDst
++# where 0 < DLEN < 16
++# Clobbers %rax, DLEN and XMM1
++.macro READ_PARTIAL_BLOCK DPTR DLEN XMM1 XMMDst
++        cmp $8, \DLEN
++        jl _read_lt8_\@
++        mov (\DPTR), %rax
++        MOVQ_R64_XMM %rax, \XMMDst
++        sub $8, \DLEN
++        jz _done_read_partial_block_\@
++	xor %eax, %eax
++_read_next_byte_\@:
++        shl $8, %rax
++        mov 7(\DPTR, \DLEN, 1), %al
++        dec \DLEN
++        jnz _read_next_byte_\@
++        MOVQ_R64_XMM %rax, \XMM1
++	pslldq $8, \XMM1
++        por \XMM1, \XMMDst
++	jmp _done_read_partial_block_\@
++_read_lt8_\@:
++	xor %eax, %eax
++_read_next_byte_lt8_\@:
++        shl $8, %rax
++        mov -1(\DPTR, \DLEN, 1), %al
++        dec \DLEN
++        jnz _read_next_byte_lt8_\@
++        MOVQ_R64_XMM %rax, \XMMDst
++_done_read_partial_block_\@:
++.endm
++
+ /*
+ * if a = number of total plaintext bytes
+ * b = floor(a/16)
+@@ -273,62 +280,30 @@ aad_shift_arr:
+ XMM2 XMM3 XMM4 XMMDst TMP6 TMP7 i i_seq operation
+         MOVADQ     SHUF_MASK(%rip), %xmm14
+ 	mov	   arg7, %r10           # %r10 = AAD
+-	mov	   arg8, %r12           # %r12 = aadLen
+-	mov	   %r12, %r11
++	mov	   arg8, %r11           # %r11 = aadLen
+ 	pxor	   %xmm\i, %xmm\i
+ 	pxor       \XMM2, \XMM2
+ 
+ 	cmp	   $16, %r11
+-	jl	   _get_AAD_rest8\num_initial_blocks\operation
++	jl	   _get_AAD_rest\num_initial_blocks\operation
+ _get_AAD_blocks\num_initial_blocks\operation:
+ 	movdqu	   (%r10), %xmm\i
+ 	PSHUFB_XMM %xmm14, %xmm\i # byte-reflect the AAD data
+ 	pxor	   %xmm\i, \XMM2
+ 	GHASH_MUL  \XMM2, \TMP3, \TMP1, \TMP2, \TMP4, \TMP5, \XMM1
+ 	add	   $16, %r10
+-	sub	   $16, %r12
+ 	sub	   $16, %r11
+ 	cmp	   $16, %r11
+ 	jge	   _get_AAD_blocks\num_initial_blocks\operation
+ 
+ 	movdqu	   \XMM2, %xmm\i
++
++	/* read the last <16B of AAD */
++_get_AAD_rest\num_initial_blocks\operation:
+ 	cmp	   $0, %r11
+ 	je	   _get_AAD_done\num_initial_blocks\operation
+ 
+-	pxor	   %xmm\i,%xmm\i
+-
+-	/* read the last <16B of AAD. since we have at least 4B of
+-	data right after the AAD (the ICV, and maybe some CT), we can
+-	read 4B/8B blocks safely, and then get rid of the extra stuff */
+-_get_AAD_rest8\num_initial_blocks\operation:
+-	cmp	   $4, %r11
+-	jle	   _get_AAD_rest4\num_initial_blocks\operation
+-	movq	   (%r10), \TMP1
+-	add	   $8, %r10
+-	sub	   $8, %r11
+-	pslldq	   $8, \TMP1
+-	psrldq	   $8, %xmm\i
+-	pxor	   \TMP1, %xmm\i
+-	jmp	   _get_AAD_rest8\num_initial_blocks\operation
+-_get_AAD_rest4\num_initial_blocks\operation:
+-	cmp	   $0, %r11
+-	jle	   _get_AAD_rest0\num_initial_blocks\operation
+-	mov	   (%r10), %eax
+-	movq	   %rax, \TMP1
+-	add	   $4, %r10
+-	sub	   $4, %r10
+-	pslldq	   $12, \TMP1
+-	psrldq	   $4, %xmm\i
+-	pxor	   \TMP1, %xmm\i
+-_get_AAD_rest0\num_initial_blocks\operation:
+-	/* finalize: shift out the extra bytes we read, and align
+-	left. since pslldq can only shift by an immediate, we use
+-	vpshufb and an array of shuffle masks */
+-	movq	   %r12, %r11
+-	salq	   $4, %r11
+-	movdqu	   aad_shift_arr(%r11), \TMP1
+-	PSHUFB_XMM \TMP1, %xmm\i
+-_get_AAD_rest_final\num_initial_blocks\operation:
++	READ_PARTIAL_BLOCK %r10, %r11, \TMP1, %xmm\i
+ 	PSHUFB_XMM   %xmm14, %xmm\i # byte-reflect the AAD data
+ 	pxor	   \XMM2, %xmm\i
+ 	GHASH_MUL  %xmm\i, \TMP3, \TMP1, \TMP2, \TMP4, \TMP5, \XMM1
+@@ -532,62 +507,30 @@ _initial_blocks_done\num_initial_blocks\operation:
+ XMM2 XMM3 XMM4 XMMDst TMP6 TMP7 i i_seq operation
+         MOVADQ     SHUF_MASK(%rip), %xmm14
+ 	mov	   arg7, %r10           # %r10 = AAD
+-	mov	   arg8, %r12           # %r12 = aadLen
+-	mov	   %r12, %r11
++	mov	   arg8, %r11           # %r11 = aadLen
+ 	pxor	   %xmm\i, %xmm\i
+ 	pxor	   \XMM2, \XMM2
+ 
+ 	cmp	   $16, %r11
+-	jl	   _get_AAD_rest8\num_initial_blocks\operation
++	jl	   _get_AAD_rest\num_initial_blocks\operation
+ _get_AAD_blocks\num_initial_blocks\operation:
+ 	movdqu	   (%r10), %xmm\i
+ 	PSHUFB_XMM   %xmm14, %xmm\i # byte-reflect the AAD data
+ 	pxor	   %xmm\i, \XMM2
+ 	GHASH_MUL  \XMM2, \TMP3, \TMP1, \TMP2, \TMP4, \TMP5, \XMM1
+ 	add	   $16, %r10
+-	sub	   $16, %r12
+ 	sub	   $16, %r11
+ 	cmp	   $16, %r11
+ 	jge	   _get_AAD_blocks\num_initial_blocks\operation
+ 
+ 	movdqu	   \XMM2, %xmm\i
++
++	/* read the last <16B of AAD */
++_get_AAD_rest\num_initial_blocks\operation:
+ 	cmp	   $0, %r11
+ 	je	   _get_AAD_done\num_initial_blocks\operation
+ 
+-	pxor	   %xmm\i,%xmm\i
+-
+-	/* read the last <16B of AAD. since we have at least 4B of
+-	data right after the AAD (the ICV, and maybe some PT), we can
+-	read 4B/8B blocks safely, and then get rid of the extra stuff */
+-_get_AAD_rest8\num_initial_blocks\operation:
+-	cmp	   $4, %r11
+-	jle	   _get_AAD_rest4\num_initial_blocks\operation
+-	movq	   (%r10), \TMP1
+-	add	   $8, %r10
+-	sub	   $8, %r11
+-	pslldq	   $8, \TMP1
+-	psrldq	   $8, %xmm\i
+-	pxor	   \TMP1, %xmm\i
+-	jmp	   _get_AAD_rest8\num_initial_blocks\operation
+-_get_AAD_rest4\num_initial_blocks\operation:
+-	cmp	   $0, %r11
+-	jle	   _get_AAD_rest0\num_initial_blocks\operation
+-	mov	   (%r10), %eax
+-	movq	   %rax, \TMP1
+-	add	   $4, %r10
+-	sub	   $4, %r10
+-	pslldq	   $12, \TMP1
+-	psrldq	   $4, %xmm\i
+-	pxor	   \TMP1, %xmm\i
+-_get_AAD_rest0\num_initial_blocks\operation:
+-	/* finalize: shift out the extra bytes we read, and align
+-	left. since pslldq can only shift by an immediate, we use
+-	vpshufb and an array of shuffle masks */
+-	movq	   %r12, %r11
+-	salq	   $4, %r11
+-	movdqu	   aad_shift_arr(%r11), \TMP1
+-	PSHUFB_XMM \TMP1, %xmm\i
+-_get_AAD_rest_final\num_initial_blocks\operation:
++	READ_PARTIAL_BLOCK %r10, %r11, \TMP1, %xmm\i
+ 	PSHUFB_XMM   %xmm14, %xmm\i # byte-reflect the AAD data
+ 	pxor	   \XMM2, %xmm\i
+ 	GHASH_MUL  %xmm\i, \TMP3, \TMP1, \TMP2, \TMP4, \TMP5, \XMM1
+@@ -1386,14 +1329,6 @@ _esb_loop_\@:
+ *
+ *                        AAD Format with 64-bit Extended Sequence Number
+ *
+-* aadLen:
+-*       from the definition of the spec, aadLen can only be 8 or 12 bytes.
+-*       The code supports 16 too but for other sizes, the code will fail.
+-*
+-* TLen:
+-*       from the definition of the spec, TLen can only be 8, 12 or 16 bytes.
+-*       For other sizes, the code will fail.
+-*
+ * poly = x^128 + x^127 + x^126 + x^121 + 1
+ *
+ *****************************************************************************/
+@@ -1487,19 +1422,16 @@ _zero_cipher_left_decrypt:
+ 	PSHUFB_XMM %xmm10, %xmm0
+ 
+ 	ENCRYPT_SINGLE_BLOCK  %xmm0, %xmm1    # E(K, Yn)
+-	sub $16, %r11
+-	add %r13, %r11
+-	movdqu (%arg3,%r11,1), %xmm1   # receive the last <16 byte block
+-	lea SHIFT_MASK+16(%rip), %r12
+-	sub %r13, %r12
+-# adjust the shuffle mask pointer to be able to shift 16-%r13 bytes
+-# (%r13 is the number of bytes in plaintext mod 16)
+-	movdqu (%r12), %xmm2           # get the appropriate shuffle mask
+-	PSHUFB_XMM %xmm2, %xmm1            # right shift 16-%r13 butes
+ 
++	lea (%arg3,%r11,1), %r10
++	mov %r13, %r12
++	READ_PARTIAL_BLOCK %r10 %r12 %xmm2 %xmm1
++
++	lea ALL_F+16(%rip), %r12
++	sub %r13, %r12
+ 	movdqa  %xmm1, %xmm2
+ 	pxor %xmm1, %xmm0            # Ciphertext XOR E(K, Yn)
+-	movdqu ALL_F-SHIFT_MASK(%r12), %xmm1
++	movdqu (%r12), %xmm1
+ 	# get the appropriate mask to mask out top 16-%r13 bytes of %xmm0
+ 	pand %xmm1, %xmm0            # mask out top 16-%r13 bytes of %xmm0
+ 	pand    %xmm1, %xmm2
+@@ -1508,9 +1440,6 @@ _zero_cipher_left_decrypt:
+ 
+ 	pxor %xmm2, %xmm8
+ 	GHASH_MUL %xmm8, %xmm13, %xmm9, %xmm10, %xmm11, %xmm5, %xmm6
+-	          # GHASH computation for the last <16 byte block
+-	sub %r13, %r11
+-	add $16, %r11
+ 
+         # output %r13 bytes
+ 	MOVQ_R64_XMM	%xmm0, %rax
+@@ -1664,14 +1593,6 @@ ENDPROC(aesni_gcm_dec)
+ *
+ *                         AAD Format with 64-bit Extended Sequence Number
+ *
+-* aadLen:
+-*       from the definition of the spec, aadLen can only be 8 or 12 bytes.
+-*       The code supports 16 too but for other sizes, the code will fail.
+-*
+-* TLen:
+-*       from the definition of the spec, TLen can only be 8, 12 or 16 bytes.
+-*       For other sizes, the code will fail.
+-*
+ * poly = x^128 + x^127 + x^126 + x^121 + 1
+ ***************************************************************************/
+ ENTRY(aesni_gcm_enc)
+@@ -1764,19 +1685,16 @@ _zero_cipher_left_encrypt:
+         movdqa SHUF_MASK(%rip), %xmm10
+ 	PSHUFB_XMM %xmm10, %xmm0
+ 
+-
+ 	ENCRYPT_SINGLE_BLOCK	%xmm0, %xmm1        # Encrypt(K, Yn)
+-	sub $16, %r11
+-	add %r13, %r11
+-	movdqu (%arg3,%r11,1), %xmm1     # receive the last <16 byte blocks
+-	lea SHIFT_MASK+16(%rip), %r12
++
++	lea (%arg3,%r11,1), %r10
++	mov %r13, %r12
++	READ_PARTIAL_BLOCK %r10 %r12 %xmm2 %xmm1
++
++	lea ALL_F+16(%rip), %r12
+ 	sub %r13, %r12
+-	# adjust the shuffle mask pointer to be able to shift 16-r13 bytes
+-	# (%r13 is the number of bytes in plaintext mod 16)
+-	movdqu	(%r12), %xmm2           # get the appropriate shuffle mask
+-	PSHUFB_XMM	%xmm2, %xmm1            # shift right 16-r13 byte
+ 	pxor	%xmm1, %xmm0            # Plaintext XOR Encrypt(K, Yn)
+-	movdqu	ALL_F-SHIFT_MASK(%r12), %xmm1
++	movdqu	(%r12), %xmm1
+ 	# get the appropriate mask to mask out top 16-r13 bytes of xmm0
+ 	pand	%xmm1, %xmm0            # mask out top 16-r13 bytes of xmm0
+         movdqa SHUF_MASK(%rip), %xmm10
+@@ -1785,9 +1703,6 @@ _zero_cipher_left_encrypt:
+ 	pxor	%xmm0, %xmm8
+ 	GHASH_MUL %xmm8, %xmm13, %xmm9, %xmm10, %xmm11, %xmm5, %xmm6
+ 	# GHASH computation for the last <16 byte block
+-	sub	%r13, %r11
+-	add	$16, %r11
+-
+ 	movdqa SHUF_MASK(%rip), %xmm10
+ 	PSHUFB_XMM %xmm10, %xmm0
+ 
+diff --git a/arch/x86/crypto/aesni-intel_glue.c b/arch/x86/crypto/aesni-intel_glue.c
+index 3bf3dcf29825..34cf1c1f8c98 100644
+--- a/arch/x86/crypto/aesni-intel_glue.c
++++ b/arch/x86/crypto/aesni-intel_glue.c
+@@ -690,8 +690,8 @@ static int common_rfc4106_set_key(struct crypto_aead *aead, const u8 *key,
+ 	       rfc4106_set_hash_subkey(ctx->hash_subkey, key, key_len);
+ }
+ 
+-static int rfc4106_set_key(struct crypto_aead *parent, const u8 *key,
+-			   unsigned int key_len)
++static int gcmaes_wrapper_set_key(struct crypto_aead *parent, const u8 *key,
++				  unsigned int key_len)
+ {
+ 	struct cryptd_aead **ctx = crypto_aead_ctx(parent);
+ 	struct cryptd_aead *cryptd_tfm = *ctx;
+@@ -716,8 +716,8 @@ static int common_rfc4106_set_authsize(struct crypto_aead *aead,
+ 
+ /* This is the Integrity Check Value (aka the authentication tag length and can
+  * be 8, 12 or 16 bytes long. */
+-static int rfc4106_set_authsize(struct crypto_aead *parent,
+-				unsigned int authsize)
++static int gcmaes_wrapper_set_authsize(struct crypto_aead *parent,
++				       unsigned int authsize)
+ {
+ 	struct cryptd_aead **ctx = crypto_aead_ctx(parent);
+ 	struct cryptd_aead *cryptd_tfm = *ctx;
+@@ -824,7 +824,7 @@ static int gcmaes_decrypt(struct aead_request *req, unsigned int assoclen,
+ 	if (sg_is_last(req->src) &&
+ 	    (!PageHighMem(sg_page(req->src)) ||
+ 	    req->src->offset + req->src->length <= PAGE_SIZE) &&
+-	    sg_is_last(req->dst) &&
++	    sg_is_last(req->dst) && req->dst->length &&
+ 	    (!PageHighMem(sg_page(req->dst)) ||
+ 	    req->dst->offset + req->dst->length <= PAGE_SIZE)) {
+ 		one_entry_in_sg = 1;
+@@ -929,7 +929,7 @@ static int helper_rfc4106_decrypt(struct aead_request *req)
+ 			      aes_ctx);
+ }
+ 
+-static int rfc4106_encrypt(struct aead_request *req)
++static int gcmaes_wrapper_encrypt(struct aead_request *req)
+ {
+ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+ 	struct cryptd_aead **ctx = crypto_aead_ctx(tfm);
+@@ -945,7 +945,7 @@ static int rfc4106_encrypt(struct aead_request *req)
+ 	return crypto_aead_encrypt(req);
+ }
+ 
+-static int rfc4106_decrypt(struct aead_request *req)
++static int gcmaes_wrapper_decrypt(struct aead_request *req)
+ {
+ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+ 	struct cryptd_aead **ctx = crypto_aead_ctx(tfm);
+@@ -1117,7 +1117,7 @@ static int generic_gcmaes_decrypt(struct aead_request *req)
+ {
+ 	__be32 counter = cpu_to_be32(1);
+ 	struct crypto_aead *tfm = crypto_aead_reqtfm(req);
+-	struct aesni_rfc4106_gcm_ctx *ctx = aesni_rfc4106_gcm_ctx_get(tfm);
++	struct generic_gcmaes_ctx *ctx = generic_gcmaes_ctx_get(tfm);
+ 	void *aes_ctx = &(ctx->aes_key_expanded);
+ 	u8 iv[16] __attribute__ ((__aligned__(AESNI_ALIGN)));
+ 
+@@ -1128,6 +1128,30 @@ static int generic_gcmaes_decrypt(struct aead_request *req)
+ 			      aes_ctx);
+ }
+ 
++static int generic_gcmaes_init(struct crypto_aead *aead)
++{
++	struct cryptd_aead *cryptd_tfm;
++	struct cryptd_aead **ctx = crypto_aead_ctx(aead);
++
++	cryptd_tfm = cryptd_alloc_aead("__driver-generic-gcm-aes-aesni",
++				       CRYPTO_ALG_INTERNAL,
++				       CRYPTO_ALG_INTERNAL);
++	if (IS_ERR(cryptd_tfm))
++		return PTR_ERR(cryptd_tfm);
++
++	*ctx = cryptd_tfm;
++	crypto_aead_set_reqsize(aead, crypto_aead_reqsize(&cryptd_tfm->base));
++
++	return 0;
++}
++
++static void generic_gcmaes_exit(struct crypto_aead *aead)
++{
++	struct cryptd_aead **ctx = crypto_aead_ctx(aead);
++
++	cryptd_free_aead(*ctx);
++}
++
+ static struct aead_alg aesni_aead_algs[] = { {
+ 	.setkey			= common_rfc4106_set_key,
+ 	.setauthsize		= common_rfc4106_set_authsize,
+@@ -1147,10 +1171,10 @@ static struct aead_alg aesni_aead_algs[] = { {
+ }, {
+ 	.init			= rfc4106_init,
+ 	.exit			= rfc4106_exit,
+-	.setkey			= rfc4106_set_key,
+-	.setauthsize		= rfc4106_set_authsize,
+-	.encrypt		= rfc4106_encrypt,
+-	.decrypt		= rfc4106_decrypt,
++	.setkey			= gcmaes_wrapper_set_key,
++	.setauthsize		= gcmaes_wrapper_set_authsize,
++	.encrypt		= gcmaes_wrapper_encrypt,
++	.decrypt		= gcmaes_wrapper_decrypt,
+ 	.ivsize			= GCM_RFC4106_IV_SIZE,
+ 	.maxauthsize		= 16,
+ 	.base = {
+@@ -1169,14 +1193,32 @@ static struct aead_alg aesni_aead_algs[] = { {
+ 	.decrypt		= generic_gcmaes_decrypt,
+ 	.ivsize			= GCM_AES_IV_SIZE,
+ 	.maxauthsize		= 16,
++	.base = {
++		.cra_name		= "__generic-gcm-aes-aesni",
++		.cra_driver_name	= "__driver-generic-gcm-aes-aesni",
++		.cra_priority		= 0,
++		.cra_flags		= CRYPTO_ALG_INTERNAL,
++		.cra_blocksize		= 1,
++		.cra_ctxsize		= sizeof(struct generic_gcmaes_ctx),
++		.cra_alignmask		= AESNI_ALIGN - 1,
++		.cra_module		= THIS_MODULE,
++	},
++}, {
++	.init			= generic_gcmaes_init,
++	.exit			= generic_gcmaes_exit,
++	.setkey			= gcmaes_wrapper_set_key,
++	.setauthsize		= gcmaes_wrapper_set_authsize,
++	.encrypt		= gcmaes_wrapper_encrypt,
++	.decrypt		= gcmaes_wrapper_decrypt,
++	.ivsize			= GCM_AES_IV_SIZE,
++	.maxauthsize		= 16,
+ 	.base = {
+ 		.cra_name		= "gcm(aes)",
+ 		.cra_driver_name	= "generic-gcm-aesni",
+ 		.cra_priority		= 400,
+ 		.cra_flags		= CRYPTO_ALG_ASYNC,
+ 		.cra_blocksize		= 1,
+-		.cra_ctxsize		= sizeof(struct generic_gcmaes_ctx),
+-		.cra_alignmask		= AESNI_ALIGN - 1,
++		.cra_ctxsize		= sizeof(struct cryptd_aead *),
+ 		.cra_module		= THIS_MODULE,
+ 	},
+ } };
+diff --git a/crypto/Kconfig b/crypto/Kconfig
+index f7911963bb79..9327fbfccf5a 100644
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -130,7 +130,7 @@ config CRYPTO_DH
+ 
+ config CRYPTO_ECDH
+ 	tristate "ECDH algorithm"
+-	select CRYTPO_KPP
++	select CRYPTO_KPP
+ 	select CRYPTO_RNG_DEFAULT
+ 	help
+ 	  Generic implementation of the ECDH algorithm
+diff --git a/crypto/af_alg.c b/crypto/af_alg.c
+index 35d4dcea381f..5231f421ad00 100644
+--- a/crypto/af_alg.c
++++ b/crypto/af_alg.c
+@@ -150,7 +150,7 @@ EXPORT_SYMBOL_GPL(af_alg_release_parent);
+ 
+ static int alg_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ {
+-	const u32 forbidden = CRYPTO_ALG_INTERNAL;
++	const u32 allowed = CRYPTO_ALG_KERN_DRIVER_ONLY;
+ 	struct sock *sk = sock->sk;
+ 	struct alg_sock *ask = alg_sk(sk);
+ 	struct sockaddr_alg *sa = (void *)uaddr;
+@@ -158,6 +158,10 @@ static int alg_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	void *private;
+ 	int err;
+ 
++	/* If caller uses non-allowed flag, return error. */
++	if ((sa->salg_feat & ~allowed) || (sa->salg_mask & ~allowed))
++		return -EINVAL;
++
+ 	if (sock->state == SS_CONNECTED)
+ 		return -EINVAL;
+ 
+@@ -176,9 +180,7 @@ static int alg_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
+ 	if (IS_ERR(type))
+ 		return PTR_ERR(type);
+ 
+-	private = type->bind(sa->salg_name,
+-			     sa->salg_feat & ~forbidden,
+-			     sa->salg_mask & ~forbidden);
++	private = type->bind(sa->salg_name, sa->salg_feat, sa->salg_mask);
+ 	if (IS_ERR(private)) {
+ 		module_put(type->owner);
+ 		return PTR_ERR(private);
+diff --git a/crypto/sha3_generic.c b/crypto/sha3_generic.c
+index 7e8ed96236ce..a68be626017c 100644
+--- a/crypto/sha3_generic.c
++++ b/crypto/sha3_generic.c
+@@ -18,6 +18,7 @@
+ #include <linux/types.h>
+ #include <crypto/sha3.h>
+ #include <asm/byteorder.h>
++#include <asm/unaligned.h>
+ 
+ #define KECCAK_ROUNDS 24
+ 
+@@ -149,7 +150,7 @@ static int sha3_update(struct shash_desc *desc, const u8 *data,
+ 			unsigned int i;
+ 
+ 			for (i = 0; i < sctx->rsizw; i++)
+-				sctx->st[i] ^= ((u64 *) src)[i];
++				sctx->st[i] ^= get_unaligned_le64(src + 8 * i);
+ 			keccakf(sctx->st);
+ 
+ 			done += sctx->rsiz;
+@@ -174,7 +175,7 @@ static int sha3_final(struct shash_desc *desc, u8 *out)
+ 	sctx->buf[sctx->rsiz - 1] |= 0x80;
+ 
+ 	for (i = 0; i < sctx->rsizw; i++)
+-		sctx->st[i] ^= ((u64 *) sctx->buf)[i];
++		sctx->st[i] ^= get_unaligned_le64(sctx->buf + 8 * i);
+ 
+ 	keccakf(sctx->st);
+ 
+diff --git a/drivers/android/binder.c b/drivers/android/binder.c
+index a7ecfde66b7b..ec0917fb7cca 100644
+--- a/drivers/android/binder.c
++++ b/drivers/android/binder.c
+@@ -4302,6 +4302,18 @@ static int binder_thread_release(struct binder_proc *proc,
+ 		if (t)
+ 			spin_lock(&t->lock);
+ 	}
++
++	/*
++	 * If this thread used poll, make sure we remove the waitqueue
++	 * from any epoll data structures holding it with POLLFREE.
++	 * waitqueue_active() is safe to use here because we're holding
++	 * the inner lock.
++	 */
++	if ((thread->looper & BINDER_LOOPER_STATE_POLL) &&
++	    waitqueue_active(&thread->wait)) {
++		wake_up_poll(&thread->wait, POLLHUP | POLLFREE);
++	}
++
+ 	binder_inner_proc_unlock(thread->proc);
+ 
+ 	if (send_reply)
+diff --git a/drivers/android/binder_alloc.c b/drivers/android/binder_alloc.c
+index 6f6f745605af..bef8c65af8fc 100644
+--- a/drivers/android/binder_alloc.c
++++ b/drivers/android/binder_alloc.c
+@@ -666,7 +666,7 @@ int binder_alloc_mmap_handler(struct binder_alloc *alloc,
+ 		goto err_already_mapped;
+ 	}
+ 
+-	area = get_vm_area(vma->vm_end - vma->vm_start, VM_IOREMAP);
++	area = get_vm_area(vma->vm_end - vma->vm_start, VM_ALLOC);
+ 	if (area == NULL) {
+ 		ret = -ENOMEM;
+ 		failure_string = "get_vm_area";
+diff --git a/drivers/bluetooth/hci_serdev.c b/drivers/bluetooth/hci_serdev.c
+index 71664b22ec9d..e0e6461b9200 100644
+--- a/drivers/bluetooth/hci_serdev.c
++++ b/drivers/bluetooth/hci_serdev.c
+@@ -303,6 +303,7 @@ int hci_uart_register_device(struct hci_uart *hu,
+ 	hci_set_drvdata(hdev, hu);
+ 
+ 	INIT_WORK(&hu->write_work, hci_uart_write_work);
++	percpu_init_rwsem(&hu->proto_lock);
+ 
+ 	/* Only when vendor specific setup callback is provided, consider
+ 	 * the manufacturer information valid. This avoids filling in the
+diff --git a/drivers/crypto/inside-secure/safexcel_hash.c b/drivers/crypto/inside-secure/safexcel_hash.c
+index 0c5a5820b06e..da9d040bccc2 100644
+--- a/drivers/crypto/inside-secure/safexcel_hash.c
++++ b/drivers/crypto/inside-secure/safexcel_hash.c
+@@ -34,6 +34,8 @@ struct safexcel_ahash_req {
+ 	bool hmac;
+ 	bool needs_inv;
+ 
++	int nents;
++
+ 	u8 state_sz;    /* expected sate size, only set once */
+ 	u32 state[SHA256_DIGEST_SIZE / sizeof(u32)] __aligned(sizeof(u32));
+ 
+@@ -152,8 +154,10 @@ static int safexcel_handle_req_result(struct safexcel_crypto_priv *priv, int rin
+ 		memcpy(areq->result, sreq->state,
+ 		       crypto_ahash_digestsize(ahash));
+ 
+-	dma_unmap_sg(priv->dev, areq->src,
+-		     sg_nents_for_len(areq->src, areq->nbytes), DMA_TO_DEVICE);
++	if (sreq->nents) {
++		dma_unmap_sg(priv->dev, areq->src, sreq->nents, DMA_TO_DEVICE);
++		sreq->nents = 0;
++	}
+ 
+ 	safexcel_free_context(priv, async, sreq->state_sz);
+ 
+@@ -178,7 +182,7 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
+ 	struct safexcel_command_desc *cdesc, *first_cdesc = NULL;
+ 	struct safexcel_result_desc *rdesc;
+ 	struct scatterlist *sg;
+-	int i, nents, queued, len, cache_len, extra, n_cdesc = 0, ret = 0;
++	int i, queued, len, cache_len, extra, n_cdesc = 0, ret = 0;
+ 
+ 	queued = len = req->len - req->processed;
+ 	if (queued < crypto_ahash_blocksize(ahash))
+@@ -186,17 +190,31 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
+ 	else
+ 		cache_len = queued - areq->nbytes;
+ 
+-	/*
+-	 * If this is not the last request and the queued data does not fit
+-	 * into full blocks, cache it for the next send() call.
+-	 */
+-	extra = queued & (crypto_ahash_blocksize(ahash) - 1);
+-	if (!req->last_req && extra) {
+-		sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
+-				   req->cache_next, extra, areq->nbytes - extra);
+-
+-		queued -= extra;
+-		len -= extra;
++	if (!req->last_req) {
++		/* If this is not the last request and the queued data does not
++		 * fit into full blocks, cache it for the next send() call.
++		 */
++		extra = queued & (crypto_ahash_blocksize(ahash) - 1);
++		if (!extra)
++			/* If this is not the last request and the queued data
++			 * is a multiple of a block, cache the last one for now.
++			 */
++			extra = queued - crypto_ahash_blocksize(ahash);
++
++		if (extra) {
++			sg_pcopy_to_buffer(areq->src, sg_nents(areq->src),
++					   req->cache_next, extra,
++					   areq->nbytes - extra);
++
++			queued -= extra;
++			len -= extra;
++
++			if (!queued) {
++				*commands = 0;
++				*results = 0;
++				return 0;
++			}
++		}
+ 	}
+ 
+ 	spin_lock_bh(&priv->ring[ring].egress_lock);
+@@ -234,15 +252,15 @@ static int safexcel_ahash_send_req(struct crypto_async_request *async, int ring,
+ 	}
+ 
+ 	/* Now handle the current ahash request buffer(s) */
+-	nents = dma_map_sg(priv->dev, areq->src,
+-		       sg_nents_for_len(areq->src, areq->nbytes),
+-		       DMA_TO_DEVICE);
+-	if (!nents) {
++	req->nents = dma_map_sg(priv->dev, areq->src,
++				sg_nents_for_len(areq->src, areq->nbytes),
++				DMA_TO_DEVICE);
++	if (!req->nents) {
+ 		ret = -ENOMEM;
+ 		goto cdesc_rollback;
+ 	}
+ 
+-	for_each_sg(areq->src, sg, nents, i) {
++	for_each_sg(areq->src, sg, req->nents, i) {
+ 		int sglen = sg_dma_len(sg);
+ 
+ 		/* Do not overflow the request */
+diff --git a/drivers/firmware/efi/Kconfig b/drivers/firmware/efi/Kconfig
+index 2b4c39fdfa91..86210f75d233 100644
+--- a/drivers/firmware/efi/Kconfig
++++ b/drivers/firmware/efi/Kconfig
+@@ -159,7 +159,10 @@ config RESET_ATTACK_MITIGATION
+ 	  using the TCG Platform Reset Attack Mitigation specification. This
+ 	  protects against an attacker forcibly rebooting the system while it
+ 	  still contains secrets in RAM, booting another OS and extracting the
+-	  secrets.
++	  secrets. This should only be enabled when userland is configured to
++	  clear the MemoryOverwriteRequest flag on clean shutdown after secrets
++	  have been evicted, since otherwise it will trigger even on clean
++	  reboots.
+ 
+ endmenu
+ 
+diff --git a/drivers/gpio/gpio-ath79.c b/drivers/gpio/gpio-ath79.c
+index 5fad89dfab7e..3ae7c1876bf4 100644
+--- a/drivers/gpio/gpio-ath79.c
++++ b/drivers/gpio/gpio-ath79.c
+@@ -324,3 +324,6 @@ static struct platform_driver ath79_gpio_driver = {
+ };
+ 
+ module_platform_driver(ath79_gpio_driver);
++
++MODULE_DESCRIPTION("Atheros AR71XX/AR724X/AR913X GPIO API support");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/gpio/gpio-iop.c b/drivers/gpio/gpio-iop.c
+index 98c7ff2a76e7..8d62db447ec1 100644
+--- a/drivers/gpio/gpio-iop.c
++++ b/drivers/gpio/gpio-iop.c
+@@ -58,3 +58,7 @@ static int __init iop3xx_gpio_init(void)
+ 	return platform_driver_register(&iop3xx_gpio_driver);
+ }
+ arch_initcall(iop3xx_gpio_init);
++
++MODULE_DESCRIPTION("GPIO handling for Intel IOP3xx processors");
++MODULE_AUTHOR("Lennert Buytenhek <buytenh@wantstofly.org>");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/gpio/gpio-stmpe.c b/drivers/gpio/gpio-stmpe.c
+index e6e5cca624a7..a365feff2377 100644
+--- a/drivers/gpio/gpio-stmpe.c
++++ b/drivers/gpio/gpio-stmpe.c
+@@ -190,6 +190,16 @@ static void stmpe_gpio_irq_sync_unlock(struct irq_data *d)
+ 	};
+ 	int i, j;
+ 
++	/*
++	 * STMPE1600: to be able to get IRQ from pins,
++	 * a read must be done on GPMR register, or a write in
++	 * GPSR or GPCR registers
++	 */
++	if (stmpe->partnum == STMPE1600) {
++		stmpe_reg_read(stmpe, stmpe->regs[STMPE_IDX_GPMR_LSB]);
++		stmpe_reg_read(stmpe, stmpe->regs[STMPE_IDX_GPMR_CSB]);
++	}
++
+ 	for (i = 0; i < CACHE_NR_REGS; i++) {
+ 		/* STMPE801 and STMPE1600 don't have RE and FE registers */
+ 		if ((stmpe->partnum == STMPE801 ||
+@@ -227,21 +237,11 @@ static void stmpe_gpio_irq_unmask(struct irq_data *d)
+ {
+ 	struct gpio_chip *gc = irq_data_get_irq_chip_data(d);
+ 	struct stmpe_gpio *stmpe_gpio = gpiochip_get_data(gc);
+-	struct stmpe *stmpe = stmpe_gpio->stmpe;
+ 	int offset = d->hwirq;
+ 	int regoffset = offset / 8;
+ 	int mask = BIT(offset % 8);
+ 
+ 	stmpe_gpio->regs[REG_IE][regoffset] |= mask;
+-
+-	/*
+-	 * STMPE1600 workaround: to be able to get IRQ from pins,
+-	 * a read must be done on GPMR register, or a write in
+-	 * GPSR or GPCR registers
+-	 */
+-	if (stmpe->partnum == STMPE1600)
+-		stmpe_reg_read(stmpe,
+-			       stmpe->regs[STMPE_IDX_GPMR_LSB + regoffset]);
+ }
+ 
+ static void stmpe_dbg_show_one(struct seq_file *s,
+diff --git a/drivers/gpio/gpiolib.c b/drivers/gpio/gpiolib.c
+index 14532d9576e4..f6efcf94f6ad 100644
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@ -732,6 +732,9 @@ static irqreturn_t lineevent_irq_thread(int irq, void *p)
+ 	struct gpioevent_data ge;
+ 	int ret, level;
+ 
++	/* Do not leak kernel stack to userspace */
++	memset(&ge, 0, sizeof(ge));
++
+ 	ge.timestamp = ktime_get_real_ns();
+ 	level = gpiod_get_value_cansleep(le->desc);
+ 
+diff --git a/drivers/hid/wacom_sys.c b/drivers/hid/wacom_sys.c
+index ee71ad9b6cc1..76531796bd3c 100644
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@ -2347,23 +2347,23 @@ static void wacom_remote_destroy_one(struct wacom *wacom, unsigned int index)
+ 	int i;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&remote->remote_lock, flags);
+-	remote->remotes[index].registered = false;
+-	spin_unlock_irqrestore(&remote->remote_lock, flags);
++	for (i = 0; i < WACOM_MAX_REMOTES; i++) {
++		if (remote->remotes[i].serial == serial) {
+ 
+-	if (remote->remotes[index].battery.battery)
+-		devres_release_group(&wacom->hdev->dev,
+-				     &remote->remotes[index].battery.bat_desc);
++			spin_lock_irqsave(&remote->remote_lock, flags);
++			remote->remotes[i].registered = false;
++			spin_unlock_irqrestore(&remote->remote_lock, flags);
+ 
+-	if (remote->remotes[index].group.name)
+-		devres_release_group(&wacom->hdev->dev,
+-				     &remote->remotes[index]);
++			if (remote->remotes[i].battery.battery)
++				devres_release_group(&wacom->hdev->dev,
++						     &remote->remotes[i].battery.bat_desc);
++
++			if (remote->remotes[i].group.name)
++				devres_release_group(&wacom->hdev->dev,
++						     &remote->remotes[i]);
+ 
+-	for (i = 0; i < WACOM_MAX_REMOTES; i++) {
+-		if (remote->remotes[i].serial == serial) {
+ 			remote->remotes[i].serial = 0;
+ 			remote->remotes[i].group.name = NULL;
+-			remote->remotes[i].registered = false;
+ 			remote->remotes[i].battery.battery = NULL;
+ 			wacom->led.groups[i].select = WACOM_STATUS_UNKNOWN;
+ 		}
+diff --git a/drivers/hid/wacom_wac.c b/drivers/hid/wacom_wac.c
+index 16af6886e828..7dbff253c05c 100644
+--- a/drivers/hid/wacom_wac.c
++++ b/drivers/hid/wacom_wac.c
+@@ -1924,7 +1924,6 @@ static void wacom_wac_pad_event(struct hid_device *hdev, struct hid_field *field
+ 	struct wacom_features *features = &wacom_wac->features;
+ 	unsigned equivalent_usage = wacom_equivalent_usage(usage->hid);
+ 	int i;
+-	bool is_touch_on = value;
+ 	bool do_report = false;
+ 
+ 	/*
+@@ -1969,16 +1968,17 @@ static void wacom_wac_pad_event(struct hid_device *hdev, struct hid_field *field
+ 		break;
+ 
+ 	case WACOM_HID_WD_MUTE_DEVICE:
+-		if (wacom_wac->shared->touch_input && value) {
+-			wacom_wac->shared->is_touch_on = !wacom_wac->shared->is_touch_on;
+-			is_touch_on = wacom_wac->shared->is_touch_on;
+-		}
+-
+-		/* fall through*/
+ 	case WACOM_HID_WD_TOUCHONOFF:
+ 		if (wacom_wac->shared->touch_input) {
++			bool *is_touch_on = &wacom_wac->shared->is_touch_on;
++
++			if (equivalent_usage == WACOM_HID_WD_MUTE_DEVICE && value)
++				*is_touch_on = !(*is_touch_on);
++			else if (equivalent_usage == WACOM_HID_WD_TOUCHONOFF)
++				*is_touch_on = value;
++
+ 			input_report_switch(wacom_wac->shared->touch_input,
+-					    SW_MUTE_DEVICE, !is_touch_on);
++					    SW_MUTE_DEVICE, !(*is_touch_on));
+ 			input_sync(wacom_wac->shared->touch_input);
+ 		}
+ 		break;
+diff --git a/drivers/iio/adc/stm32-adc.c b/drivers/iio/adc/stm32-adc.c
+index c9d96f935dba..cecf1e5b244c 100644
+--- a/drivers/iio/adc/stm32-adc.c
++++ b/drivers/iio/adc/stm32-adc.c
+@@ -1315,6 +1315,7 @@ static int stm32_adc_set_watermark(struct iio_dev *indio_dev, unsigned int val)
+ {
+ 	struct stm32_adc *adc = iio_priv(indio_dev);
+ 	unsigned int watermark = STM32_DMA_BUFFER_SIZE / 2;
++	unsigned int rx_buf_sz = STM32_DMA_BUFFER_SIZE;
+ 
+ 	/*
+ 	 * dma cyclic transfers are used, buffer is split into two periods.
+@@ -1323,7 +1324,7 @@ static int stm32_adc_set_watermark(struct iio_dev *indio_dev, unsigned int val)
+ 	 * - one buffer (period) driver can push with iio_trigger_poll().
+ 	 */
+ 	watermark = min(watermark, val * (unsigned)(sizeof(u16)));
+-	adc->rx_buf_sz = watermark * 2;
++	adc->rx_buf_sz = min(rx_buf_sz, watermark * 2 * adc->num_conv);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/iio/chemical/ccs811.c b/drivers/iio/chemical/ccs811.c
+index 97bce8345c6a..fbe2431f5b81 100644
+--- a/drivers/iio/chemical/ccs811.c
++++ b/drivers/iio/chemical/ccs811.c
+@@ -96,7 +96,6 @@ static const struct iio_chan_spec ccs811_channels[] = {
+ 		.channel2 = IIO_MOD_CO2,
+ 		.modified = 1,
+ 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
+-				      BIT(IIO_CHAN_INFO_OFFSET) |
+ 				      BIT(IIO_CHAN_INFO_SCALE),
+ 		.scan_index = 0,
+ 		.scan_type = {
+@@ -255,24 +254,18 @@ static int ccs811_read_raw(struct iio_dev *indio_dev,
+ 			switch (chan->channel2) {
+ 			case IIO_MOD_CO2:
+ 				*val = 0;
+-				*val2 = 12834;
++				*val2 = 100;
+ 				return IIO_VAL_INT_PLUS_MICRO;
+ 			case IIO_MOD_VOC:
+ 				*val = 0;
+-				*val2 = 84246;
+-				return IIO_VAL_INT_PLUS_MICRO;
++				*val2 = 100;
++				return IIO_VAL_INT_PLUS_NANO;
+ 			default:
+ 				return -EINVAL;
+ 			}
+ 		default:
+ 			return -EINVAL;
+ 		}
+-	case IIO_CHAN_INFO_OFFSET:
+-		if (!(chan->type == IIO_CONCENTRATION &&
+-		      chan->channel2 == IIO_MOD_CO2))
+-			return -EINVAL;
+-		*val = -400;
+-		return IIO_VAL_INT;
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/input/rmi4/rmi_driver.c b/drivers/input/rmi4/rmi_driver.c
+index 141ea228aac6..f5954981e9ee 100644
+--- a/drivers/input/rmi4/rmi_driver.c
++++ b/drivers/input/rmi4/rmi_driver.c
+@@ -41,6 +41,13 @@ void rmi_free_function_list(struct rmi_device *rmi_dev)
+ 
+ 	rmi_dbg(RMI_DEBUG_CORE, &rmi_dev->dev, "Freeing function list\n");
+ 
++	/* Doing it in the reverse order so F01 will be removed last */
++	list_for_each_entry_safe_reverse(fn, tmp,
++					 &data->function_list, node) {
++		list_del(&fn->node);
++		rmi_unregister_function(fn);
++	}
++
+ 	devm_kfree(&rmi_dev->dev, data->irq_memory);
+ 	data->irq_memory = NULL;
+ 	data->irq_status = NULL;
+@@ -50,13 +57,6 @@ void rmi_free_function_list(struct rmi_device *rmi_dev)
+ 
+ 	data->f01_container = NULL;
+ 	data->f34_container = NULL;
+-
+-	/* Doing it in the reverse order so F01 will be removed last */
+-	list_for_each_entry_safe_reverse(fn, tmp,
+-					 &data->function_list, node) {
+-		list_del(&fn->node);
+-		rmi_unregister_function(fn);
+-	}
+ }
+ 
+ static int reset_one_function(struct rmi_function *fn)
+diff --git a/drivers/input/rmi4/rmi_f03.c b/drivers/input/rmi4/rmi_f03.c
+index ad71a5e768dc..7ccbb370a9a8 100644
+--- a/drivers/input/rmi4/rmi_f03.c
++++ b/drivers/input/rmi4/rmi_f03.c
+@@ -32,6 +32,7 @@ struct f03_data {
+ 	struct rmi_function *fn;
+ 
+ 	struct serio *serio;
++	bool serio_registered;
+ 
+ 	unsigned int overwrite_buttons;
+ 
+@@ -138,6 +139,37 @@ static int rmi_f03_initialize(struct f03_data *f03)
+ 	return 0;
+ }
+ 
++static int rmi_f03_pt_open(struct serio *serio)
++{
++	struct f03_data *f03 = serio->port_data;
++	struct rmi_function *fn = f03->fn;
++	const u8 ob_len = f03->rx_queue_length * RMI_F03_OB_SIZE;
++	const u16 data_addr = fn->fd.data_base_addr + RMI_F03_OB_OFFSET;
++	u8 obs[RMI_F03_QUEUE_LENGTH * RMI_F03_OB_SIZE];
++	int error;
++
++	/*
++	 * Consume any pending data. Some devices like to spam with
++	 * 0xaa 0x00 announcements which may confuse us as we try to
++	 * probe the device.
++	 */
++	error = rmi_read_block(fn->rmi_dev, data_addr, &obs, ob_len);
++	if (!error)
++		rmi_dbg(RMI_DEBUG_FN, &fn->dev,
++			"%s: Consumed %*ph (%d) from PS2 guest\n",
++			__func__, ob_len, obs, ob_len);
++
++	return fn->rmi_dev->driver->set_irq_bits(fn->rmi_dev, fn->irq_mask);
++}
++
++static void rmi_f03_pt_close(struct serio *serio)
++{
++	struct f03_data *f03 = serio->port_data;
++	struct rmi_function *fn = f03->fn;
++
++	fn->rmi_dev->driver->clear_irq_bits(fn->rmi_dev, fn->irq_mask);
++}
++
+ static int rmi_f03_register_pt(struct f03_data *f03)
+ {
+ 	struct serio *serio;
+@@ -148,6 +180,8 @@ static int rmi_f03_register_pt(struct f03_data *f03)
+ 
+ 	serio->id.type = SERIO_PS_PSTHRU;
+ 	serio->write = rmi_f03_pt_write;
++	serio->open = rmi_f03_pt_open;
++	serio->close = rmi_f03_pt_close;
+ 	serio->port_data = f03;
+ 
+ 	strlcpy(serio->name, "Synaptics RMI4 PS/2 pass-through",
+@@ -184,17 +218,27 @@ static int rmi_f03_probe(struct rmi_function *fn)
+ 			 f03->device_count);
+ 
+ 	dev_set_drvdata(dev, f03);
+-
+-	error = rmi_f03_register_pt(f03);
+-	if (error)
+-		return error;
+-
+ 	return 0;
+ }
+ 
+ static int rmi_f03_config(struct rmi_function *fn)
+ {
+-	fn->rmi_dev->driver->set_irq_bits(fn->rmi_dev, fn->irq_mask);
++	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
++	int error;
++
++	if (!f03->serio_registered) {
++		error = rmi_f03_register_pt(f03);
++		if (error)
++			return error;
++
++		f03->serio_registered = true;
++	} else {
++		/*
++		 * We must be re-configuring the sensor, just enable
++		 * interrupts for this function.
++		 */
++		fn->rmi_dev->driver->set_irq_bits(fn->rmi_dev, fn->irq_mask);
++	}
+ 
+ 	return 0;
+ }
+@@ -204,7 +248,7 @@ static int rmi_f03_attention(struct rmi_function *fn, unsigned long *irq_bits)
+ 	struct rmi_device *rmi_dev = fn->rmi_dev;
+ 	struct rmi_driver_data *drvdata = dev_get_drvdata(&rmi_dev->dev);
+ 	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
+-	u16 data_addr = fn->fd.data_base_addr;
++	const u16 data_addr = fn->fd.data_base_addr + RMI_F03_OB_OFFSET;
+ 	const u8 ob_len = f03->rx_queue_length * RMI_F03_OB_SIZE;
+ 	u8 obs[RMI_F03_QUEUE_LENGTH * RMI_F03_OB_SIZE];
+ 	u8 ob_status;
+@@ -226,8 +270,7 @@ static int rmi_f03_attention(struct rmi_function *fn, unsigned long *irq_bits)
+ 		drvdata->attn_data.size -= ob_len;
+ 	} else {
+ 		/* Grab all of the data registers, and check them for data */
+-		error = rmi_read_block(fn->rmi_dev, data_addr + RMI_F03_OB_OFFSET,
+-				       &obs, ob_len);
++		error = rmi_read_block(fn->rmi_dev, data_addr, &obs, ob_len);
+ 		if (error) {
+ 			dev_err(&fn->dev,
+ 				"%s: Failed to read F03 output buffers: %d\n",
+@@ -266,7 +309,8 @@ static void rmi_f03_remove(struct rmi_function *fn)
+ {
+ 	struct f03_data *f03 = dev_get_drvdata(&fn->dev);
+ 
+-	serio_unregister_port(f03->serio);
++	if (f03->serio_registered)
++		serio_unregister_port(f03->serio);
+ }
+ 
+ struct rmi_function_handler rmi_f03_handler = {
+diff --git a/drivers/misc/mei/pci-me.c b/drivers/misc/mei/pci-me.c
+index f4f17552c9b8..4a0ccda4d04b 100644
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@ -238,8 +238,11 @@ static int mei_me_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	 */
+ 	mei_me_set_pm_domain(dev);
+ 
+-	if (mei_pg_is_enabled(dev))
++	if (mei_pg_is_enabled(dev)) {
+ 		pm_runtime_put_noidle(&pdev->dev);
++		if (hw->d0i3_supported)
++			pm_runtime_allow(&pdev->dev);
++	}
+ 
+ 	dev_dbg(&pdev->dev, "initialization successful.\n");
+ 
+diff --git a/drivers/mtd/nand/denali_pci.c b/drivers/mtd/nand/denali_pci.c
+index 57fb7ae31412..49cb3e1f8bd0 100644
+--- a/drivers/mtd/nand/denali_pci.c
++++ b/drivers/mtd/nand/denali_pci.c
+@@ -125,3 +125,7 @@ static struct pci_driver denali_pci_driver = {
+ 	.remove = denali_pci_remove,
+ };
+ module_pci_driver(denali_pci_driver);
++
++MODULE_DESCRIPTION("PCI driver for Denali NAND controller");
++MODULE_AUTHOR("Intel Corporation and its suppliers");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index c208753ff5b7..c69a5b3ae8c8 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -3676,7 +3676,7 @@ static int __igb_close(struct net_device *netdev, bool suspending)
+ 
+ int igb_close(struct net_device *netdev)
+ {
+-	if (netif_device_present(netdev))
++	if (netif_device_present(netdev) || netdev->dismantle)
+ 		return __igb_close(netdev, false);
+ 	return 0;
+ }
+diff --git a/drivers/power/reset/zx-reboot.c b/drivers/power/reset/zx-reboot.c
+index 7549c7f74a3c..c03e96e6a041 100644
+--- a/drivers/power/reset/zx-reboot.c
++++ b/drivers/power/reset/zx-reboot.c
+@@ -82,3 +82,7 @@ static struct platform_driver zx_reboot_driver = {
+ 	},
+ };
+ module_platform_driver(zx_reboot_driver);
++
++MODULE_DESCRIPTION("ZTE SoCs reset driver");
++MODULE_AUTHOR("Jun Nie <jun.nie@linaro.org>");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/scsi/aacraid/aachba.c b/drivers/scsi/aacraid/aachba.c
+index af3e4d3f9735..7173ae53c526 100644
+--- a/drivers/scsi/aacraid/aachba.c
++++ b/drivers/scsi/aacraid/aachba.c
+@@ -913,8 +913,15 @@ static void setinqstr(struct aac_dev *dev, void *data, int tindex)
+ 	memset(str, ' ', sizeof(*str));
+ 
+ 	if (sup_adap_info->adapter_type_text[0]) {
+-		char *cp = sup_adap_info->adapter_type_text;
+ 		int c;
++		char *cp;
++		char *cname = kmemdup(sup_adap_info->adapter_type_text,
++				sizeof(sup_adap_info->adapter_type_text),
++								GFP_ATOMIC);
++		if (!cname)
++			return;
++
++		cp = cname;
+ 		if ((cp[0] == 'A') && (cp[1] == 'O') && (cp[2] == 'C'))
+ 			inqstrcpy("SMC", str->vid);
+ 		else {
+@@ -923,7 +930,7 @@ static void setinqstr(struct aac_dev *dev, void *data, int tindex)
+ 				++cp;
+ 			c = *cp;
+ 			*cp = '\0';
+-			inqstrcpy(sup_adap_info->adapter_type_text, str->vid);
++			inqstrcpy(cname, str->vid);
+ 			*cp = c;
+ 			while (*cp && *cp != ' ')
+ 				++cp;
+@@ -937,8 +944,8 @@ static void setinqstr(struct aac_dev *dev, void *data, int tindex)
+ 			cp[sizeof(str->pid)] = '\0';
+ 		}
+ 		inqstrcpy (cp, str->pid);
+-		if (c)
+-			cp[sizeof(str->pid)] = c;
++
++		kfree(cname);
+ 	} else {
+ 		struct aac_driver_ident *mp = aac_get_driver_ident(dev->cardtype);
+ 
+diff --git a/drivers/scsi/aacraid/commsup.c b/drivers/scsi/aacraid/commsup.c
+index 80a8cb26cdea..d9b20dada109 100644
+--- a/drivers/scsi/aacraid/commsup.c
++++ b/drivers/scsi/aacraid/commsup.c
+@@ -1643,14 +1643,7 @@ static int _aac_reset_adapter(struct aac_dev *aac, int forced, u8 reset_type)
+ out:
+ 	aac->in_reset = 0;
+ 	scsi_unblock_requests(host);
+-	/*
+-	 * Issue bus rescan to catch any configuration that might have
+-	 * occurred
+-	 */
+-	if (!retval) {
+-		dev_info(&aac->pdev->dev, "Issuing bus rescan\n");
+-		scsi_scan_host(host);
+-	}
++
+ 	if (jafo) {
+ 		spin_lock_irq(host->host_lock);
+ 	}
+diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
+index 3b3d1d050cac..40fc7a590e81 100644
+--- a/drivers/scsi/storvsc_drv.c
++++ b/drivers/scsi/storvsc_drv.c
+@@ -1834,8 +1834,10 @@ static int storvsc_probe(struct hv_device *device,
+ 		fc_host_node_name(host) = stor_device->node_name;
+ 		fc_host_port_name(host) = stor_device->port_name;
+ 		stor_device->rport = fc_remote_port_add(host, 0, &ids);
+-		if (!stor_device->rport)
++		if (!stor_device->rport) {
++			ret = -ENOMEM;
+ 			goto err_out4;
++		}
+ 	}
+ #endif
+ 	return 0;
+diff --git a/drivers/spi/spi-imx.c b/drivers/spi/spi-imx.c
+index 79ddefe4180d..40390d31a93b 100644
+--- a/drivers/spi/spi-imx.c
++++ b/drivers/spi/spi-imx.c
+@@ -1668,12 +1668,23 @@ static int spi_imx_remove(struct platform_device *pdev)
+ {
+ 	struct spi_master *master = platform_get_drvdata(pdev);
+ 	struct spi_imx_data *spi_imx = spi_master_get_devdata(master);
++	int ret;
+ 
+ 	spi_bitbang_stop(&spi_imx->bitbang);
+ 
++	ret = clk_enable(spi_imx->clk_per);
++	if (ret)
++		return ret;
++
++	ret = clk_enable(spi_imx->clk_ipg);
++	if (ret) {
++		clk_disable(spi_imx->clk_per);
++		return ret;
++	}
++
+ 	writel(0, spi_imx->base + MXC_CSPICTRL);
+-	clk_unprepare(spi_imx->clk_ipg);
+-	clk_unprepare(spi_imx->clk_per);
++	clk_disable_unprepare(spi_imx->clk_ipg);
++	clk_disable_unprepare(spi_imx->clk_per);
+ 	spi_imx_sdma_exit(spi_imx);
+ 	spi_master_put(master);
+ 
+diff --git a/drivers/staging/ccree/ssi_cipher.c b/drivers/staging/ccree/ssi_cipher.c
+index ee85cbf7c9ae..980ff42128b4 100644
+--- a/drivers/staging/ccree/ssi_cipher.c
++++ b/drivers/staging/ccree/ssi_cipher.c
+@@ -908,6 +908,7 @@ static int ssi_ablkcipher_decrypt(struct ablkcipher_request *req)
+ 	scatterwalk_map_and_copy(req_ctx->backup_info, req->src,
+ 				 (req->nbytes - ivsize), ivsize, 0);
+ 	req_ctx->is_giv = false;
++	req_ctx->backup_info = NULL;
+ 
+ 	return ssi_blkcipher_process(tfm, req_ctx, req->dst, req->src, req->nbytes, req->info, ivsize, (void *)req, DRV_CRYPTO_DIRECTION_DECRYPT);
+ }
+diff --git a/drivers/staging/ccree/ssi_driver.c b/drivers/staging/ccree/ssi_driver.c
+index 1a3c481fa92a..ce16c3440319 100644
+--- a/drivers/staging/ccree/ssi_driver.c
++++ b/drivers/staging/ccree/ssi_driver.c
+@@ -117,7 +117,7 @@ static irqreturn_t cc_isr(int irq, void *dev_id)
+ 		irr &= ~SSI_COMP_IRQ_MASK;
+ 		complete_request(drvdata);
+ 	}
+-#ifdef CC_SUPPORT_FIPS
++#ifdef CONFIG_CRYPTO_FIPS
+ 	/* TEE FIPS interrupt */
+ 	if (likely((irr & SSI_GPR0_IRQ_MASK) != 0)) {
+ 		/* Mask interrupt - will be unmasked in Deferred service handler */
+diff --git a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
+index 8024843521ab..7b256d716251 100644
+--- a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
++++ b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.c
+@@ -826,14 +826,15 @@ struct kib_conn *kiblnd_create_conn(struct kib_peer *peer, struct rdma_cm_id *cm
+ 	return conn;
+ 
+  failed_2:
+-	kiblnd_destroy_conn(conn, true);
++	kiblnd_destroy_conn(conn);
++	LIBCFS_FREE(conn, sizeof(*conn));
+  failed_1:
+ 	LIBCFS_FREE(init_qp_attr, sizeof(*init_qp_attr));
+  failed_0:
+ 	return NULL;
+ }
+ 
+-void kiblnd_destroy_conn(struct kib_conn *conn, bool free_conn)
++void kiblnd_destroy_conn(struct kib_conn *conn)
+ {
+ 	struct rdma_cm_id *cmid = conn->ibc_cmid;
+ 	struct kib_peer *peer = conn->ibc_peer;
+@@ -896,8 +897,6 @@ void kiblnd_destroy_conn(struct kib_conn *conn, bool free_conn)
+ 		rdma_destroy_id(cmid);
+ 		atomic_dec(&net->ibn_nconns);
+ 	}
+-
+-	LIBCFS_FREE(conn, sizeof(*conn));
+ }
+ 
+ int kiblnd_close_peer_conns_locked(struct kib_peer *peer, int why)
+diff --git a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
+index 171eced213f8..b18911d09e9a 100644
+--- a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
++++ b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd.h
+@@ -1016,7 +1016,7 @@ int  kiblnd_close_peer_conns_locked(struct kib_peer *peer, int why);
+ struct kib_conn *kiblnd_create_conn(struct kib_peer *peer,
+ 				    struct rdma_cm_id *cmid,
+ 				    int state, int version);
+-void kiblnd_destroy_conn(struct kib_conn *conn, bool free_conn);
++void kiblnd_destroy_conn(struct kib_conn *conn);
+ void kiblnd_close_conn(struct kib_conn *conn, int error);
+ void kiblnd_close_conn_locked(struct kib_conn *conn, int error);
+ 
+diff --git a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
+index 40e3af5d8b04..2f25642ea1a6 100644
+--- a/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
++++ b/drivers/staging/lustre/lnet/klnds/o2iblnd/o2iblnd_cb.c
+@@ -3314,11 +3314,13 @@ kiblnd_connd(void *arg)
+ 			spin_unlock_irqrestore(lock, flags);
+ 			dropped_lock = 1;
+ 
+-			kiblnd_destroy_conn(conn, !peer);
++			kiblnd_destroy_conn(conn);
+ 
+ 			spin_lock_irqsave(lock, flags);
+-			if (!peer)
++			if (!peer) {
++				kfree(conn);
+ 				continue;
++			}
+ 
+ 			conn->ibc_peer = peer;
+ 			if (peer->ibp_reconnected < KIB_RECONN_HIGH_RACE)
+diff --git a/drivers/tty/serial/8250/8250_dw.c b/drivers/tty/serial/8250/8250_dw.c
+index 5bb0c42c88dd..7070203e3157 100644
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -252,31 +252,25 @@ static void dw8250_set_termios(struct uart_port *p, struct ktermios *termios,
+ 			       struct ktermios *old)
+ {
+ 	unsigned int baud = tty_termios_baud_rate(termios);
+-	unsigned int target_rate, min_rate, max_rate;
+ 	struct dw8250_data *d = p->private_data;
+ 	long rate;
+-	int i, ret;
++	int ret;
+ 
+ 	if (IS_ERR(d->clk) || !old)
+ 		goto out;
+ 
+-	/* Find a clk rate within +/-1.6% of an integer multiple of baudx16 */
+-	target_rate = baud * 16;
+-	min_rate = target_rate - (target_rate >> 6);
+-	max_rate = target_rate + (target_rate >> 6);
+-
+-	for (i = 1; i <= UART_DIV_MAX; i++) {
+-		rate = clk_round_rate(d->clk, i * target_rate);
+-		if (rate >= i * min_rate && rate <= i * max_rate)
+-			break;
+-	}
+-	if (i <= UART_DIV_MAX) {
+-		clk_disable_unprepare(d->clk);
++	clk_disable_unprepare(d->clk);
++	rate = clk_round_rate(d->clk, baud * 16);
++	if (rate < 0)
++		ret = rate;
++	else if (rate == 0)
++		ret = -ENOENT;
++	else
+ 		ret = clk_set_rate(d->clk, rate);
+-		clk_prepare_enable(d->clk);
+-		if (!ret)
+-			p->uartclk = rate;
+-	}
++	clk_prepare_enable(d->clk);
++
++	if (!ret)
++		p->uartclk = rate;
+ 
+ out:
+ 	p->status &= ~UPSTAT_AUTOCTS;
+diff --git a/drivers/tty/serial/8250/8250_of.c b/drivers/tty/serial/8250/8250_of.c
+index 1e67a7e4a5fd..160b8906d9b9 100644
+--- a/drivers/tty/serial/8250/8250_of.c
++++ b/drivers/tty/serial/8250/8250_of.c
+@@ -136,8 +136,11 @@ static int of_platform_serial_setup(struct platform_device *ofdev,
+ 	}
+ 
+ 	info->rst = devm_reset_control_get_optional_shared(&ofdev->dev, NULL);
+-	if (IS_ERR(info->rst))
++	if (IS_ERR(info->rst)) {
++		ret = PTR_ERR(info->rst);
+ 		goto err_dispose;
++	}
++
+ 	ret = reset_control_deassert(info->rst);
+ 	if (ret)
+ 		goto err_dispose;
+diff --git a/drivers/tty/serial/8250/8250_uniphier.c b/drivers/tty/serial/8250/8250_uniphier.c
+index 45ef506293ae..28d88ccf5a0c 100644
+--- a/drivers/tty/serial/8250/8250_uniphier.c
++++ b/drivers/tty/serial/8250/8250_uniphier.c
+@@ -250,12 +250,13 @@ static int uniphier_uart_probe(struct platform_device *pdev)
+ 	up.dl_read = uniphier_serial_dl_read;
+ 	up.dl_write = uniphier_serial_dl_write;
+ 
+-	priv->line = serial8250_register_8250_port(&up);
+-	if (priv->line < 0) {
++	ret = serial8250_register_8250_port(&up);
++	if (ret < 0) {
+ 		dev_err(dev, "failed to register 8250 port\n");
+ 		clk_disable_unprepare(priv->clk);
+ 		return ret;
+ 	}
++	priv->line = ret;
+ 
+ 	platform_set_drvdata(pdev, priv);
+ 
+diff --git a/drivers/tty/serial/imx.c b/drivers/tty/serial/imx.c
+index e4b3d9123a03..e9145ed0d6e7 100644
+--- a/drivers/tty/serial/imx.c
++++ b/drivers/tty/serial/imx.c
+@@ -2238,12 +2238,14 @@ static void serial_imx_enable_wakeup(struct imx_port *sport, bool on)
+ 		val &= ~UCR3_AWAKEN;
+ 	writel(val, sport->port.membase + UCR3);
+ 
+-	val = readl(sport->port.membase + UCR1);
+-	if (on)
+-		val |= UCR1_RTSDEN;
+-	else
+-		val &= ~UCR1_RTSDEN;
+-	writel(val, sport->port.membase + UCR1);
++	if (sport->have_rtscts) {
++		val = readl(sport->port.membase + UCR1);
++		if (on)
++			val |= UCR1_RTSDEN;
++		else
++			val &= ~UCR1_RTSDEN;
++		writel(val, sport->port.membase + UCR1);
++	}
+ }
+ 
+ static int imx_serial_port_suspend_noirq(struct device *dev)
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index dc60aeea87d8..4b506f2d3522 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -1323,6 +1323,9 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
+ 			"%s: %s driver does not set tty->port. This will crash the kernel later. Fix the driver!\n",
+ 			__func__, tty->driver->name);
+ 
++	retval = tty_ldisc_lock(tty, 5 * HZ);
++	if (retval)
++		goto err_release_lock;
+ 	tty->port->itty = tty;
+ 
+ 	/*
+@@ -1333,6 +1336,7 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
+ 	retval = tty_ldisc_setup(tty, tty->link);
+ 	if (retval)
+ 		goto err_release_tty;
++	tty_ldisc_unlock(tty);
+ 	/* Return the tty locked so that it cannot vanish under the caller */
+ 	return tty;
+ 
+@@ -1345,9 +1349,11 @@ struct tty_struct *tty_init_dev(struct tty_driver *driver, int idx)
+ 
+ 	/* call the tty release_tty routine to clean out this slot */
+ err_release_tty:
+-	tty_unlock(tty);
++	tty_ldisc_unlock(tty);
+ 	tty_info_ratelimited(tty, "ldisc open failed (%d), clearing slot %d\n",
+ 			     retval, idx);
++err_release_lock:
++	tty_unlock(tty);
+ 	release_tty(tty, idx);
+ 	return ERR_PTR(retval);
+ }
+diff --git a/drivers/tty/tty_ldisc.c b/drivers/tty/tty_ldisc.c
+index 24ec5c7e6b20..4e7946c0484b 100644
+--- a/drivers/tty/tty_ldisc.c
++++ b/drivers/tty/tty_ldisc.c
+@@ -337,7 +337,7 @@ static inline void __tty_ldisc_unlock(struct tty_struct *tty)
+ 	ldsem_up_write(&tty->ldisc_sem);
+ }
+ 
+-static int tty_ldisc_lock(struct tty_struct *tty, unsigned long timeout)
++int tty_ldisc_lock(struct tty_struct *tty, unsigned long timeout)
+ {
+ 	int ret;
+ 
+@@ -348,7 +348,7 @@ static int tty_ldisc_lock(struct tty_struct *tty, unsigned long timeout)
+ 	return 0;
+ }
+ 
+-static void tty_ldisc_unlock(struct tty_struct *tty)
++void tty_ldisc_unlock(struct tty_struct *tty)
+ {
+ 	clear_bit(TTY_LDISC_HALTED, &tty->flags);
+ 	__tty_ldisc_unlock(tty);
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 8e0636c963a7..18bbe3fedb8b 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -425,7 +425,7 @@ static int acm_submit_read_urb(struct acm *acm, int index, gfp_t mem_flags)
+ 
+ 	res = usb_submit_urb(acm->read_urbs[index], mem_flags);
+ 	if (res) {
+-		if (res != -EPERM) {
++		if (res != -EPERM && res != -ENODEV) {
+ 			dev_err(&acm->data->dev,
+ 				"urb %d failed submission with %d\n",
+ 				index, res);
+@@ -1752,6 +1752,9 @@ static const struct usb_device_id acm_ids[] = {
+ 	{ USB_DEVICE(0x0ace, 0x1611), /* ZyDAS 56K USB MODEM - new version */
+ 	.driver_info = SINGLE_RX_URB, /* firmware bug */
+ 	},
++	{ USB_DEVICE(0x11ca, 0x0201), /* VeriFone Mx870 Gadget Serial */
++	.driver_info = SINGLE_RX_URB,
++	},
+ 	{ USB_DEVICE(0x22b8, 0x7000), /* Motorola Q Phone */
+ 	.driver_info = NO_UNION_NORMAL, /* has no union descriptor */
+ 	},
+diff --git a/drivers/usb/gadget/function/f_fs.c b/drivers/usb/gadget/function/f_fs.c
+index b6cf5ab5a0a1..f9bd351637cd 100644
+--- a/drivers/usb/gadget/function/f_fs.c
++++ b/drivers/usb/gadget/function/f_fs.c
+@@ -3700,7 +3700,8 @@ static void ffs_closed(struct ffs_data *ffs)
+ 	ci = opts->func_inst.group.cg_item.ci_parent->ci_parent;
+ 	ffs_dev_unlock();
+ 
+-	unregister_gadget_item(ci);
++	if (test_bit(FFS_FL_BOUND, &ffs->flags))
++		unregister_gadget_item(ci);
+ 	return;
+ done:
+ 	ffs_dev_unlock();
+diff --git a/drivers/usb/gadget/udc/core.c b/drivers/usb/gadget/udc/core.c
+index 1b3efb14aec7..ac0541529499 100644
+--- a/drivers/usb/gadget/udc/core.c
++++ b/drivers/usb/gadget/udc/core.c
+@@ -912,7 +912,7 @@ int usb_gadget_ep_match_desc(struct usb_gadget *gadget,
+ 		return 0;
+ 
+ 	/* "high bandwidth" works only at high speed */
+-	if (!gadget_is_dualspeed(gadget) && usb_endpoint_maxp(desc) & (3<<11))
++	if (!gadget_is_dualspeed(gadget) && usb_endpoint_maxp_mult(desc) > 1)
+ 		return 0;
+ 
+ 	switch (type) {
+diff --git a/drivers/usb/serial/Kconfig b/drivers/usb/serial/Kconfig
+index a8d5f2e4878d..c66b93664d54 100644
+--- a/drivers/usb/serial/Kconfig
++++ b/drivers/usb/serial/Kconfig
+@@ -63,6 +63,7 @@ config USB_SERIAL_SIMPLE
+ 		- Google USB serial devices
+ 		- HP4x calculators
+ 		- a number of Motorola phones
++		- Motorola Tetra devices
+ 		- Novatel Wireless GPS receivers
+ 		- Siemens USB/MPI adapter.
+ 		- ViVOtech ViVOpay USB device.
+diff --git a/drivers/usb/serial/io_edgeport.c b/drivers/usb/serial/io_edgeport.c
+index 219265ce3711..17283f4b4779 100644
+--- a/drivers/usb/serial/io_edgeport.c
++++ b/drivers/usb/serial/io_edgeport.c
+@@ -2282,7 +2282,6 @@ static int write_cmd_usb(struct edgeport_port *edge_port,
+ 		/* something went wrong */
+ 		dev_err(dev, "%s - usb_submit_urb(write command) failed, status = %d\n",
+ 			__func__, status);
+-		usb_kill_urb(urb);
+ 		usb_free_urb(urb);
+ 		atomic_dec(&CmdUrbs);
+ 		return status;
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index b6320e3be429..5db8ed517e0e 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -380,6 +380,9 @@ static void option_instat_callback(struct urb *urb);
+ #define FOUR_G_SYSTEMS_PRODUCT_W14		0x9603
+ #define FOUR_G_SYSTEMS_PRODUCT_W100		0x9b01
+ 
++/* Fujisoft products */
++#define FUJISOFT_PRODUCT_FS040U			0x9b02
++
+ /* iBall 3.5G connect wireless modem */
+ #define IBALL_3_5G_CONNECT			0x9605
+ 
+@@ -1894,6 +1897,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, FOUR_G_SYSTEMS_PRODUCT_W100),
+ 	  .driver_info = (kernel_ulong_t)&four_g_w100_blacklist
+ 	},
++	{USB_DEVICE(LONGCHEER_VENDOR_ID, FUJISOFT_PRODUCT_FS040U),
++	 .driver_info = (kernel_ulong_t)&net_intf3_blacklist},
+ 	{ USB_DEVICE_INTERFACE_CLASS(LONGCHEER_VENDOR_ID, SPEEDUP_PRODUCT_SU9800, 0xff) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(LONGCHEER_VENDOR_ID, 0x9801, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
+diff --git a/drivers/usb/serial/pl2303.c b/drivers/usb/serial/pl2303.c
+index 57ae832a49ff..46dd09da2434 100644
+--- a/drivers/usb/serial/pl2303.c
++++ b/drivers/usb/serial/pl2303.c
+@@ -38,6 +38,7 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_RSAQ2) },
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_DCU11) },
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_RSAQ3) },
++	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_CHILITAG) },
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_PHAROS) },
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_ALDIGA) },
+ 	{ USB_DEVICE(PL2303_VENDOR_ID, PL2303_PRODUCT_ID_MMX) },
+diff --git a/drivers/usb/serial/pl2303.h b/drivers/usb/serial/pl2303.h
+index f98fd84890de..fcd72396a7b6 100644
+--- a/drivers/usb/serial/pl2303.h
++++ b/drivers/usb/serial/pl2303.h
+@@ -12,6 +12,7 @@
+ #define PL2303_PRODUCT_ID_DCU11		0x1234
+ #define PL2303_PRODUCT_ID_PHAROS	0xaaa0
+ #define PL2303_PRODUCT_ID_RSAQ3		0xaaa2
++#define PL2303_PRODUCT_ID_CHILITAG	0xaaa8
+ #define PL2303_PRODUCT_ID_ALDIGA	0x0611
+ #define PL2303_PRODUCT_ID_MMX		0x0612
+ #define PL2303_PRODUCT_ID_GPRS		0x0609
+diff --git a/drivers/usb/serial/usb-serial-simple.c b/drivers/usb/serial/usb-serial-simple.c
+index 74172fe158df..4ef79e29cb26 100644
+--- a/drivers/usb/serial/usb-serial-simple.c
++++ b/drivers/usb/serial/usb-serial-simple.c
+@@ -77,6 +77,11 @@ DEVICE(vivopay, VIVOPAY_IDS);
+ 	{ USB_DEVICE(0x22b8, 0x2c64) }	/* Motorola V950 phone */
+ DEVICE(moto_modem, MOTO_IDS);
+ 
++/* Motorola Tetra driver */
++#define MOTOROLA_TETRA_IDS()			\
++	{ USB_DEVICE(0x0cad, 0x9011) }	/* Motorola Solutions TETRA PEI */
++DEVICE(motorola_tetra, MOTOROLA_TETRA_IDS);
++
+ /* Novatel Wireless GPS driver */
+ #define NOVATEL_IDS()			\
+ 	{ USB_DEVICE(0x09d7, 0x0100) }	/* NovAtel FlexPack GPS */
+@@ -107,6 +112,7 @@ static struct usb_serial_driver * const serial_drivers[] = {
+ 	&google_device,
+ 	&vivopay_device,
+ 	&moto_modem_device,
++	&motorola_tetra_device,
+ 	&novatel_gps_device,
+ 	&hp4x_device,
+ 	&suunto_device,
+@@ -122,6 +128,7 @@ static const struct usb_device_id id_table[] = {
+ 	GOOGLE_IDS(),
+ 	VIVOPAY_IDS(),
+ 	MOTO_IDS(),
++	MOTOROLA_TETRA_IDS(),
+ 	NOVATEL_IDS(),
+ 	HP4X_IDS(),
+ 	SUUNTO_IDS(),
+diff --git a/drivers/usb/storage/uas.c b/drivers/usb/storage/uas.c
+index 5d04c40ee40a..3b1b9695177a 100644
+--- a/drivers/usb/storage/uas.c
++++ b/drivers/usb/storage/uas.c
+@@ -1076,20 +1076,19 @@ static int uas_post_reset(struct usb_interface *intf)
+ 		return 0;
+ 
+ 	err = uas_configure_endpoints(devinfo);
+-	if (err) {
++	if (err && err != ENODEV)
+ 		shost_printk(KERN_ERR, shost,
+ 			     "%s: alloc streams error %d after reset",
+ 			     __func__, err);
+-		return 1;
+-	}
+ 
++	/* we must unblock the host in every case lest we deadlock */
+ 	spin_lock_irqsave(shost->host_lock, flags);
+ 	scsi_report_bus_reset(shost, 0);
+ 	spin_unlock_irqrestore(shost->host_lock, flags);
+ 
+ 	scsi_unblock_requests(shost);
+ 
+-	return 0;
++	return err ? 1 : 0;
+ }
+ 
+ static int uas_suspend(struct usb_interface *intf, pm_message_t message)
+diff --git a/include/linux/tty.h b/include/linux/tty.h
+index 7ac8ba208b1f..0a6c71e0ad01 100644
+--- a/include/linux/tty.h
++++ b/include/linux/tty.h
+@@ -405,6 +405,8 @@ extern const char *tty_name(const struct tty_struct *tty);
+ extern struct tty_struct *tty_kopen(dev_t device);
+ extern void tty_kclose(struct tty_struct *tty);
+ extern int tty_dev_name_to_number(const char *name, dev_t *number);
++extern int tty_ldisc_lock(struct tty_struct *tty, unsigned long timeout);
++extern void tty_ldisc_unlock(struct tty_struct *tty);
+ #else
+ static inline void tty_kref_put(struct tty_struct *tty)
+ { }
+diff --git a/lib/test_firmware.c b/lib/test_firmware.c
+index 64a4c76cba2b..e7008688769b 100644
+--- a/lib/test_firmware.c
++++ b/lib/test_firmware.c
+@@ -371,6 +371,7 @@ static ssize_t config_num_requests_store(struct device *dev,
+ 	if (test_fw_config->reqs) {
+ 		pr_err("Must call release_all_firmware prior to changing config\n");
+ 		rc = -EINVAL;
++		mutex_unlock(&test_fw_mutex);
+ 		goto out;
+ 	}
+ 	mutex_unlock(&test_fw_mutex);
+diff --git a/security/integrity/ima/ima_policy.c b/security/integrity/ima/ima_policy.c
+index ee4613fa5840..f19f4841a97a 100644
+--- a/security/integrity/ima/ima_policy.c
++++ b/security/integrity/ima/ima_policy.c
+@@ -743,7 +743,7 @@ static int ima_parse_rule(char *rule, struct ima_rule_entry *entry)
+ 		case Opt_fsuuid:
+ 			ima_log_string(ab, "fsuuid", args[0].from);
+ 
+-			if (uuid_is_null(&entry->fsuuid)) {
++			if (!uuid_is_null(&entry->fsuuid)) {
+ 				result = -EINVAL;
+ 				break;
+ 			}
+diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
+index 9aafc6c86132..1750e00c5bb4 100644
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -3154,11 +3154,13 @@ static void alc256_shutup(struct hda_codec *codec)
+ 	if (hp_pin_sense)
+ 		msleep(85);
+ 
++	/* 3k pull low control for Headset jack. */
++	/* NOTE: call this before clearing the pin, otherwise codec stalls */
++	alc_update_coef_idx(codec, 0x46, 0, 3 << 12);
++
+ 	snd_hda_codec_write(codec, hp_pin, 0,
+ 			    AC_VERB_SET_PIN_WIDGET_CONTROL, 0x0);
+ 
+-	alc_update_coef_idx(codec, 0x46, 0, 3 << 12); /* 3k pull low control for Headset jack. */
+-
+ 	if (hp_pin_sense)
+ 		msleep(100);
+ 
+diff --git a/tools/gpio/gpio-event-mon.c b/tools/gpio/gpio-event-mon.c
+index 1c14c2595158..4b36323ea64b 100644
+--- a/tools/gpio/gpio-event-mon.c
++++ b/tools/gpio/gpio-event-mon.c
+@@ -23,6 +23,7 @@
+ #include <getopt.h>
+ #include <inttypes.h>
+ #include <sys/ioctl.h>
++#include <sys/types.h>
+ #include <linux/gpio.h>
+ 
+ int monitor_device(const char *device_name,
+diff --git a/tools/usb/usbip/src/usbip_bind.c b/tools/usb/usbip/src/usbip_bind.c
+index fa46141ae68b..e121cfb1746a 100644
+--- a/tools/usb/usbip/src/usbip_bind.c
++++ b/tools/usb/usbip/src/usbip_bind.c
+@@ -144,6 +144,7 @@ static int bind_device(char *busid)
+ 	int rc;
+ 	struct udev *udev;
+ 	struct udev_device *dev;
++	const char *devpath;
+ 
+ 	/* Check whether the device with this bus ID exists. */
+ 	udev = udev_new();
+@@ -152,8 +153,16 @@ static int bind_device(char *busid)
+ 		err("device with the specified bus ID does not exist");
+ 		return -1;
+ 	}
++	devpath = udev_device_get_devpath(dev);
+ 	udev_unref(udev);
+ 
++	/* If the device is already attached to vhci_hcd - bail out */
++	if (strstr(devpath, USBIP_VHCI_DRV_NAME)) {
++		err("bind loop detected: device: %s is attached to %s\n",
++		    devpath, USBIP_VHCI_DRV_NAME);
++		return -1;
++	}
++
+ 	rc = unbind_other(busid);
+ 	if (rc == UNBIND_ST_FAILED) {
+ 		err("could not unbind driver from device on busid %s", busid);
+diff --git a/tools/usb/usbip/src/usbip_list.c b/tools/usb/usbip/src/usbip_list.c
+index f1b38e866dd7..d65a9f444174 100644
+--- a/tools/usb/usbip/src/usbip_list.c
++++ b/tools/usb/usbip/src/usbip_list.c
+@@ -187,6 +187,7 @@ static int list_devices(bool parsable)
+ 	const char *busid;
+ 	char product_name[128];
+ 	int ret = -1;
++	const char *devpath;
+ 
+ 	/* Create libudev context. */
+ 	udev = udev_new();
+@@ -209,6 +210,14 @@ static int list_devices(bool parsable)
+ 		path = udev_list_entry_get_name(dev_list_entry);
+ 		dev = udev_device_new_from_syspath(udev, path);
+ 
++		/* Ignore devices attached to vhci_hcd */
++		devpath = udev_device_get_devpath(dev);
++		if (strstr(devpath, USBIP_VHCI_DRV_NAME)) {
++			dbg("Skip the device %s already attached to %s\n",
++			    devpath, USBIP_VHCI_DRV_NAME);
++			continue;
++		}
++
+ 		/* Get device information. */
+ 		idVendor = udev_device_get_sysattr_value(dev, "idVendor");
+ 		idProduct = udev_device_get_sysattr_value(dev, "idProduct");
