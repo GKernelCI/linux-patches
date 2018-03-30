@@ -34,7 +34,7 @@ process_static_content();
 sub make_index_page {
 	local *FD;
 	print ">> Making index page\n";
-	open(FD, '> '.$output_path.'/index.htm');
+	open(FD, '> '.$output_path.'/index.html');
 	html_header *FD;
 	include_content *FD, 'sitemap';
 	html_footer *FD;
@@ -44,7 +44,7 @@ sub make_index_page {
 sub make_about_page {
 	local *FD;
 	print ">> Making about page\n";
-	open(FD, '> '.$output_path.'/about.htm');
+	open(FD, '> '.$output_path.'/about.html');
 	html_header *FD;
 	include_content *FD, 'about';
 	html_footer *FD;
@@ -54,7 +54,7 @@ sub make_about_page {
 sub make_faq_page {
 	local (*FD, *DIR);
 	print ">> Making FAQ page\n";
-	open(FD, '> '.$output_path.'/faq.htm');
+	open(FD, '> '.$output_path.'/faq.html');
 	html_header *FD;
 	print FD '<h1>Frequently Asked Questions</h1>';
 	opendir(DIR, 'content/faq');
@@ -67,7 +67,7 @@ sub make_faq_page {
 sub make_bugs_page {
 	local *FD;
 	print ">> Making bugs page\n";
-	open(FD, '> '.$output_path.'/bugs.htm');
+	open(FD, '> '.$output_path.'/bugs.html');
 	html_header *FD;
 	include_content *FD, 'bugs';
 	html_footer *FD;
@@ -77,7 +77,7 @@ sub make_bugs_page {
 sub make_issues_page {
 	local *FD;
 	print ">> Making issues page\n";
-	open(FD, '> '.$output_path.'/issues.htm');
+	open(FD, '> '.$output_path.'/issues.html');
 	html_header *FD;
 	generate_issues_index(FD);
 	html_footer *FD;
@@ -97,7 +97,7 @@ sub generate_issues_index {
 	opendir(DIR, 'content/issues/current');
 	foreach $file (grep { -f "content/issues/current/$_" } sort readdir DIR) {
 		$path = 'content/issues/current/'.$file;
-		print FD '<li><a href="issues-current.htm#'.$file.'">';
+		print FD '<li><a href="issues-current.html#'.$file.'">';
 		print FD nl2br html_escape issues_get_questions $path;
 		print FD '</a></li>';
 	}
@@ -109,7 +109,7 @@ sub generate_issues_index {
 	opendir(DIR, 'content/issues/resolved');
 	foreach $file (grep { -f "content/issues/resolved/$_" } sort readdir DIR) {
 		$path = 'content/issues/resolved/'.$file;
-		print FD '<li><a href="issues-resolved.htm#'.$file.'">';
+		print FD '<li><a href="issues-resolved.html#'.$file.'">';
 		print FD nl2br html_escape issues_get_questions $path;
 		print FD '</a></li>';
 	}
@@ -120,7 +120,7 @@ sub generate_issues_index {
 sub generate_issues_current {
 	local (*DIR, *FD);
 	my $file;
-	open(FD, '> '.$output_path.'/issues-current.htm');
+	open(FD, '> '.$output_path.'/issues-current.html');
 	html_header *FD;
 	print FD '<h1>Current Issues and Solutions</h1>';
 	
@@ -146,7 +146,7 @@ sub generate_issues_current {
 sub generate_issues_resolved {
 	local (*DIR, *FD);
 	my $file;
-	open(FD, '> '.$output_path.'/issues-resolved.htm');
+	open(FD, '> '.$output_path.'/issues-resolved.html');
 	html_header *FD;
 	print FD '<h1>Previous/Resolved Issues and Solutions</h1>';
 	
@@ -184,7 +184,7 @@ sub make_kernels_page {
 	print ">> Making kernels page\n";
 	my %kernels = _get_genpatches_kernels();
 	
-	open(FD, '> '.$output_path.'/kernels.htm');
+	open(FD, '> '.$output_path.'/kernels.html');
 	html_header *FD;
 	print FD '<h1>Available Kernels</h1>';
 	print FD '<table id="hor-minimalist-a" class="kernels">';
@@ -195,7 +195,7 @@ sub make_kernels_page {
 		print FD '<td>'.$kernel->{'ver'}.'</td>';
         # need link to be http://git.mpagano.com/?p=linux-patches.git;a=tree;h=9fe89d1c30a6de1bf4996aa8cfaf2a24b77919fe;hb=ae90dea77ef818eb638b8bb086ac8f0b671b28cf
 		
-		print FD '<td><a href="patches-'.$kernel->{'gprev'}.'.htm">'.$kernel->{'gprev'}.'</a> '.$kernel->{'wanted'}.'</td>';
+		print FD '<td><a href="patches-'.$kernel->{'gprev'}.'.html">'.$kernel->{'gprev'}.'</a> '.$kernel->{'wanted'}.'</td>';
 		print FD '</tr>';
 	}
 
@@ -232,11 +232,11 @@ sub make_release_pages {
     
     
 	opendir(DIR, $webscript_path.'/generated');
-	@patchpages = grep { /-patches\.htm$/ } sort readdir DIR;
+	@patchpages = grep { /-patches\.html$/ } sort readdir DIR;
 	closedir(DIR);
 	
 	foreach $patch (@patchpages) {
-		$patch =~ m/^(.*)-patches\.htm$/;
+		$patch =~ m/^(.*)-patches\.html$/;
 		copy($webscript_path.'/generated/'.$patch, $webscript_path.'/output/patches-'.$1.'.htm');
 	}
 
@@ -248,9 +248,9 @@ sub mysort {
 
 sub mysort_old {
 
-	$a =~ m/^\d\.\d\.(\d+)-(\d+)-info\.htm$/;
+	$a =~ m/^\d\.\d\.(\d+)-(\d+)-info\.html$/;
 	$mya = $2;
-	$b =~ m/^\d\.\d\.(\d+)-(\d+)-info\.htm$/;
+	$b =~ m/^\d\.\d\.(\d+)-(\d+)-info\.html$/;
 	$myb = $2;
 	return $mya - $myb;
 }
@@ -261,10 +261,10 @@ sub make_releases_index {
 	my (%kernels, $info, @infopages, $kernel);
 	local (*DIR, *FILE, *INDEX);
 	opendir(DIR, $webscript_path.'/generated');
-	@infopages = grep { /-info\.htm$/ } readdir DIR;
+	@infopages = grep { /-info\.html$/ } readdir DIR;
 	foreach $info (@infopages) {
 		#$info =~ m/^(\d\.\d\.\d+)-\d+-info\.htm$/;
-		$info =~ m/^(\d\.\d+)-\d+-info\.htm$/;
+		$info =~ m/^(\d\.\d+)-\d+-info\.html$/;
 		$kernels{$1} = 1;
 	}
 
@@ -273,7 +273,7 @@ sub make_releases_index {
 #		$kernels{$1} = 1;
 #	}
 
-	open(INDEX, '> '.$webscript_path.'/output/releases.htm');
+	open(INDEX, '> '.$webscript_path.'/output/releases.html');
 	html_header(INDEX, 'genpatches Releases');
 	print INDEX '<h1>genpatches Releases</h1>';
 
@@ -282,8 +282,8 @@ sub make_releases_index {
         if ($kernel == "") {
             next;
         }
-		print INDEX '<p><a href="releases-'.$kernel.'.htm">genpatches releases for Linux '.$kernel.'</a></p>';
-		open(FILE, '> '.$webscript_path.'/output/releases-'.$kernel.'.htm');
+		print INDEX '<p><a href="releases-'.$kernel.'.html">genpatches releases for Linux '.$kernel.'</a></p>';
+		open(FILE, '> '.$webscript_path.'/output/releases-'.$kernel.'.html');
 		html_header(FILE, "$kernel Releases");
 		print FILE '<h1>'.$kernel.' Releases</h1>';
 		foreach (grep { /^$kernel-/ } sort mysort @infopages) {
@@ -307,7 +307,7 @@ sub generate_patchlist {
 	local $ext;
 	$ext = get_tarball_ext($tag);
 
-	open(PATCHLIST, '> '.$webscript_path.'/generated/'.$tag.'-patches.htm');
+	open(PATCHLIST, '> '.$webscript_path.'/generated/'.$tag.'-patches.html');
 	html_header(PATCHLIST, "$tag Patch List");
 	print PATCHLIST '<h1>'.$tag.' Patch List</h1>';
 	print PATCHLIST '<p>Patches 0000-2999 are available in ';
@@ -367,9 +367,9 @@ sub generate_info {
         print "no revision found for tag: $tag\n";
     }
 	
-	open (INFO, '> '.$webscript_path.'/generated/'.$tag.'-info.htm');
+	open (INFO, '> '.$webscript_path.'/generated/'.$tag.'-info.html');
 	print INFO '<h2>Release '.$tag.'</h2>';
-	print INFO '<p><a href="patches-'.$tag.'.htm">View entire patch list</a><br />';
+	print INFO '<p><a href="patches-'.$tag.'.html">View entire patch list</a><br />';
 	print INFO 'Split-out patch tarballs: ';
 	print INFO '<a href="tarballs/genpatches-'.$tag.'.base.tar'.$ext.'">base</a>, ';
 	print INFO '<a href="tarballs/genpatches-'.$tag.'.extras.tar'.$ext.'">extras</a></p>';
