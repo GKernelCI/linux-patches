@@ -237,7 +237,7 @@ sub make_release_pages {
 	
 	foreach $patch (@patchpages) {
 		$patch =~ m/^(.*)-patches\.html$/;
-		copy($webscript_path.'/generated/'.$patch, $webscript_path.'/output/patches-'.$1.'.htm');
+		copy($webscript_path.'/generated/'.$patch, $webscript_path.'/output/patches-'.$1.'.html');
 	}
 
 }
@@ -263,13 +263,13 @@ sub make_releases_index {
 	opendir(DIR, $webscript_path.'/generated');
 	@infopages = grep { /-info\.html$/ } readdir DIR;
 	foreach $info (@infopages) {
-		#$info =~ m/^(\d\.\d\.\d+)-\d+-info\.htm$/;
+		#$info =~ m/^(\d\.\d\.\d+)-\d+-info\.html$/;
 		$info =~ m/^(\d\.\d+)-\d+-info\.html$/;
 		$kernels{$1} = 1;
 	}
 
 #	foreach $info (@infopages) {
-#		$info =~ m/^(\d\.\d+)-\d+-info\.htm$/;
+#		$info =~ m/^(\d\.\d+)-\d+-info\.html$/;
 #		$kernels{$1} = 1;
 #	}
 

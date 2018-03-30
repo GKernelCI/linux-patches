@@ -121,7 +121,7 @@ else {
 #$email .= "-------\n\n";
 #$email .= "When the website updates, the complete patch list and split-out patches will be\n";
 #$email .= "available here:\n";
-#$email .= $website_base."/patches-".$tag.".htm\n";
+#$email .= $website_base."/patches-".$tag.".html\n";
 #$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".base.tar".$ext."\n";
 #$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".extras.tar".$ext."\n";
 #$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".experimental.tar".$ext."\n";

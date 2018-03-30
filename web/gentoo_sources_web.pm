@@ -48,12 +48,12 @@ sub html_header {
 	print FD '<body>';
 
 	print FD '<table id="newspaper-a">';
-	print FD '<th><a href="index.htm">Home</a></th>';
-	print FD '<th><a href="about.htm">About</a></th>';
-	print FD '<th><a href="faq.htm">FAQ</a></th>';
-	print FD '<th><a href="releases.htm">Releases</a></th>';
-	print FD '<th><a href="bugs.htm">Bugs</a></th>';
-	print FD '<th><a href="issues.htm">Issues</a></th></table>';
+	print FD '<th><a href="index.html">Home</a></th>';
+	print FD '<th><a href="about.html">About</a></th>';
+	print FD '<th><a href="faq.html">FAQ</a></th>';
+	print FD '<th><a href="releases.html">Releases</a></th>';
+	print FD '<th><a href="bugs.html">Bugs</a></th>';
+	print FD '<th><a href="issues.html">Issues</a></th></table>';
 }
 
 sub html_footer {
@@ -160,7 +160,7 @@ sub include_content {
 	my $page = shift;
 	local *CONTENT;
 
-	open(CONTENT, '< '.$webscript_path.'/content/'.$page.'.htm');
+	open(CONTENT, '< '.$webscript_path.'/content/'.$page.'.html');
 	print FD $_ foreach <CONTENT>;
 	close(CONTENT);
 }
@@ -284,8 +284,8 @@ sub _parse_log2 {
 sub release_is_generated {
 	my $tag = shift;
 
-	return -e $webscript_path.'/generated/'.$tag.'-patches.htm' &&
-		-e $webscript_path.'/generated/'.$tag.'-info.htm';
+	return -e $webscript_path.'/generated/'.$tag.'-patches.html' &&
+		-e $webscript_path.'/generated/'.$tag.'-info.html';
 }
 
 sub _get_genpatches_kernels2 {
@@ -344,12 +344,12 @@ sub get_tarball_ext {
 }
 
 
+#this one is active
 sub _get_genpatches_kernels {
     my (%gp_kernels, $kernel);
 
     foreach $kernel (@kernels) {
         $kernel =~ m/^([a-z-]+)\/([a-z0-9-]+)$/;
-        print "Got kernel $kernel\n";
         my $cat = $1;
         my $pkg = $2;
         $cmd = 'egrep --color=never "^(K_GENPATCHES_VER|K_WANT_GENPATCHES)" '.$ebuild_base.'/'.$kernel.'/*.ebuild';
