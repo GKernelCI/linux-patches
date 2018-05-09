@@ -1,0 +1,2881 @@
+diff --git a/Documentation/arm64/silicon-errata.txt b/Documentation/arm64/silicon-errata.txt
+index c1d520de6dfe..3b2f2dd82225 100644
+--- a/Documentation/arm64/silicon-errata.txt
++++ b/Documentation/arm64/silicon-errata.txt
+@@ -55,6 +55,7 @@ stable kernels.
+ | ARM            | Cortex-A57      | #834220         | ARM64_ERRATUM_834220        |
+ | ARM            | Cortex-A72      | #853709         | N/A                         |
+ | ARM            | Cortex-A73      | #858921         | ARM64_ERRATUM_858921        |
++| ARM            | Cortex-A55      | #1024718        | ARM64_ERRATUM_1024718       |
+ | ARM            | MMU-500         | #841119,#826419 | N/A                         |
+ |                |                 |                 |                             |
+ | Cavium         | ThunderX ITS    | #22375, #24313  | CAVIUM_ERRATUM_22375        |
+diff --git a/Makefile b/Makefile
+index 1c5d5d8c45e2..5da6ffd69209 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 16
+-SUBLEVEL = 7
++SUBLEVEL = 8
+ EXTRAVERSION =
+ NAME = Fearless Coyote
+ 
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 7381eeb7ef8e..be665760f2bd 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -464,6 +464,20 @@ config ARM64_ERRATUM_843419
+ 
+ 	  If unsure, say Y.
+ 
++config ARM64_ERRATUM_1024718
++	bool "Cortex-A55: 1024718: Update of DBM/AP bits without break before make might result in incorrect update"
++	default y
++	help
++	  This option adds work around for Arm Cortex-A55 Erratum 1024718.
++
++	  Affected Cortex-A55 cores (r0p0, r0p1, r1p0) could cause incorrect
++	  update of the hardware dirty bit when the DBM/AP bits are updated
++	  without a break-before-make. The work around is to disable the usage
++	  of hardware DBM locally on the affected cores. CPUs not affected by
++	  erratum will continue to use the feature.
++
++	  If unsure, say Y.
++
+ config CAVIUM_ERRATUM_22375
+ 	bool "Cavium erratum 22375, 24313"
+ 	default y
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 3c78835bba94..a3ca19e68b73 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -25,6 +25,7 @@
+ 
+ #include <asm/asm-offsets.h>
+ #include <asm/cpufeature.h>
++#include <asm/cputype.h>
+ #include <asm/debug-monitors.h>
+ #include <asm/page.h>
+ #include <asm/pgtable-hwdef.h>
+@@ -595,4 +596,43 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
+ #endif
+ 	.endm
+ 
++/*
++ * Check the MIDR_EL1 of the current CPU for a given model and a range of
++ * variant/revision. See asm/cputype.h for the macros used below.
++ *
++ *	model:		MIDR_CPU_MODEL of CPU
++ *	rv_min:		Minimum of MIDR_CPU_VAR_REV()
++ *	rv_max:		Maximum of MIDR_CPU_VAR_REV()
++ *	res:		Result register.
++ *	tmp1, tmp2, tmp3: Temporary registers
++ *
++ * Corrupts: res, tmp1, tmp2, tmp3
++ * Returns:  0, if the CPU id doesn't match. Non-zero otherwise
++ */
++	.macro	cpu_midr_match model, rv_min, rv_max, res, tmp1, tmp2, tmp3
++	mrs		\res, midr_el1
++	mov_q		\tmp1, (MIDR_REVISION_MASK | MIDR_VARIANT_MASK)
++	mov_q		\tmp2, MIDR_CPU_MODEL_MASK
++	and		\tmp3, \res, \tmp2	// Extract model
++	and		\tmp1, \res, \tmp1	// rev & variant
++	mov_q		\tmp2, \model
++	cmp		\tmp3, \tmp2
++	cset		\res, eq
++	cbz		\res, .Ldone\@		// Model matches ?
++
++	.if (\rv_min != 0)			// Skip min check if rv_min == 0
++	mov_q		\tmp3, \rv_min
++	cmp		\tmp1, \tmp3
++	cset		\res, ge
++	.endif					// \rv_min != 0
++	/* Skip rv_max check if rv_min == rv_max && rv_min != 0 */
++	.if ((\rv_min != \rv_max) || \rv_min == 0)
++	mov_q		\tmp2, \rv_max
++	cmp		\tmp1, \tmp2
++	cset		\tmp2, le
++	and		\res, \res, \tmp2
++	.endif
++.Ldone\@:
++	.endm
++
+ #endif	/* __ASM_ASSEMBLER_H */
+diff --git a/arch/arm64/include/asm/cputype.h b/arch/arm64/include/asm/cputype.h
+index 350c76a1d15b..8e32a6f28f00 100644
+--- a/arch/arm64/include/asm/cputype.h
++++ b/arch/arm64/include/asm/cputype.h
+@@ -83,6 +83,7 @@
+ #define ARM_CPU_PART_CORTEX_A53		0xD03
+ #define ARM_CPU_PART_CORTEX_A73		0xD09
+ #define ARM_CPU_PART_CORTEX_A75		0xD0A
++#define ARM_CPU_PART_CORTEX_A55		0xD05
+ 
+ #define APM_CPU_PART_POTENZA		0x000
+ 
+@@ -102,6 +103,7 @@
+ #define MIDR_CORTEX_A72 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A72)
+ #define MIDR_CORTEX_A73 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A73)
+ #define MIDR_CORTEX_A75 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A75)
++#define MIDR_CORTEX_A55 MIDR_CPU_MODEL(ARM_CPU_IMP_ARM, ARM_CPU_PART_CORTEX_A55)
+ #define MIDR_THUNDERX	MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX)
+ #define MIDR_THUNDERX_81XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_81XX)
+ #define MIDR_THUNDERX_83XX MIDR_CPU_MODEL(ARM_CPU_IMP_CAVIUM, CAVIUM_CPU_PART_THUNDERX_83XX)
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index c0af47617299..5244440baea4 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -448,6 +448,11 @@ ENTRY(__cpu_setup)
+ 	cbz	x9, 2f
+ 	cmp	x9, #2
+ 	b.lt	1f
++#ifdef CONFIG_ARM64_ERRATUM_1024718
++	/* Disable hardware DBM on Cortex-A55 r0p0, r0p1 & r1p0 */
++	cpu_midr_match MIDR_CORTEX_A55, MIDR_CPU_VAR_REV(0, 0), MIDR_CPU_VAR_REV(1, 0), x1, x2, x3, x4
++	cbnz	x1, 1f
++#endif
+ 	orr	x10, x10, #TCR_HD		// hardware Dirty flag update
+ 1:	orr	x10, x10, #TCR_HA		// hardware Access flag update
+ 2:
+diff --git a/arch/x86/kernel/tsc.c b/arch/x86/kernel/tsc.c
+index 3615c0f255e9..c375b0aef877 100644
+--- a/arch/x86/kernel/tsc.c
++++ b/arch/x86/kernel/tsc.c
+@@ -1067,6 +1067,7 @@ static struct clocksource clocksource_tsc_early = {
+ 	.resume			= tsc_resume,
+ 	.mark_unstable		= tsc_cs_mark_unstable,
+ 	.tick_stable		= tsc_cs_tick_stable,
++	.list			= LIST_HEAD_INIT(clocksource_tsc_early.list),
+ };
+ 
+ /*
+@@ -1086,6 +1087,7 @@ static struct clocksource clocksource_tsc = {
+ 	.resume			= tsc_resume,
+ 	.mark_unstable		= tsc_cs_mark_unstable,
+ 	.tick_stable		= tsc_cs_tick_stable,
++	.list			= LIST_HEAD_INIT(clocksource_tsc.list),
+ };
+ 
+ void mark_tsc_unstable(char *reason)
+@@ -1098,13 +1100,9 @@ void mark_tsc_unstable(char *reason)
+ 		clear_sched_clock_stable();
+ 	disable_sched_clock_irqtime();
+ 	pr_info("Marking TSC unstable due to %s\n", reason);
+-	/* Change only the rating, when not registered */
+-	if (clocksource_tsc.mult) {
+-		clocksource_mark_unstable(&clocksource_tsc);
+-	} else {
+-		clocksource_tsc.flags |= CLOCK_SOURCE_UNSTABLE;
+-		clocksource_tsc.rating = 0;
+-	}
++
++	clocksource_mark_unstable(&clocksource_tsc_early);
++	clocksource_mark_unstable(&clocksource_tsc);
+ }
+ 
+ EXPORT_SYMBOL_GPL(mark_tsc_unstable);
+@@ -1205,7 +1203,7 @@ static void tsc_refine_calibration_work(struct work_struct *work)
+ 
+ 	/* Don't bother refining TSC on unstable systems */
+ 	if (tsc_unstable)
+-		return;
++		goto unreg;
+ 
+ 	/*
+ 	 * Since the work is started early in boot, we may be
+@@ -1258,11 +1256,12 @@ static void tsc_refine_calibration_work(struct work_struct *work)
+ 
+ out:
+ 	if (tsc_unstable)
+-		return;
++		goto unreg;
+ 
+ 	if (boot_cpu_has(X86_FEATURE_ART))
+ 		art_related_clocksource = &clocksource_tsc;
+ 	clocksource_register_khz(&clocksource_tsc, tsc_khz);
++unreg:
+ 	clocksource_unregister(&clocksource_tsc_early);
+ }
+ 
+@@ -1272,8 +1271,8 @@ static int __init init_tsc_clocksource(void)
+ 	if (!boot_cpu_has(X86_FEATURE_TSC) || tsc_disabled > 0 || !tsc_khz)
+ 		return 0;
+ 
+-	if (check_tsc_unstable())
+-		return 0;
++	if (tsc_unstable)
++		goto unreg;
+ 
+ 	if (tsc_clocksource_reliable)
+ 		clocksource_tsc.flags &= ~CLOCK_SOURCE_MUST_VERIFY;
+@@ -1289,6 +1288,7 @@ static int __init init_tsc_clocksource(void)
+ 		if (boot_cpu_has(X86_FEATURE_ART))
+ 			art_related_clocksource = &clocksource_tsc;
+ 		clocksource_register_khz(&clocksource_tsc, tsc_khz);
++unreg:
+ 		clocksource_unregister(&clocksource_tsc_early);
+ 		return 0;
+ 	}
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index 391dda8d43b7..7cf470a3755f 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -1455,23 +1455,6 @@ static void start_sw_tscdeadline(struct kvm_lapic *apic)
+ 	local_irq_restore(flags);
+ }
+ 
+-static void start_sw_period(struct kvm_lapic *apic)
+-{
+-	if (!apic->lapic_timer.period)
+-		return;
+-
+-	if (apic_lvtt_oneshot(apic) &&
+-	    ktime_after(ktime_get(),
+-			apic->lapic_timer.target_expiration)) {
+-		apic_timer_expired(apic);
+-		return;
+-	}
+-
+-	hrtimer_start(&apic->lapic_timer.timer,
+-		apic->lapic_timer.target_expiration,
+-		HRTIMER_MODE_ABS_PINNED);
+-}
+-
+ static void update_target_expiration(struct kvm_lapic *apic, uint32_t old_divisor)
+ {
+ 	ktime_t now, remaining;
+@@ -1538,6 +1521,26 @@ static void advance_periodic_target_expiration(struct kvm_lapic *apic)
+ 				apic->lapic_timer.period);
+ }
+ 
++static void start_sw_period(struct kvm_lapic *apic)
++{
++	if (!apic->lapic_timer.period)
++		return;
++
++	if (ktime_after(ktime_get(),
++			apic->lapic_timer.target_expiration)) {
++		apic_timer_expired(apic);
++
++		if (apic_lvtt_oneshot(apic))
++			return;
++
++		advance_periodic_target_expiration(apic);
++	}
++
++	hrtimer_start(&apic->lapic_timer.timer,
++		apic->lapic_timer.target_expiration,
++		HRTIMER_MODE_ABS_PINNED);
++}
++
+ bool kvm_lapic_hv_timer_in_use(struct kvm_vcpu *vcpu)
+ {
+ 	if (!lapic_in_kernel(vcpu))
+diff --git a/drivers/acpi/button.c b/drivers/acpi/button.c
+index e1eee7a60fad..f1cc4f9d31cd 100644
+--- a/drivers/acpi/button.c
++++ b/drivers/acpi/button.c
+@@ -635,4 +635,26 @@ module_param_call(lid_init_state,
+ 		  NULL, 0644);
+ MODULE_PARM_DESC(lid_init_state, "Behavior for reporting LID initial state");
+ 
+-module_acpi_driver(acpi_button_driver);
++static int acpi_button_register_driver(struct acpi_driver *driver)
++{
++	/*
++	 * Modules such as nouveau.ko and i915.ko have a link time dependency
++	 * on acpi_lid_open(), and would therefore not be loadable on ACPI
++	 * capable kernels booted in non-ACPI mode if the return value of
++	 * acpi_bus_register_driver() is returned from here with ACPI disabled
++	 * when this driver is built as a module.
++	 */
++	if (acpi_disabled)
++		return 0;
++
++	return acpi_bus_register_driver(driver);
++}
++
++static void acpi_button_unregister_driver(struct acpi_driver *driver)
++{
++	if (!acpi_disabled)
++		acpi_bus_unregister_driver(driver);
++}
++
++module_driver(acpi_button_driver, acpi_button_register_driver,
++	       acpi_button_unregister_driver);
+diff --git a/drivers/gpu/drm/bridge/dumb-vga-dac.c b/drivers/gpu/drm/bridge/dumb-vga-dac.c
+index de5e7dee7ad6..2e6c61d9b8ea 100644
+--- a/drivers/gpu/drm/bridge/dumb-vga-dac.c
++++ b/drivers/gpu/drm/bridge/dumb-vga-dac.c
+@@ -55,7 +55,9 @@ static int dumb_vga_get_modes(struct drm_connector *connector)
+ 	}
+ 
+ 	drm_mode_connector_update_edid_property(connector, edid);
+-	return drm_add_edid_modes(connector, edid);
++	ret = drm_add_edid_modes(connector, edid);
++	kfree(edid);
++	return ret;
+ 
+ fallback:
+ 	/*
+diff --git a/drivers/gpu/drm/vc4/vc4_crtc.c b/drivers/gpu/drm/vc4/vc4_crtc.c
+index ce1e3b9e14c9..75f379c67a31 100644
+--- a/drivers/gpu/drm/vc4/vc4_crtc.c
++++ b/drivers/gpu/drm/vc4/vc4_crtc.c
+@@ -735,6 +735,7 @@ static irqreturn_t vc4_crtc_irq_handler(int irq, void *data)
+ struct vc4_async_flip_state {
+ 	struct drm_crtc *crtc;
+ 	struct drm_framebuffer *fb;
++	struct drm_framebuffer *old_fb;
+ 	struct drm_pending_vblank_event *event;
+ 
+ 	struct vc4_seqno_cb cb;
+@@ -764,6 +765,23 @@ vc4_async_page_flip_complete(struct vc4_seqno_cb *cb)
+ 
+ 	drm_crtc_vblank_put(crtc);
+ 	drm_framebuffer_put(flip_state->fb);
++
++	/* Decrement the BO usecnt in order to keep the inc/dec calls balanced
++	 * when the planes are updated through the async update path.
++	 * FIXME: we should move to generic async-page-flip when it's
++	 * available, so that we can get rid of this hand-made cleanup_fb()
++	 * logic.
++	 */
++	if (flip_state->old_fb) {
++		struct drm_gem_cma_object *cma_bo;
++		struct vc4_bo *bo;
++
++		cma_bo = drm_fb_cma_get_gem_obj(flip_state->old_fb, 0);
++		bo = to_vc4_bo(&cma_bo->base);
++		vc4_bo_dec_usecnt(bo);
++		drm_framebuffer_put(flip_state->old_fb);
++	}
++
+ 	kfree(flip_state);
+ 
+ 	up(&vc4->async_modeset);
+@@ -788,9 +806,22 @@ static int vc4_async_page_flip(struct drm_crtc *crtc,
+ 	struct drm_gem_cma_object *cma_bo = drm_fb_cma_get_gem_obj(fb, 0);
+ 	struct vc4_bo *bo = to_vc4_bo(&cma_bo->base);
+ 
++	/* Increment the BO usecnt here, so that we never end up with an
++	 * unbalanced number of vc4_bo_{dec,inc}_usecnt() calls when the
++	 * plane is later updated through the non-async path.
++	 * FIXME: we should move to generic async-page-flip when it's
++	 * available, so that we can get rid of this hand-made prepare_fb()
++	 * logic.
++	 */
++	ret = vc4_bo_inc_usecnt(bo);
++	if (ret)
++		return ret;
++
+ 	flip_state = kzalloc(sizeof(*flip_state), GFP_KERNEL);
+-	if (!flip_state)
++	if (!flip_state) {
++		vc4_bo_dec_usecnt(bo);
+ 		return -ENOMEM;
++	}
+ 
+ 	drm_framebuffer_get(fb);
+ 	flip_state->fb = fb;
+@@ -801,10 +832,23 @@ static int vc4_async_page_flip(struct drm_crtc *crtc,
+ 	ret = down_interruptible(&vc4->async_modeset);
+ 	if (ret) {
+ 		drm_framebuffer_put(fb);
++		vc4_bo_dec_usecnt(bo);
+ 		kfree(flip_state);
+ 		return ret;
+ 	}
+ 
++	/* Save the current FB before it's replaced by the new one in
++	 * drm_atomic_set_fb_for_plane(). We'll need the old FB in
++	 * vc4_async_page_flip_complete() to decrement the BO usecnt and keep
++	 * it consistent.
++	 * FIXME: we should move to generic async-page-flip when it's
++	 * available, so that we can get rid of this hand-made cleanup_fb()
++	 * logic.
++	 */
++	flip_state->old_fb = plane->state->fb;
++	if (flip_state->old_fb)
++		drm_framebuffer_get(flip_state->old_fb);
++
+ 	WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+ 	/* Immediately update the plane's legacy fb pointer, so that later
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+index 3c824fd7cbf3..af9fd49c22e6 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_kms.c
+@@ -2598,6 +2598,7 @@ void vmw_kms_helper_resource_finish(struct vmw_validation_ctx *ctx,
+ 		vmw_kms_helper_buffer_finish(res->dev_priv, NULL, ctx->buf,
+ 					     out_fence, NULL);
+ 
++	vmw_dmabuf_unreference(&ctx->buf);
+ 	vmw_resource_unreserve(res, false, NULL, 0);
+ 	mutex_unlock(&res->dev_priv->cmdbuf_mutex);
+ }
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index 5c21ae237f82..006e9c0e1ea3 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -678,7 +678,7 @@ static ssize_t ucma_resolve_ip(struct ucma_file *file,
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
+-	if (!rdma_addr_size_in6(&cmd.src_addr) ||
++	if ((cmd.src_addr.sin6_family && !rdma_addr_size_in6(&cmd.src_addr)) ||
+ 	    !rdma_addr_size_in6(&cmd.dst_addr))
+ 		return -EINVAL;
+ 
+diff --git a/drivers/infiniband/hw/cxgb4/cq.c b/drivers/infiniband/hw/cxgb4/cq.c
+index 6f2b26126c64..2be2e1ac1b5f 100644
+--- a/drivers/infiniband/hw/cxgb4/cq.c
++++ b/drivers/infiniband/hw/cxgb4/cq.c
+@@ -315,7 +315,7 @@ static void advance_oldest_read(struct t4_wq *wq)
+  * Deal with out-of-order and/or completions that complete
+  * prior unsignalled WRs.
+  */
+-void c4iw_flush_hw_cq(struct c4iw_cq *chp)
++void c4iw_flush_hw_cq(struct c4iw_cq *chp, struct c4iw_qp *flush_qhp)
+ {
+ 	struct t4_cqe *hw_cqe, *swcqe, read_cqe;
+ 	struct c4iw_qp *qhp;
+@@ -339,6 +339,13 @@ void c4iw_flush_hw_cq(struct c4iw_cq *chp)
+ 		if (qhp == NULL)
+ 			goto next_cqe;
+ 
++		if (flush_qhp != qhp) {
++			spin_lock(&qhp->lock);
++
++			if (qhp->wq.flushed == 1)
++				goto next_cqe;
++		}
++
+ 		if (CQE_OPCODE(hw_cqe) == FW_RI_TERMINATE)
+ 			goto next_cqe;
+ 
+@@ -390,6 +397,8 @@ void c4iw_flush_hw_cq(struct c4iw_cq *chp)
+ next_cqe:
+ 		t4_hwcq_consume(&chp->cq);
+ 		ret = t4_next_hw_cqe(&chp->cq, &hw_cqe);
++		if (qhp && flush_qhp != qhp)
++			spin_unlock(&qhp->lock);
+ 	}
+ }
+ 
+diff --git a/drivers/infiniband/hw/cxgb4/device.c b/drivers/infiniband/hw/cxgb4/device.c
+index 7a9d0de89d6a..01d94cd88916 100644
+--- a/drivers/infiniband/hw/cxgb4/device.c
++++ b/drivers/infiniband/hw/cxgb4/device.c
+@@ -875,6 +875,11 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
+ 
+ 	rdev->status_page->db_off = 0;
+ 
++	init_completion(&rdev->rqt_compl);
++	init_completion(&rdev->pbl_compl);
++	kref_init(&rdev->rqt_kref);
++	kref_init(&rdev->pbl_kref);
++
+ 	return 0;
+ err_free_status_page_and_wr_log:
+ 	if (c4iw_wr_log && rdev->wr_log)
+@@ -893,13 +898,15 @@ static int c4iw_rdev_open(struct c4iw_rdev *rdev)
+ 
+ static void c4iw_rdev_close(struct c4iw_rdev *rdev)
+ {
+-	destroy_workqueue(rdev->free_workq);
+ 	kfree(rdev->wr_log);
+ 	c4iw_release_dev_ucontext(rdev, &rdev->uctx);
+ 	free_page((unsigned long)rdev->status_page);
+ 	c4iw_pblpool_destroy(rdev);
+ 	c4iw_rqtpool_destroy(rdev);
++	wait_for_completion(&rdev->pbl_compl);
++	wait_for_completion(&rdev->rqt_compl);
+ 	c4iw_ocqp_pool_destroy(rdev);
++	destroy_workqueue(rdev->free_workq);
+ 	c4iw_destroy_resource(&rdev->resource);
+ }
+ 
+diff --git a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index cc929002c05e..831027717121 100644
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@ -185,6 +185,10 @@ struct c4iw_rdev {
+ 	struct wr_log_entry *wr_log;
+ 	int wr_log_size;
+ 	struct workqueue_struct *free_workq;
++	struct completion rqt_compl;
++	struct completion pbl_compl;
++	struct kref rqt_kref;
++	struct kref pbl_kref;
+ };
+ 
+ static inline int c4iw_fatal_error(struct c4iw_rdev *rdev)
+@@ -1049,7 +1053,7 @@ u32 c4iw_pblpool_alloc(struct c4iw_rdev *rdev, int size);
+ void c4iw_pblpool_free(struct c4iw_rdev *rdev, u32 addr, int size);
+ u32 c4iw_ocqp_pool_alloc(struct c4iw_rdev *rdev, int size);
+ void c4iw_ocqp_pool_free(struct c4iw_rdev *rdev, u32 addr, int size);
+-void c4iw_flush_hw_cq(struct c4iw_cq *chp);
++void c4iw_flush_hw_cq(struct c4iw_cq *chp, struct c4iw_qp *flush_qhp);
+ void c4iw_count_rcqes(struct t4_cq *cq, struct t4_wq *wq, int *count);
+ int c4iw_ep_disconnect(struct c4iw_ep *ep, int abrupt, gfp_t gfp);
+ int c4iw_flush_rq(struct t4_wq *wq, struct t4_cq *cq, int count);
+diff --git a/drivers/infiniband/hw/cxgb4/qp.c b/drivers/infiniband/hw/cxgb4/qp.c
+index de77b6027d69..ae167b686608 100644
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -1343,12 +1343,12 @@ static void __flush_qp(struct c4iw_qp *qhp, struct c4iw_cq *rchp,
+ 	qhp->wq.flushed = 1;
+ 	t4_set_wq_in_error(&qhp->wq);
+ 
+-	c4iw_flush_hw_cq(rchp);
++	c4iw_flush_hw_cq(rchp, qhp);
+ 	c4iw_count_rcqes(&rchp->cq, &qhp->wq, &count);
+ 	rq_flushed = c4iw_flush_rq(&qhp->wq, &rchp->cq, count);
+ 
+ 	if (schp != rchp)
+-		c4iw_flush_hw_cq(schp);
++		c4iw_flush_hw_cq(schp, qhp);
+ 	sq_flushed = c4iw_flush_sq(qhp);
+ 
+ 	spin_unlock(&qhp->lock);
+diff --git a/drivers/infiniband/hw/cxgb4/resource.c b/drivers/infiniband/hw/cxgb4/resource.c
+index 3cf25997ed2b..0ef25ae05e6f 100644
+--- a/drivers/infiniband/hw/cxgb4/resource.c
++++ b/drivers/infiniband/hw/cxgb4/resource.c
+@@ -260,12 +260,22 @@ u32 c4iw_pblpool_alloc(struct c4iw_rdev *rdev, int size)
+ 		rdev->stats.pbl.cur += roundup(size, 1 << MIN_PBL_SHIFT);
+ 		if (rdev->stats.pbl.cur > rdev->stats.pbl.max)
+ 			rdev->stats.pbl.max = rdev->stats.pbl.cur;
++		kref_get(&rdev->pbl_kref);
+ 	} else
+ 		rdev->stats.pbl.fail++;
+ 	mutex_unlock(&rdev->stats.lock);
+ 	return (u32)addr;
+ }
+ 
++static void destroy_pblpool(struct kref *kref)
++{
++	struct c4iw_rdev *rdev;
++
++	rdev = container_of(kref, struct c4iw_rdev, pbl_kref);
++	gen_pool_destroy(rdev->pbl_pool);
++	complete(&rdev->pbl_compl);
++}
++
+ void c4iw_pblpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ {
+ 	pr_debug("addr 0x%x size %d\n", addr, size);
+@@ -273,6 +283,7 @@ void c4iw_pblpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ 	rdev->stats.pbl.cur -= roundup(size, 1 << MIN_PBL_SHIFT);
+ 	mutex_unlock(&rdev->stats.lock);
+ 	gen_pool_free(rdev->pbl_pool, (unsigned long)addr, size);
++	kref_put(&rdev->pbl_kref, destroy_pblpool);
+ }
+ 
+ int c4iw_pblpool_create(struct c4iw_rdev *rdev)
+@@ -310,7 +321,7 @@ int c4iw_pblpool_create(struct c4iw_rdev *rdev)
+ 
+ void c4iw_pblpool_destroy(struct c4iw_rdev *rdev)
+ {
+-	gen_pool_destroy(rdev->pbl_pool);
++	kref_put(&rdev->pbl_kref, destroy_pblpool);
+ }
+ 
+ /*
+@@ -331,12 +342,22 @@ u32 c4iw_rqtpool_alloc(struct c4iw_rdev *rdev, int size)
+ 		rdev->stats.rqt.cur += roundup(size << 6, 1 << MIN_RQT_SHIFT);
+ 		if (rdev->stats.rqt.cur > rdev->stats.rqt.max)
+ 			rdev->stats.rqt.max = rdev->stats.rqt.cur;
++		kref_get(&rdev->rqt_kref);
+ 	} else
+ 		rdev->stats.rqt.fail++;
+ 	mutex_unlock(&rdev->stats.lock);
+ 	return (u32)addr;
+ }
+ 
++static void destroy_rqtpool(struct kref *kref)
++{
++	struct c4iw_rdev *rdev;
++
++	rdev = container_of(kref, struct c4iw_rdev, rqt_kref);
++	gen_pool_destroy(rdev->rqt_pool);
++	complete(&rdev->rqt_compl);
++}
++
+ void c4iw_rqtpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ {
+ 	pr_debug("addr 0x%x size %d\n", addr, size << 6);
+@@ -344,6 +365,7 @@ void c4iw_rqtpool_free(struct c4iw_rdev *rdev, u32 addr, int size)
+ 	rdev->stats.rqt.cur -= roundup(size << 6, 1 << MIN_RQT_SHIFT);
+ 	mutex_unlock(&rdev->stats.lock);
+ 	gen_pool_free(rdev->rqt_pool, (unsigned long)addr, size << 6);
++	kref_put(&rdev->rqt_kref, destroy_rqtpool);
+ }
+ 
+ int c4iw_rqtpool_create(struct c4iw_rdev *rdev)
+@@ -380,7 +402,7 @@ int c4iw_rqtpool_create(struct c4iw_rdev *rdev)
+ 
+ void c4iw_rqtpool_destroy(struct c4iw_rdev *rdev)
+ {
+-	gen_pool_destroy(rdev->rqt_pool);
++	kref_put(&rdev->rqt_kref, destroy_rqtpool);
+ }
+ 
+ /*
+diff --git a/drivers/infiniband/hw/hfi1/driver.c b/drivers/infiniband/hw/hfi1/driver.c
+index addc68e83606..78f7c4e743dd 100644
+--- a/drivers/infiniband/hw/hfi1/driver.c
++++ b/drivers/infiniband/hw/hfi1/driver.c
+@@ -432,31 +432,43 @@ void hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
+ 			       bool do_cnp)
+ {
+ 	struct hfi1_ibport *ibp = to_iport(qp->ibqp.device, qp->port_num);
++	struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+ 	struct ib_other_headers *ohdr = pkt->ohdr;
+ 	struct ib_grh *grh = pkt->grh;
+ 	u32 rqpn = 0, bth1;
+-	u16 pkey, rlid, dlid = ib_get_dlid(pkt->hdr);
++	u16 pkey;
++	u32 rlid, slid, dlid = 0;
+ 	u8 hdr_type, sc, svc_type;
+ 	bool is_mcast = false;
+ 
++	/* can be called from prescan */
+ 	if (pkt->etype == RHF_RCV_TYPE_BYPASS) {
+ 		is_mcast = hfi1_is_16B_mcast(dlid);
+ 		pkey = hfi1_16B_get_pkey(pkt->hdr);
+ 		sc = hfi1_16B_get_sc(pkt->hdr);
++		dlid = hfi1_16B_get_dlid(pkt->hdr);
++		slid = hfi1_16B_get_slid(pkt->hdr);
+ 		hdr_type = HFI1_PKT_TYPE_16B;
+ 	} else {
+ 		is_mcast = (dlid > be16_to_cpu(IB_MULTICAST_LID_BASE)) &&
+ 			   (dlid != be16_to_cpu(IB_LID_PERMISSIVE));
+ 		pkey = ib_bth_get_pkey(ohdr);
+ 		sc = hfi1_9B_get_sc5(pkt->hdr, pkt->rhf);
++		dlid = ib_get_dlid(pkt->hdr);
++		slid = ib_get_slid(pkt->hdr);
+ 		hdr_type = HFI1_PKT_TYPE_9B;
+ 	}
+ 
+ 	switch (qp->ibqp.qp_type) {
++	case IB_QPT_UD:
++		dlid = ppd->lid;
++		rlid = slid;
++		rqpn = ib_get_sqpn(pkt->ohdr);
++		svc_type = IB_CC_SVCTYPE_UD;
++		break;
+ 	case IB_QPT_SMI:
+ 	case IB_QPT_GSI:
+-	case IB_QPT_UD:
+-		rlid = ib_get_slid(pkt->hdr);
++		rlid = slid;
+ 		rqpn = ib_get_sqpn(pkt->ohdr);
+ 		svc_type = IB_CC_SVCTYPE_UD;
+ 		break;
+@@ -481,7 +493,6 @@ void hfi1_process_ecn_slowpath(struct rvt_qp *qp, struct hfi1_packet *pkt,
+ 					      dlid, rlid, sc, grh);
+ 
+ 	if (!is_mcast && (bth1 & IB_BECN_SMASK)) {
+-		struct hfi1_pportdata *ppd = ppd_from_ibp(ibp);
+ 		u32 lqpn = bth1 & RVT_QPN_MASK;
+ 		u8 sl = ibp->sc_to_sl[sc];
+ 
+diff --git a/drivers/infiniband/hw/hfi1/hfi.h b/drivers/infiniband/hw/hfi1/hfi.h
+index 90bc8c76d2ca..43050006f301 100644
+--- a/drivers/infiniband/hw/hfi1/hfi.h
++++ b/drivers/infiniband/hw/hfi1/hfi.h
+@@ -1538,13 +1538,13 @@ void set_link_ipg(struct hfi1_pportdata *ppd);
+ void process_becn(struct hfi1_pportdata *ppd, u8 sl, u32 rlid, u32 lqpn,
+ 		  u32 rqpn, u8 svc_type);
+ void return_cnp(struct hfi1_ibport *ibp, struct rvt_qp *qp, u32 remote_qpn,
+-		u32 pkey, u32 slid, u32 dlid, u8 sc5,
++		u16 pkey, u32 slid, u32 dlid, u8 sc5,
+ 		const struct ib_grh *old_grh);
+ void return_cnp_16B(struct hfi1_ibport *ibp, struct rvt_qp *qp,
+-		    u32 remote_qpn, u32 pkey, u32 slid, u32 dlid,
++		    u32 remote_qpn, u16 pkey, u32 slid, u32 dlid,
+ 		    u8 sc5, const struct ib_grh *old_grh);
+ typedef void (*hfi1_handle_cnp)(struct hfi1_ibport *ibp, struct rvt_qp *qp,
+-				u32 remote_qpn, u32 pkey, u32 slid, u32 dlid,
++				u32 remote_qpn, u16 pkey, u32 slid, u32 dlid,
+ 				u8 sc5, const struct ib_grh *old_grh);
+ 
+ #define PKEY_CHECK_INVALID -1
+@@ -2438,7 +2438,7 @@ static inline void hfi1_make_16b_hdr(struct hfi1_16b_header *hdr,
+ 		((slid >> OPA_16B_SLID_SHIFT) << OPA_16B_SLID_HIGH_SHIFT);
+ 	lrh2 = (lrh2 & ~OPA_16B_DLID_MASK) |
+ 		((dlid >> OPA_16B_DLID_SHIFT) << OPA_16B_DLID_HIGH_SHIFT);
+-	lrh2 = (lrh2 & ~OPA_16B_PKEY_MASK) | (pkey << OPA_16B_PKEY_SHIFT);
++	lrh2 = (lrh2 & ~OPA_16B_PKEY_MASK) | ((u32)pkey << OPA_16B_PKEY_SHIFT);
+ 	lrh2 = (lrh2 & ~OPA_16B_L4_MASK) | l4;
+ 
+ 	hdr->lrh[0] = lrh0;
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index 33eba2356742..b27fe75c7102 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -1265,6 +1265,8 @@ struct hfi1_devdata *hfi1_alloc_devdata(struct pci_dev *pdev, size_t extra)
+ 		return ERR_PTR(-ENOMEM);
+ 	dd->num_pports = nports;
+ 	dd->pport = (struct hfi1_pportdata *)(dd + 1);
++	dd->pcidev = pdev;
++	pci_set_drvdata(pdev, dd);
+ 
+ 	INIT_LIST_HEAD(&dd->list);
+ 	idr_preload(GFP_KERNEL);
+diff --git a/drivers/infiniband/hw/hfi1/pcie.c b/drivers/infiniband/hw/hfi1/pcie.c
+index 83d66e862207..c1c982908b4b 100644
+--- a/drivers/infiniband/hw/hfi1/pcie.c
++++ b/drivers/infiniband/hw/hfi1/pcie.c
+@@ -163,9 +163,6 @@ int hfi1_pcie_ddinit(struct hfi1_devdata *dd, struct pci_dev *pdev)
+ 	resource_size_t addr;
+ 	int ret = 0;
+ 
+-	dd->pcidev = pdev;
+-	pci_set_drvdata(pdev, dd);
+-
+ 	addr = pci_resource_start(pdev, 0);
+ 	len = pci_resource_len(pdev, 0);
+ 
+diff --git a/drivers/infiniband/hw/hfi1/ruc.c b/drivers/infiniband/hw/hfi1/ruc.c
+index 3daa94bdae3a..c0071ca4147a 100644
+--- a/drivers/infiniband/hw/hfi1/ruc.c
++++ b/drivers/infiniband/hw/hfi1/ruc.c
+@@ -733,6 +733,20 @@ static inline void hfi1_make_ruc_bth(struct rvt_qp *qp,
+ 	ohdr->bth[2] = cpu_to_be32(bth2);
+ }
+ 
++/**
++ * hfi1_make_ruc_header_16B - build a 16B header
++ * @qp: the queue pair
++ * @ohdr: a pointer to the destination header memory
++ * @bth0: bth0 passed in from the RC/UC builder
++ * @bth2: bth2 passed in from the RC/UC builder
++ * @middle: non zero implies indicates ahg "could" be used
++ * @ps: the current packet state
++ *
++ * This routine may disarm ahg under these situations:
++ * - packet needs a GRH
++ * - BECN needed
++ * - migration state not IB_MIG_MIGRATED
++ */
+ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
+ 					    struct ib_other_headers *ohdr,
+ 					    u32 bth0, u32 bth2, int middle,
+@@ -777,6 +791,12 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
+ 	else
+ 		middle = 0;
+ 
++	if (qp->s_flags & RVT_S_ECN) {
++		qp->s_flags &= ~RVT_S_ECN;
++		/* we recently received a FECN, so return a BECN */
++		becn = true;
++		middle = 0;
++	}
+ 	if (middle)
+ 		build_ahg(qp, bth2);
+ 	else
+@@ -784,11 +804,6 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
+ 
+ 	bth0 |= pkey;
+ 	bth0 |= extra_bytes << 20;
+-	if (qp->s_flags & RVT_S_ECN) {
+-		qp->s_flags &= ~RVT_S_ECN;
+-		/* we recently received a FECN, so return a BECN */
+-		becn = true;
+-	}
+ 	hfi1_make_ruc_bth(qp, ohdr, bth0, bth1, bth2);
+ 
+ 	if (!ppd->lid)
+@@ -806,6 +821,20 @@ static inline void hfi1_make_ruc_header_16B(struct rvt_qp *qp,
+ 			  pkey, becn, 0, l4, priv->s_sc);
+ }
+ 
++/**
++ * hfi1_make_ruc_header_9B - build a 9B header
++ * @qp: the queue pair
++ * @ohdr: a pointer to the destination header memory
++ * @bth0: bth0 passed in from the RC/UC builder
++ * @bth2: bth2 passed in from the RC/UC builder
++ * @middle: non zero implies indicates ahg "could" be used
++ * @ps: the current packet state
++ *
++ * This routine may disarm ahg under these situations:
++ * - packet needs a GRH
++ * - BECN needed
++ * - migration state not IB_MIG_MIGRATED
++ */
+ static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
+ 					   struct ib_other_headers *ohdr,
+ 					   u32 bth0, u32 bth2, int middle,
+@@ -839,6 +868,12 @@ static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
+ 	else
+ 		middle = 0;
+ 
++	if (qp->s_flags & RVT_S_ECN) {
++		qp->s_flags &= ~RVT_S_ECN;
++		/* we recently received a FECN, so return a BECN */
++		bth1 |= (IB_BECN_MASK << IB_BECN_SHIFT);
++		middle = 0;
++	}
+ 	if (middle)
+ 		build_ahg(qp, bth2);
+ 	else
+@@ -846,11 +881,6 @@ static inline void hfi1_make_ruc_header_9B(struct rvt_qp *qp,
+ 
+ 	bth0 |= pkey;
+ 	bth0 |= extra_bytes << 20;
+-	if (qp->s_flags & RVT_S_ECN) {
+-		qp->s_flags &= ~RVT_S_ECN;
+-		/* we recently received a FECN, so return a BECN */
+-		bth1 |= (IB_BECN_MASK << IB_BECN_SHIFT);
+-	}
+ 	hfi1_make_ruc_bth(qp, ohdr, bth0, bth1, bth2);
+ 	hfi1_make_ib_hdr(&ps->s_txreq->phdr.hdr.ibh,
+ 			 lrh0,
+diff --git a/drivers/infiniband/hw/hfi1/ud.c b/drivers/infiniband/hw/hfi1/ud.c
+index bcf3b0bebac8..69c17a5ef038 100644
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@ -628,7 +628,7 @@ int hfi1_lookup_pkey_idx(struct hfi1_ibport *ibp, u16 pkey)
+ }
+ 
+ void return_cnp_16B(struct hfi1_ibport *ibp, struct rvt_qp *qp,
+-		    u32 remote_qpn, u32 pkey, u32 slid, u32 dlid,
++		    u32 remote_qpn, u16 pkey, u32 slid, u32 dlid,
+ 		    u8 sc5, const struct ib_grh *old_grh)
+ {
+ 	u64 pbc, pbc_flags = 0;
+@@ -687,7 +687,7 @@ void return_cnp_16B(struct hfi1_ibport *ibp, struct rvt_qp *qp,
+ }
+ 
+ void return_cnp(struct hfi1_ibport *ibp, struct rvt_qp *qp, u32 remote_qpn,
+-		u32 pkey, u32 slid, u32 dlid, u8 sc5,
++		u16 pkey, u32 slid, u32 dlid, u8 sc5,
+ 		const struct ib_grh *old_grh)
+ {
+ 	u64 pbc, pbc_flags = 0;
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index f045491f2c14..93af6b704d06 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -673,7 +673,8 @@ static int set_qp_rss(struct mlx4_ib_dev *dev, struct mlx4_ib_rss *rss_ctx,
+ 					  MLX4_IB_RX_HASH_SRC_PORT_TCP	|
+ 					  MLX4_IB_RX_HASH_DST_PORT_TCP	|
+ 					  MLX4_IB_RX_HASH_SRC_PORT_UDP	|
+-					  MLX4_IB_RX_HASH_DST_PORT_UDP)) {
++					  MLX4_IB_RX_HASH_DST_PORT_UDP  |
++					  MLX4_IB_RX_HASH_INNER)) {
+ 		pr_debug("RX Hash fields_mask has unsupported mask (0x%llx)\n",
+ 			 ucmd->rx_hash_fields_mask);
+ 		return (-EOPNOTSUPP);
+diff --git a/drivers/infiniband/hw/mlx5/Kconfig b/drivers/infiniband/hw/mlx5/Kconfig
+index bce263b92821..fb4d77be019b 100644
+--- a/drivers/infiniband/hw/mlx5/Kconfig
++++ b/drivers/infiniband/hw/mlx5/Kconfig
+@@ -1,6 +1,7 @@
+ config MLX5_INFINIBAND
+ 	tristate "Mellanox Connect-IB HCA support"
+ 	depends on NETDEVICES && ETHERNET && PCI && MLX5_CORE
++	depends on INFINIBAND_USER_ACCESS || INFINIBAND_USER_ACCESS=n
+ 	---help---
+ 	  This driver provides low-level InfiniBand support for
+ 	  Mellanox Connect-IB PCI Express host channel adapters (HCAs).
+diff --git a/drivers/infiniband/hw/mlx5/mr.c b/drivers/infiniband/hw/mlx5/mr.c
+index 6857c61bdee1..deccd91c2361 100644
+--- a/drivers/infiniband/hw/mlx5/mr.c
++++ b/drivers/infiniband/hw/mlx5/mr.c
+@@ -836,25 +836,28 @@ static int mr_umem_get(struct ib_pd *pd, u64 start, u64 length,
+ 		       int *order)
+ {
+ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++	struct ib_umem *u;
+ 	int err;
+ 
+-	*umem = ib_umem_get(pd->uobject->context, start, length,
+-			    access_flags, 0);
+-	err = PTR_ERR_OR_ZERO(*umem);
++	*umem = NULL;
++
++	u = ib_umem_get(pd->uobject->context, start, length, access_flags, 0);
++	err = PTR_ERR_OR_ZERO(u);
+ 	if (err) {
+-		*umem = NULL;
+-		mlx5_ib_err(dev, "umem get failed (%d)\n", err);
++		mlx5_ib_dbg(dev, "umem get failed (%d)\n", err);
+ 		return err;
+ 	}
+ 
+-	mlx5_ib_cont_pages(*umem, start, MLX5_MKEY_PAGE_SHIFT_MASK, npages,
++	mlx5_ib_cont_pages(u, start, MLX5_MKEY_PAGE_SHIFT_MASK, npages,
+ 			   page_shift, ncont, order);
+ 	if (!*npages) {
+ 		mlx5_ib_warn(dev, "avoid zero region\n");
+-		ib_umem_release(*umem);
++		ib_umem_release(u);
+ 		return -EINVAL;
+ 	}
+ 
++	*umem = u;
++
+ 	mlx5_ib_dbg(dev, "npages %d, ncont %d, order %d, page_shift %d\n",
+ 		    *npages, *ncont, *order, *page_shift);
+ 
+@@ -1343,13 +1346,12 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+ 	int access_flags = flags & IB_MR_REREG_ACCESS ?
+ 			    new_access_flags :
+ 			    mr->access_flags;
+-	u64 addr = (flags & IB_MR_REREG_TRANS) ? virt_addr : mr->umem->address;
+-	u64 len = (flags & IB_MR_REREG_TRANS) ? length : mr->umem->length;
+ 	int page_shift = 0;
+ 	int upd_flags = 0;
+ 	int npages = 0;
+ 	int ncont = 0;
+ 	int order = 0;
++	u64 addr, len;
+ 	int err;
+ 
+ 	mlx5_ib_dbg(dev, "start 0x%llx, virt_addr 0x%llx, length 0x%llx, access_flags 0x%x\n",
+@@ -1357,6 +1359,17 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+ 
+ 	atomic_sub(mr->npages, &dev->mdev->priv.reg_pages);
+ 
++	if (!mr->umem)
++		return -EINVAL;
++
++	if (flags & IB_MR_REREG_TRANS) {
++		addr = virt_addr;
++		len = length;
++	} else {
++		addr = mr->umem->address;
++		len = mr->umem->length;
++	}
++
+ 	if (flags != IB_MR_REREG_PD) {
+ 		/*
+ 		 * Replace umem. This needs to be done whether or not UMR is
+@@ -1364,6 +1377,7 @@ int mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
+ 		 */
+ 		flags |= IB_MR_REREG_TRANS;
+ 		ib_umem_release(mr->umem);
++		mr->umem = NULL;
+ 		err = mr_umem_get(pd, addr, len, access_flags, &mr->umem,
+ 				  &npages, &page_shift, &ncont, &order);
+ 		if (err < 0) {
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 6c424afea25f..5f0144fee2ac 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -256,7 +256,11 @@ static int set_rq_size(struct mlx5_ib_dev *dev, struct ib_qp_cap *cap,
+ 	} else {
+ 		if (ucmd) {
+ 			qp->rq.wqe_cnt = ucmd->rq_wqe_count;
++			if (ucmd->rq_wqe_shift > BITS_PER_BYTE * sizeof(ucmd->rq_wqe_shift))
++				return -EINVAL;
+ 			qp->rq.wqe_shift = ucmd->rq_wqe_shift;
++			if ((1 << qp->rq.wqe_shift) / sizeof(struct mlx5_wqe_data_seg) < qp->wq_sig)
++				return -EINVAL;
+ 			qp->rq.max_gs = (1 << qp->rq.wqe_shift) / sizeof(struct mlx5_wqe_data_seg) - qp->wq_sig;
+ 			qp->rq.max_post = qp->rq.wqe_cnt;
+ 		} else {
+@@ -2420,18 +2424,18 @@ enum {
+ 
+ static int ib_rate_to_mlx5(struct mlx5_ib_dev *dev, u8 rate)
+ {
+-	if (rate == IB_RATE_PORT_CURRENT) {
++	if (rate == IB_RATE_PORT_CURRENT)
+ 		return 0;
+-	} else if (rate < IB_RATE_2_5_GBPS || rate > IB_RATE_300_GBPS) {
++
++	if (rate < IB_RATE_2_5_GBPS || rate > IB_RATE_300_GBPS)
+ 		return -EINVAL;
+-	} else {
+-		while (rate != IB_RATE_2_5_GBPS &&
+-		       !(1 << (rate + MLX5_STAT_RATE_OFFSET) &
+-			 MLX5_CAP_GEN(dev->mdev, stat_rate_support)))
+-			--rate;
+-	}
+ 
+-	return rate + MLX5_STAT_RATE_OFFSET;
++	while (rate != IB_RATE_PORT_CURRENT &&
++	       !(1 << (rate + MLX5_STAT_RATE_OFFSET) &
++		 MLX5_CAP_GEN(dev->mdev, stat_rate_support)))
++		--rate;
++
++	return rate ? rate + MLX5_STAT_RATE_OFFSET : rate;
+ }
+ 
+ static int modify_raw_packet_eth_prio(struct mlx5_core_dev *dev,
+diff --git a/drivers/input/input-leds.c b/drivers/input/input-leds.c
+index 766bf2660116..5f04b2d94635 100644
+--- a/drivers/input/input-leds.c
++++ b/drivers/input/input-leds.c
+@@ -88,6 +88,7 @@ static int input_leds_connect(struct input_handler *handler,
+ 			      const struct input_device_id *id)
+ {
+ 	struct input_leds *leds;
++	struct input_led *led;
+ 	unsigned int num_leds;
+ 	unsigned int led_code;
+ 	int led_no;
+@@ -119,14 +120,13 @@ static int input_leds_connect(struct input_handler *handler,
+ 
+ 	led_no = 0;
+ 	for_each_set_bit(led_code, dev->ledbit, LED_CNT) {
+-		struct input_led *led = &leds->leds[led_no];
++		if (!input_led_info[led_code].name)
++			continue;
+ 
++		led = &leds->leds[led_no];
+ 		led->handle = &leds->handle;
+ 		led->code = led_code;
+ 
+-		if (!input_led_info[led_code].name)
+-			continue;
+-
+ 		led->cdev.name = kasprintf(GFP_KERNEL, "%s::%s",
+ 					   dev_name(&dev->dev),
+ 					   input_led_info[led_code].name);
+diff --git a/drivers/input/touchscreen/atmel_mxt_ts.c b/drivers/input/touchscreen/atmel_mxt_ts.c
+index 7659bc48f1db..429b694405c7 100644
+--- a/drivers/input/touchscreen/atmel_mxt_ts.c
++++ b/drivers/input/touchscreen/atmel_mxt_ts.c
+@@ -3030,6 +3030,15 @@ static const struct dmi_system_id mxt_dmi_table[] = {
+ 		},
+ 		.driver_data = samus_platform_data,
+ 	},
++	{
++		/* Samsung Chromebook Pro */
++		.ident = "Samsung Chromebook Pro",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Google"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Caroline"),
++		},
++		.driver_data = samus_platform_data,
++	},
+ 	{
+ 		/* Other Google Chromebooks */
+ 		.ident = "Chromebook",
+diff --git a/drivers/irqchip/qcom-irq-combiner.c b/drivers/irqchip/qcom-irq-combiner.c
+index f31265937439..7f0c0be322e0 100644
+--- a/drivers/irqchip/qcom-irq-combiner.c
++++ b/drivers/irqchip/qcom-irq-combiner.c
+@@ -1,4 +1,4 @@
+-/* Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
++/* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 and
+@@ -68,7 +68,7 @@ static void combiner_handle_irq(struct irq_desc *desc)
+ 
+ 		bit = readl_relaxed(combiner->regs[reg].addr);
+ 		status = bit & combiner->regs[reg].enabled;
+-		if (!status)
++		if (bit && !status)
+ 			pr_warn_ratelimited("Unexpected IRQ on CPU%d: (%08x %08lx %p)\n",
+ 					    smp_processor_id(), bit,
+ 					    combiner->regs[reg].enabled,
+diff --git a/drivers/net/usb/qmi_wwan.c b/drivers/net/usb/qmi_wwan.c
+index c853e7410f5a..51c68fc416fa 100644
+--- a/drivers/net/usb/qmi_wwan.c
++++ b/drivers/net/usb/qmi_wwan.c
+@@ -1098,6 +1098,7 @@ static const struct usb_device_id products[] = {
+ 	{QMI_FIXED_INTF(0x05c6, 0x9080, 8)},
+ 	{QMI_FIXED_INTF(0x05c6, 0x9083, 3)},
+ 	{QMI_FIXED_INTF(0x05c6, 0x9084, 4)},
++	{QMI_FIXED_INTF(0x05c6, 0x90b2, 3)},    /* ublox R410M */
+ 	{QMI_FIXED_INTF(0x05c6, 0x920d, 0)},
+ 	{QMI_FIXED_INTF(0x05c6, 0x920d, 5)},
+ 	{QMI_QUIRK_SET_DTR(0x05c6, 0x9625, 4)},	/* YUGA CLM920-NC5 */
+diff --git a/drivers/net/wireless/realtek/rtlwifi/btcoexist/halbtcoutsrc.c b/drivers/net/wireless/realtek/rtlwifi/btcoexist/halbtcoutsrc.c
+index 1404729441a2..71f9eee8fbe5 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/btcoexist/halbtcoutsrc.c
++++ b/drivers/net/wireless/realtek/rtlwifi/btcoexist/halbtcoutsrc.c
+@@ -158,16 +158,6 @@ static u8 halbtc_get_wifi_central_chnl(struct btc_coexist *btcoexist)
+ 
+ static u8 rtl_get_hwpg_single_ant_path(struct rtl_priv *rtlpriv)
+ {
+-	struct rtl_mod_params *mod_params = rtlpriv->cfg->mod_params;
+-
+-	/* override ant_num / ant_path */
+-	if (mod_params->ant_sel) {
+-		rtlpriv->btcoexist.btc_info.ant_num =
+-			(mod_params->ant_sel == 1 ? ANT_X2 : ANT_X1);
+-
+-		rtlpriv->btcoexist.btc_info.single_ant_path =
+-			(mod_params->ant_sel == 1 ? 0 : 1);
+-	}
+ 	return rtlpriv->btcoexist.btc_info.single_ant_path;
+ }
+ 
+@@ -178,7 +168,6 @@ static u8 rtl_get_hwpg_bt_type(struct rtl_priv *rtlpriv)
+ 
+ static u8 rtl_get_hwpg_ant_num(struct rtl_priv *rtlpriv)
+ {
+-	struct rtl_mod_params *mod_params = rtlpriv->cfg->mod_params;
+ 	u8 num;
+ 
+ 	if (rtlpriv->btcoexist.btc_info.ant_num == ANT_X2)
+@@ -186,10 +175,6 @@ static u8 rtl_get_hwpg_ant_num(struct rtl_priv *rtlpriv)
+ 	else
+ 		num = 1;
+ 
+-	/* override ant_num / ant_path */
+-	if (mod_params->ant_sel)
+-		num = (mod_params->ant_sel == 1 ? ANT_X2 : ANT_X1) + 1;
+-
+ 	return num;
+ }
+ 
+diff --git a/drivers/net/wireless/realtek/rtlwifi/rtl8723be/hw.c b/drivers/net/wireless/realtek/rtlwifi/rtl8723be/hw.c
+index e7bbbc95cdb1..b4f3f91b590e 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/rtl8723be/hw.c
++++ b/drivers/net/wireless/realtek/rtlwifi/rtl8723be/hw.c
+@@ -848,6 +848,9 @@ static bool _rtl8723be_init_mac(struct ieee80211_hw *hw)
+ 		return false;
+ 	}
+ 
++	if (rtlpriv->cfg->ops->get_btc_status())
++		rtlpriv->btcoexist.btc_ops->btc_power_on_setting(rtlpriv);
++
+ 	bytetmp = rtl_read_byte(rtlpriv, REG_MULTI_FUNC_CTRL);
+ 	rtl_write_byte(rtlpriv, REG_MULTI_FUNC_CTRL, bytetmp | BIT(3));
+ 
+@@ -2696,21 +2699,21 @@ void rtl8723be_read_bt_coexist_info_from_hwpg(struct ieee80211_hw *hw,
+ 		rtlpriv->btcoexist.btc_info.bt_type = BT_RTL8723B;
+ 		rtlpriv->btcoexist.btc_info.ant_num = (value & 0x1);
+ 		rtlpriv->btcoexist.btc_info.single_ant_path =
+-			 (value & 0x40);	/*0xc3[6]*/
++			 (value & 0x40 ? ANT_AUX : ANT_MAIN);	/*0xc3[6]*/
+ 	} else {
+ 		rtlpriv->btcoexist.btc_info.btcoexist = 0;
+ 		rtlpriv->btcoexist.btc_info.bt_type = BT_RTL8723B;
+ 		rtlpriv->btcoexist.btc_info.ant_num = ANT_X2;
+-		rtlpriv->btcoexist.btc_info.single_ant_path = 0;
++		rtlpriv->btcoexist.btc_info.single_ant_path = ANT_MAIN;
+ 	}
+ 
+ 	/* override ant_num / ant_path */
+ 	if (mod_params->ant_sel) {
+ 		rtlpriv->btcoexist.btc_info.ant_num =
+-			(mod_params->ant_sel == 1 ? ANT_X2 : ANT_X1);
++			(mod_params->ant_sel == 1 ? ANT_X1 : ANT_X2);
+ 
+ 		rtlpriv->btcoexist.btc_info.single_ant_path =
+-			(mod_params->ant_sel == 1 ? 0 : 1);
++			(mod_params->ant_sel == 1 ? ANT_AUX : ANT_MAIN);
+ 	}
+ }
+ 
+diff --git a/drivers/net/wireless/realtek/rtlwifi/wifi.h b/drivers/net/wireless/realtek/rtlwifi/wifi.h
+index 46dcb7fef195..36683364dbc7 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/wifi.h
++++ b/drivers/net/wireless/realtek/rtlwifi/wifi.h
+@@ -2759,6 +2759,11 @@ enum bt_ant_num {
+ 	ANT_X1 = 1,
+ };
+ 
++enum bt_ant_path {
++	ANT_MAIN = 0,
++	ANT_AUX = 1,
++};
++
+ enum bt_co_type {
+ 	BT_2WIRE = 0,
+ 	BT_ISSC_3WIRE = 1,
+diff --git a/drivers/platform/x86/Kconfig b/drivers/platform/x86/Kconfig
+index 51ebc5a6053f..51a1b49760ea 100644
+--- a/drivers/platform/x86/Kconfig
++++ b/drivers/platform/x86/Kconfig
+@@ -154,7 +154,7 @@ config DELL_LAPTOP
+ 	depends on ACPI_VIDEO || ACPI_VIDEO = n
+ 	depends on RFKILL || RFKILL = n
+ 	depends on SERIO_I8042
+-	select DELL_SMBIOS
++	depends on DELL_SMBIOS
+ 	select POWER_SUPPLY
+ 	select LEDS_CLASS
+ 	select NEW_LEDS
+diff --git a/drivers/platform/x86/asus-wireless.c b/drivers/platform/x86/asus-wireless.c
+index d4aeac3477f5..f086469ea740 100644
+--- a/drivers/platform/x86/asus-wireless.c
++++ b/drivers/platform/x86/asus-wireless.c
+@@ -178,8 +178,10 @@ static int asus_wireless_remove(struct acpi_device *adev)
+ {
+ 	struct asus_wireless_data *data = acpi_driver_data(adev);
+ 
+-	if (data->wq)
++	if (data->wq) {
++		devm_led_classdev_unregister(&adev->dev, &data->led);
+ 		destroy_workqueue(data->wq);
++	}
+ 	return 0;
+ }
+ 
+diff --git a/drivers/target/target_core_iblock.c b/drivers/target/target_core_iblock.c
+index 07c814c42648..60429011292a 100644
+--- a/drivers/target/target_core_iblock.c
++++ b/drivers/target/target_core_iblock.c
+@@ -427,8 +427,8 @@ iblock_execute_zero_out(struct block_device *bdev, struct se_cmd *cmd)
+ {
+ 	struct se_device *dev = cmd->se_dev;
+ 	struct scatterlist *sg = &cmd->t_data_sg[0];
+-	unsigned char *buf, zero = 0x00, *p = &zero;
+-	int rc, ret;
++	unsigned char *buf, *not_zero;
++	int ret;
+ 
+ 	buf = kmap(sg_page(sg)) + sg->offset;
+ 	if (!buf)
+@@ -437,10 +437,10 @@ iblock_execute_zero_out(struct block_device *bdev, struct se_cmd *cmd)
+ 	 * Fall back to block_execute_write_same() slow-path if
+ 	 * incoming WRITE_SAME payload does not contain zeros.
+ 	 */
+-	rc = memcmp(buf, p, cmd->data_length);
++	not_zero = memchr_inv(buf, 0x00, cmd->data_length);
+ 	kunmap(sg_page(sg));
+ 
+-	if (rc)
++	if (not_zero)
+ 		return TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
+ 
+ 	ret = blkdev_issue_zeroout(bdev,
+diff --git a/drivers/usb/core/config.c b/drivers/usb/core/config.c
+index c821b4b9647e..7b5cb28ffb35 100644
+--- a/drivers/usb/core/config.c
++++ b/drivers/usb/core/config.c
+@@ -191,7 +191,9 @@ static const unsigned short full_speed_maxpacket_maxes[4] = {
+ static const unsigned short high_speed_maxpacket_maxes[4] = {
+ 	[USB_ENDPOINT_XFER_CONTROL] = 64,
+ 	[USB_ENDPOINT_XFER_ISOC] = 1024,
+-	[USB_ENDPOINT_XFER_BULK] = 512,
++
++	/* Bulk should be 512, but some devices use 1024: we will warn below */
++	[USB_ENDPOINT_XFER_BULK] = 1024,
+ 	[USB_ENDPOINT_XFER_INT] = 1024,
+ };
+ static const unsigned short super_speed_maxpacket_maxes[4] = {
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 100454c514d5..726ae915c03a 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -1424,7 +1424,7 @@ static int dwc3_gadget_ep_dequeue(struct usb_ep *ep,
+ 					dwc->lock);
+ 
+ 			if (!r->trb)
+-				goto out1;
++				goto out0;
+ 
+ 			if (r->num_pending_sgs) {
+ 				struct dwc3_trb *trb;
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 5d37700ae4b0..b60a02c50b89 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -3548,6 +3548,7 @@ static void xhci_free_dev(struct usb_hcd *hcd, struct usb_device *udev)
+ 		del_timer_sync(&virt_dev->eps[i].stop_cmd_timer);
+ 	}
+ 	xhci_debugfs_remove_slot(xhci, udev->slot_id);
++	virt_dev->udev = NULL;
+ 	ret = xhci_disable_slot(xhci, udev->slot_id);
+ 	if (ret)
+ 		xhci_free_virt_device(xhci, udev->slot_id);
+diff --git a/drivers/usb/musb/musb_gadget.c b/drivers/usb/musb/musb_gadget.c
+index 293e5b8da565..21b87a077c69 100644
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ -417,7 +417,6 @@ void musb_g_tx(struct musb *musb, u8 epnum)
+ 	req = next_request(musb_ep);
+ 	request = &req->request;
+ 
+-	trace_musb_req_tx(req);
+ 	csr = musb_readw(epio, MUSB_TXCSR);
+ 	musb_dbg(musb, "<== %s, txcsr %04x", musb_ep->end_point.name, csr);
+ 
+@@ -456,6 +455,8 @@ void musb_g_tx(struct musb *musb, u8 epnum)
+ 		u8	is_dma = 0;
+ 		bool	short_packet = false;
+ 
++		trace_musb_req_tx(req);
++
+ 		if (dma && (csr & MUSB_TXCSR_DMAENAB)) {
+ 			is_dma = 1;
+ 			csr |= MUSB_TXCSR_P_WZC_BITS;
+diff --git a/drivers/usb/musb/musb_host.c b/drivers/usb/musb/musb_host.c
+index 45ed32c2cba9..0ee0c6d7f194 100644
+--- a/drivers/usb/musb/musb_host.c
++++ b/drivers/usb/musb/musb_host.c
+@@ -996,7 +996,9 @@ static void musb_bulk_nak_timeout(struct musb *musb, struct musb_hw_ep *ep,
+ 			/* set tx_reinit and schedule the next qh */
+ 			ep->tx_reinit = 1;
+ 		}
+-		musb_start_urb(musb, is_in, next_qh);
++
++		if (next_qh)
++			musb_start_urb(musb, is_in, next_qh);
+ 	}
+ }
+ 
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 2d8d9150da0c..10c7ab427a52 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -233,6 +233,8 @@ static void option_instat_callback(struct urb *urb);
+ /* These Quectel products use Qualcomm's vendor ID */
+ #define QUECTEL_PRODUCT_UC20			0x9003
+ #define QUECTEL_PRODUCT_UC15			0x9090
++/* These u-blox products use Qualcomm's vendor ID */
++#define UBLOX_PRODUCT_R410M			0x90b2
+ /* These Yuga products use Qualcomm's vendor ID */
+ #define YUGA_PRODUCT_CLM920_NC5			0x9625
+ 
+@@ -548,151 +550,15 @@ static void option_instat_callback(struct urb *urb);
+ #define WETELECOM_PRODUCT_6802			0x6802
+ #define WETELECOM_PRODUCT_WMD300		0x6803
+ 
+-struct option_blacklist_info {
+-	/* bitmask of interface numbers blacklisted for send_setup */
+-	const unsigned long sendsetup;
+-	/* bitmask of interface numbers that are reserved */
+-	const unsigned long reserved;
+-};
+ 
+-static const struct option_blacklist_info four_g_w14_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1),
+-};
++/* Device flags */
+ 
+-static const struct option_blacklist_info four_g_w100_blacklist = {
+-	.sendsetup = BIT(1) | BIT(2),
+-	.reserved = BIT(3),
+-};
++/* Interface does not support modem-control requests */
++#define NCTRL(ifnum)	((BIT(ifnum) & 0xff) << 8)
+ 
+-static const struct option_blacklist_info alcatel_x200_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1),
+-	.reserved = BIT(4),
+-};
++/* Interface is reserved */
++#define RSVD(ifnum)	((BIT(ifnum) & 0xff) << 0)
+ 
+-static const struct option_blacklist_info zte_0037_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1),
+-};
+-
+-static const struct option_blacklist_info zte_k3765_z_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1) | BIT(2),
+-	.reserved = BIT(4),
+-};
+-
+-static const struct option_blacklist_info zte_ad3812_z_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1) | BIT(2),
+-};
+-
+-static const struct option_blacklist_info zte_mc2718_z_blacklist = {
+-	.sendsetup = BIT(1) | BIT(2) | BIT(3) | BIT(4),
+-};
+-
+-static const struct option_blacklist_info zte_mc2716_z_blacklist = {
+-	.sendsetup = BIT(1) | BIT(2) | BIT(3),
+-};
+-
+-static const struct option_blacklist_info zte_me3620_mbim_blacklist = {
+-	.reserved = BIT(2) | BIT(3) | BIT(4),
+-};
+-
+-static const struct option_blacklist_info zte_me3620_xl_blacklist = {
+-	.reserved = BIT(3) | BIT(4) | BIT(5),
+-};
+-
+-static const struct option_blacklist_info zte_zm8620_x_blacklist = {
+-	.reserved = BIT(3) | BIT(4) | BIT(5),
+-};
+-
+-static const struct option_blacklist_info huawei_cdc12_blacklist = {
+-	.reserved = BIT(1) | BIT(2),
+-};
+-
+-static const struct option_blacklist_info net_intf0_blacklist = {
+-	.reserved = BIT(0),
+-};
+-
+-static const struct option_blacklist_info net_intf1_blacklist = {
+-	.reserved = BIT(1),
+-};
+-
+-static const struct option_blacklist_info net_intf2_blacklist = {
+-	.reserved = BIT(2),
+-};
+-
+-static const struct option_blacklist_info net_intf3_blacklist = {
+-	.reserved = BIT(3),
+-};
+-
+-static const struct option_blacklist_info net_intf4_blacklist = {
+-	.reserved = BIT(4),
+-};
+-
+-static const struct option_blacklist_info net_intf5_blacklist = {
+-	.reserved = BIT(5),
+-};
+-
+-static const struct option_blacklist_info net_intf6_blacklist = {
+-	.reserved = BIT(6),
+-};
+-
+-static const struct option_blacklist_info zte_mf626_blacklist = {
+-	.sendsetup = BIT(0) | BIT(1),
+-	.reserved = BIT(4),
+-};
+-
+-static const struct option_blacklist_info zte_1255_blacklist = {
+-	.reserved = BIT(3) | BIT(4),
+-};
+-
+-static const struct option_blacklist_info simcom_sim7100e_blacklist = {
+-	.reserved = BIT(5) | BIT(6),
+-};
+-
+-static const struct option_blacklist_info telit_me910_blacklist = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(1) | BIT(3),
+-};
+-
+-static const struct option_blacklist_info telit_me910_dual_modem_blacklist = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(3),
+-};
+-
+-static const struct option_blacklist_info telit_le910_blacklist = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(1) | BIT(2),
+-};
+-
+-static const struct option_blacklist_info telit_le920_blacklist = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(1) | BIT(5),
+-};
+-
+-static const struct option_blacklist_info telit_le920a4_blacklist_1 = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(1),
+-};
+-
+-static const struct option_blacklist_info telit_le922_blacklist_usbcfg0 = {
+-	.sendsetup = BIT(2),
+-	.reserved = BIT(0) | BIT(1) | BIT(3),
+-};
+-
+-static const struct option_blacklist_info telit_le922_blacklist_usbcfg3 = {
+-	.sendsetup = BIT(0),
+-	.reserved = BIT(1) | BIT(2) | BIT(3),
+-};
+-
+-static const struct option_blacklist_info cinterion_rmnet2_blacklist = {
+-	.reserved = BIT(4) | BIT(5),
+-};
+-
+-static const struct option_blacklist_info yuga_clm920_nc5_blacklist = {
+-	.reserved = BIT(1) | BIT(4),
+-};
+-
+-static const struct option_blacklist_info quectel_ep06_blacklist = {
+-	.reserved = BIT(4) | BIT(5),
+-};
+ 
+ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(OPTION_VENDOR_ID, OPTION_PRODUCT_COLT) },
+@@ -726,26 +592,26 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GKE) },
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GLE) },
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, 0xea42),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x1c05, USB_CLASS_COMM, 0x02, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x1c1f, USB_CLASS_COMM, 0x02, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x1c23, USB_CLASS_COMM, 0x02, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E173, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E173S6, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E1750, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x1441, USB_CLASS_COMM, 0x02, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x1442, USB_CLASS_COMM, 0x02, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4505, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
++	  .driver_info = RSVD(1) | RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3765, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
++	  .driver_info = RSVD(1) | RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0x14ac, 0xff, 0xff, 0xff),	/* Huawei E1820 */
+-		.driver_info = (kernel_ulong_t) &net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4605, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
++	  .driver_info = RSVD(1) | RSVD(2) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0xff, 0xff, 0xff) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0xff, 0x01, 0x01) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, 0xff, 0x01, 0x02) },
+@@ -1190,67 +1056,70 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(KYOCERA_VENDOR_ID, KYOCERA_PRODUCT_KPC680) },
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x6000)}, /* ZTE AC8700 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(QUALCOMM_VENDOR_ID, 0x6001, 0xff, 0xff, 0xff), /* 4G LTE usb-modem U901 */
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x6613)}, /* Onda H600/ZTE MF330 */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x0023)}, /* ONYX 3G device */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x9000)}, /* SIMCom SIM5218 */
+ 	/* Quectel products using Qualcomm vendor ID */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, QUECTEL_PRODUCT_UC15)},
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, QUECTEL_PRODUCT_UC20),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	/* Yuga products use Qualcomm vendor ID */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, YUGA_PRODUCT_CLM920_NC5),
+-	  .driver_info = (kernel_ulong_t)&yuga_clm920_nc5_blacklist },
++	  .driver_info = RSVD(1) | RSVD(4) },
++	/* u-blox products using Qualcomm vendor ID */
++	{ USB_DEVICE(QUALCOMM_VENDOR_ID, UBLOX_PRODUCT_R410M),
++	  .driver_info = RSVD(1) | RSVD(3) },
+ 	/* Quectel products using Quectel vendor ID */
+ 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_EC21),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_EC25),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_BG96),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_EP06),
+-	  .driver_info = (kernel_ulong_t)&quectel_ep06_blacklist },
++	  .driver_info = RSVD(4) | RSVD(5) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6001) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_300) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6003),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6004) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6005) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CGU_628A) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHE_628S),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_301),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_628),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_628S) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CDU_680) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CDU_685A) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_720S),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7002),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_629K),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7004),
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7005) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CGU_629),
+-	  .driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_629S),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CHU_720I),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7212),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7213),
+-	  .driver_info = (kernel_ulong_t)&net_intf0_blacklist },
++	  .driver_info = RSVD(0) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7251),
+-	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7252),
+-	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_7253),
+-	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_UC864E) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_UC864G) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_CC864_DUAL) },
+@@ -1258,38 +1127,38 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_DE910_DUAL) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_UE910_V2) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG0),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
++	  .driver_info = RSVD(0) | RSVD(1) | NCTRL(2) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG1),
+-		.driver_info = (kernel_ulong_t)&telit_le910_blacklist },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG2),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG3),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) | RSVD(3) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG5, 0xff),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
++	  .driver_info = RSVD(0) | RSVD(1) | NCTRL(2) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_ME910),
+-		.driver_info = (kernel_ulong_t)&telit_me910_blacklist },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_ME910_DUAL_MODEM),
+-		.driver_info = (kernel_ulong_t)&telit_me910_dual_modem_blacklist },
++	  .driver_info = NCTRL(0) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910),
+-		.driver_info = (kernel_ulong_t)&telit_le910_blacklist },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910_USBCFG4),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920),
+-		.driver_info = (kernel_ulong_t)&telit_le920_blacklist },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(5) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1207) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1208),
+-		.driver_info = (kernel_ulong_t)&telit_le920a4_blacklist_1 },
++	  .driver_info = NCTRL(0) | RSVD(1) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1211),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) | RSVD(3) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1212),
+-		.driver_info = (kernel_ulong_t)&telit_le920a4_blacklist_1 },
++	  .driver_info = NCTRL(0) | RSVD(1) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1213, 0xff) },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920A4_1214),
+-		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	  .driver_info = NCTRL(0) | RSVD(1) | RSVD(2) | RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MF622, 0xff, 0xff, 0xff) }, /* ZTE WCDMA products */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0002, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0003, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0004, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0005, 0xff, 0xff, 0xff) },
+@@ -1305,58 +1174,58 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0010, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0011, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0012, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0013, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MF628, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0016, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0017, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0018, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0019, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0020, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0021, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0022, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0023, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0024, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0025, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0028, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0029, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0030, 0xff, 0xff, 0xff) },
+-	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MF626, 0xff,
+-	  0xff, 0xff), .driver_info = (kernel_ulong_t)&zte_mf626_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MF626, 0xff, 0xff, 0xff),
++	  .driver_info = NCTRL(0) | NCTRL(1) | RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0032, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0033, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0034, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0037, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&zte_0037_blacklist },
++	  .driver_info = NCTRL(0) | NCTRL(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0038, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0039, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0040, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0042, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0043, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0044, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0048, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0049, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0050, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0051, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0052, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0054, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0055, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0056, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0057, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0058, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0061, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0062, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0063, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0064, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0065, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0066, 0xff, 0xff, 0xff) },
+@@ -1381,26 +1250,26 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0096, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0097, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0104, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0105, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0106, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0108, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0113, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0117, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0118, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0121, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0122, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0123, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0124, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0125, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0126, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0128, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0135, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0136, 0xff, 0xff, 0xff) },
+@@ -1416,50 +1285,50 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0155, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0156, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0157, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0158, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0159, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0161, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0162, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0164, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0165, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0167, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0189, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0191, 0xff, 0xff, 0xff), /* ZTE EuFi890 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0196, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0197, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0199, 0xff, 0xff, 0xff), /* ZTE MF820S */
+-	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0200, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0201, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0254, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0257, 0xff, 0xff, 0xff), /* ZTE MF821 */
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0265, 0xff, 0xff, 0xff), /* ONDA MT8205 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0284, 0xff, 0xff, 0xff), /* ZTE MF880 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0317, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0326, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0330, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0395, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0412, 0xff, 0xff, 0xff), /* Telewell TW-LTE 4G */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0414, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0417, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1008, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1010, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1012, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1018, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1021, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1057, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1058, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1059, 0xff, 0xff, 0xff) },
+@@ -1576,23 +1445,23 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1170, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1244, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1245, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1246, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1247, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1248, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1249, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1250, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1251, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1252, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1253, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1254, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1255, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&zte_1255_blacklist },
++	  .driver_info = RSVD(3) | RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1256, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1257, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1258, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1259, 0xff, 0xff, 0xff) },
+@@ -1607,7 +1476,7 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1268, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1269, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1270, 0xff, 0xff, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1271, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1272, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1273, 0xff, 0xff, 0xff) },
+@@ -1643,17 +1512,17 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1303, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1333, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1401, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1402, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1424, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1425, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1426, 0xff, 0xff, 0xff),  /* ZTE MF91 */
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1428, 0xff, 0xff, 0xff),  /* Telewell TW-LTE 4G v2 */
+-		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1533, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1534, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1535, 0xff, 0xff, 0xff) },
+@@ -1671,8 +1540,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1596, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1598, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1600, 0xff, 0xff, 0xff) },
+-	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x2002, 0xff,
+-	  0xff, 0xff), .driver_info = (kernel_ulong_t)&zte_k3765_z_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x2002, 0xff, 0xff, 0xff),
++	  .driver_info = NCTRL(0) | NCTRL(1) | NCTRL(2) | RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x2003, 0xff, 0xff, 0xff) },
+ 
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0014, 0xff, 0xff, 0xff) }, /* ZTE CDMA products */
+@@ -1683,20 +1552,20 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0073, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0094, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0130, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	  .driver_info = RSVD(1) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0133, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0141, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0147, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0152, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0168, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0170, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0176, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0178, 0xff, 0xff, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff42, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff43, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff44, 0xff, 0xff, 0xff) },
+@@ -1848,19 +1717,19 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_AC2726, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_AC8710T, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MC2718, 0xff, 0xff, 0xff),
+-	 .driver_info = (kernel_ulong_t)&zte_mc2718_z_blacklist },
++	 .driver_info = NCTRL(1) | NCTRL(2) | NCTRL(3) | NCTRL(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_AD3812, 0xff, 0xff, 0xff),
+-	 .driver_info = (kernel_ulong_t)&zte_ad3812_z_blacklist },
++	 .driver_info = NCTRL(0) | NCTRL(1) | NCTRL(2) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, ZTE_PRODUCT_MC2716, 0xff, 0xff, 0xff),
+-	 .driver_info = (kernel_ulong_t)&zte_mc2716_z_blacklist },
++	 .driver_info = NCTRL(1) | NCTRL(2) | NCTRL(3) },
+ 	{ USB_DEVICE(ZTE_VENDOR_ID, ZTE_PRODUCT_ME3620_L),
+-	 .driver_info = (kernel_ulong_t)&zte_me3620_xl_blacklist },
++	 .driver_info = RSVD(3) | RSVD(4) | RSVD(5) },
+ 	{ USB_DEVICE(ZTE_VENDOR_ID, ZTE_PRODUCT_ME3620_MBIM),
+-	 .driver_info = (kernel_ulong_t)&zte_me3620_mbim_blacklist },
++	 .driver_info = RSVD(2) | RSVD(3) | RSVD(4) },
+ 	{ USB_DEVICE(ZTE_VENDOR_ID, ZTE_PRODUCT_ME3620_X),
+-	 .driver_info = (kernel_ulong_t)&zte_me3620_xl_blacklist },
++	 .driver_info = RSVD(3) | RSVD(4) | RSVD(5) },
+ 	{ USB_DEVICE(ZTE_VENDOR_ID, ZTE_PRODUCT_ZM8620_X),
+-	 .driver_info = (kernel_ulong_t)&zte_zm8620_x_blacklist },
++	 .driver_info = RSVD(3) | RSVD(4) | RSVD(5) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff, 0x02, 0x01) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff, 0x02, 0x05) },
+ 	{ USB_VENDOR_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0xff, 0x86, 0x10) },
+@@ -1880,37 +1749,34 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(ALINK_VENDOR_ID, ALINK_PRODUCT_PH300) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ALINK_VENDOR_ID, ALINK_PRODUCT_3GU, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE(ALINK_VENDOR_ID, SIMCOM_PRODUCT_SIM7100E),
+-	  .driver_info = (kernel_ulong_t)&simcom_sim7100e_blacklist },
++	  .driver_info = RSVD(5) | RSVD(6) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, ALCATEL_PRODUCT_X060S_X200),
+-	  .driver_info = (kernel_ulong_t)&alcatel_x200_blacklist
+-	},
++	  .driver_info = NCTRL(0) | NCTRL(1) | RSVD(4) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, ALCATEL_PRODUCT_X220_X500D),
+-	  .driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, 0x0052),
+-	  .driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, 0x00b6),
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, 0x00b7),
+-	  .driver_info = (kernel_ulong_t)&net_intf5_blacklist },
++	  .driver_info = RSVD(5) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, ALCATEL_PRODUCT_L100V),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(ALCATEL_VENDOR_ID, ALCATEL_PRODUCT_L800MA),
+-	  .driver_info = (kernel_ulong_t)&net_intf2_blacklist },
++	  .driver_info = RSVD(2) },
+ 	{ USB_DEVICE(AIRPLUS_VENDOR_ID, AIRPLUS_PRODUCT_MCD650) },
+ 	{ USB_DEVICE(TLAYTECH_VENDOR_ID, TLAYTECH_PRODUCT_TEU800) },
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, FOUR_G_SYSTEMS_PRODUCT_W14),
+-  	  .driver_info = (kernel_ulong_t)&four_g_w14_blacklist
+-  	},
++	  .driver_info = NCTRL(0) | NCTRL(1) },
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, FOUR_G_SYSTEMS_PRODUCT_W100),
+-	  .driver_info = (kernel_ulong_t)&four_g_w100_blacklist
+-	},
++	  .driver_info = NCTRL(1) | NCTRL(2) | RSVD(3) },
+ 	{USB_DEVICE(LONGCHEER_VENDOR_ID, FUJISOFT_PRODUCT_FS040U),
+-	 .driver_info = (kernel_ulong_t)&net_intf3_blacklist},
++	 .driver_info = RSVD(3)},
+ 	{ USB_DEVICE_INTERFACE_CLASS(LONGCHEER_VENDOR_ID, SPEEDUP_PRODUCT_SU9800, 0xff) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(LONGCHEER_VENDOR_ID, 0x9801, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	  .driver_info = RSVD(3) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(LONGCHEER_VENDOR_ID, 0x9803, 0xff),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, ZOOM_PRODUCT_4597) },
+ 	{ USB_DEVICE(LONGCHEER_VENDOR_ID, IBALL_3_5G_CONNECT) },
+ 	{ USB_DEVICE(HAIER_VENDOR_ID, HAIER_PRODUCT_CE100) },
+@@ -1936,14 +1802,14 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(CINTERION_VENDOR_ID, CINTERION_PRODUCT_EU3_E) },
+ 	{ USB_DEVICE(CINTERION_VENDOR_ID, CINTERION_PRODUCT_EU3_P) },
+ 	{ USB_DEVICE(CINTERION_VENDOR_ID, CINTERION_PRODUCT_PH8),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(CINTERION_VENDOR_ID, CINTERION_PRODUCT_AHXX, 0xff) },
+ 	{ USB_DEVICE(CINTERION_VENDOR_ID, CINTERION_PRODUCT_PLXX),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(CINTERION_VENDOR_ID, CINTERION_PRODUCT_PH8_2RMNET, 0xff),
+-		.driver_info = (kernel_ulong_t)&cinterion_rmnet2_blacklist },
++	  .driver_info = RSVD(4) | RSVD(5) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(CINTERION_VENDOR_ID, CINTERION_PRODUCT_PH8_AUDIO, 0xff),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(CINTERION_VENDOR_ID, CINTERION_PRODUCT_AHXX_2RMNET, 0xff) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(CINTERION_VENDOR_ID, CINTERION_PRODUCT_AHXX_AUDIO, 0xff) },
+ 	{ USB_DEVICE(CINTERION_VENDOR_ID, CINTERION_PRODUCT_HC28_MDM) },
+@@ -1953,20 +1819,20 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(SIEMENS_VENDOR_ID, CINTERION_PRODUCT_HC28_MDM) }, /* HC28 enumerates with Siemens or Cinterion VID depending on FW revision */
+ 	{ USB_DEVICE(SIEMENS_VENDOR_ID, CINTERION_PRODUCT_HC28_MDMNET) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD100),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD120),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD140),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD145) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD155),
+-		.driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200),
+-		.driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD160),
+-		.driver_info = (kernel_ulong_t)&net_intf6_blacklist },
++	  .driver_info = RSVD(6) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD500),
+-		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(CELOT_VENDOR_ID, CELOT_PRODUCT_CT680M) }, /* CT-650 CDMA 450 1xEVDO modem */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(SAMSUNG_VENDOR_ID, SAMSUNG_PRODUCT_GT_B3730, USB_CLASS_CDC_DATA, 0x00, 0x00) }, /* Samsung GT-B3730 LTE USB modem.*/
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEM600) },
+@@ -2043,9 +1909,9 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(PETATEL_VENDOR_ID, PETATEL_PRODUCT_NP10T_600E) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(TPLINK_VENDOR_ID, TPLINK_PRODUCT_LTE, 0xff, 0x00, 0x00) },	/* TP-Link LTE Module */
+ 	{ USB_DEVICE(TPLINK_VENDOR_ID, TPLINK_PRODUCT_MA180),
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(TPLINK_VENDOR_ID, 0x9000),					/* TP-Link MA260 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE(CHANGHONG_VENDOR_ID, CHANGHONG_PRODUCT_CH690) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7d01, 0xff) },			/* D-Link DWM-156 (variant) */
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7d02, 0xff) },
+@@ -2053,9 +1919,9 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7d04, 0xff) },			/* D-Link DWM-158 */
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7d0e, 0xff) },			/* D-Link DWM-157 C1 */
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7e19, 0xff),			/* D-Link DWM-221 B1 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_INTERFACE_CLASS(0x2001, 0x7e35, 0xff),			/* D-Link DWM-222 */
+-	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	  .driver_info = RSVD(4) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) }, /* D-Link DWM-152/C1 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/C1 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x7e11, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/A3 */
+@@ -2115,7 +1981,7 @@ static int option_probe(struct usb_serial *serial,
+ 	struct usb_interface_descriptor *iface_desc =
+ 				&serial->interface->cur_altsetting->desc;
+ 	struct usb_device_descriptor *dev_desc = &serial->dev->descriptor;
+-	const struct option_blacklist_info *blacklist;
++	unsigned long device_flags = id->driver_info;
+ 
+ 	/* Never bind to the CD-Rom emulation interface	*/
+ 	if (iface_desc->bInterfaceClass == 0x08)
+@@ -2126,9 +1992,7 @@ static int option_probe(struct usb_serial *serial,
+ 	 * the same class/subclass/protocol as the serial interfaces.  Look at
+ 	 * the Windows driver .INF files for reserved interface numbers.
+ 	 */
+-	blacklist = (void *)id->driver_info;
+-	if (blacklist && test_bit(iface_desc->bInterfaceNumber,
+-						&blacklist->reserved))
++	if (device_flags & RSVD(iface_desc->bInterfaceNumber))
+ 		return -ENODEV;
+ 	/*
+ 	 * Don't bind network interface on Samsung GT-B3730, it is handled by
+@@ -2139,8 +2003,8 @@ static int option_probe(struct usb_serial *serial,
+ 	    iface_desc->bInterfaceClass != USB_CLASS_CDC_DATA)
+ 		return -ENODEV;
+ 
+-	/* Store the blacklist info so we can use it during attach. */
+-	usb_set_serial_data(serial, (void *)blacklist);
++	/* Store the device flags so we can use them during attach. */
++	usb_set_serial_data(serial, (void *)device_flags);
+ 
+ 	return 0;
+ }
+@@ -2148,22 +2012,21 @@ static int option_probe(struct usb_serial *serial,
+ static int option_attach(struct usb_serial *serial)
+ {
+ 	struct usb_interface_descriptor *iface_desc;
+-	const struct option_blacklist_info *blacklist;
+ 	struct usb_wwan_intf_private *data;
++	unsigned long device_flags;
+ 
+ 	data = kzalloc(sizeof(struct usb_wwan_intf_private), GFP_KERNEL);
+ 	if (!data)
+ 		return -ENOMEM;
+ 
+-	/* Retrieve blacklist info stored at probe. */
+-	blacklist = usb_get_serial_data(serial);
++	/* Retrieve device flags stored at probe. */
++	device_flags = (unsigned long)usb_get_serial_data(serial);
+ 
+ 	iface_desc = &serial->interface->cur_altsetting->desc;
+ 
+-	if (!blacklist || !test_bit(iface_desc->bInterfaceNumber,
+-						&blacklist->sendsetup)) {
++	if (!(device_flags & NCTRL(iface_desc->bInterfaceNumber)))
+ 		data->use_send_setup = 1;
+-	}
++
+ 	spin_lock_init(&data->susp_lock);
+ 
+ 	usb_set_serial_data(serial, data);
+diff --git a/drivers/usb/serial/visor.c b/drivers/usb/serial/visor.c
+index f5373ed2cd45..8ddbecc25d89 100644
+--- a/drivers/usb/serial/visor.c
++++ b/drivers/usb/serial/visor.c
+@@ -335,47 +335,48 @@ static int palm_os_3_probe(struct usb_serial *serial,
+ 		goto exit;
+ 	}
+ 
+-	if (retval == sizeof(*connection_info)) {
+-			connection_info = (struct visor_connection_info *)
+-							transfer_buffer;
+-
+-		num_ports = le16_to_cpu(connection_info->num_ports);
+-		for (i = 0; i < num_ports; ++i) {
+-			switch (
+-			   connection_info->connections[i].port_function_id) {
+-			case VISOR_FUNCTION_GENERIC:
+-				string = "Generic";
+-				break;
+-			case VISOR_FUNCTION_DEBUGGER:
+-				string = "Debugger";
+-				break;
+-			case VISOR_FUNCTION_HOTSYNC:
+-				string = "HotSync";
+-				break;
+-			case VISOR_FUNCTION_CONSOLE:
+-				string = "Console";
+-				break;
+-			case VISOR_FUNCTION_REMOTE_FILE_SYS:
+-				string = "Remote File System";
+-				break;
+-			default:
+-				string = "unknown";
+-				break;
+-			}
+-			dev_info(dev, "%s: port %d, is for %s use\n",
+-				serial->type->description,
+-				connection_info->connections[i].port, string);
+-		}
++	if (retval != sizeof(*connection_info)) {
++		dev_err(dev, "Invalid connection information received from device\n");
++		retval = -ENODEV;
++		goto exit;
+ 	}
+-	/*
+-	* Handle devices that report invalid stuff here.
+-	*/
++
++	connection_info = (struct visor_connection_info *)transfer_buffer;
++
++	num_ports = le16_to_cpu(connection_info->num_ports);
++
++	/* Handle devices that report invalid stuff here. */
+ 	if (num_ports == 0 || num_ports > 2) {
+ 		dev_warn(dev, "%s: No valid connect info available\n",
+ 			serial->type->description);
+ 		num_ports = 2;
+ 	}
+ 
++	for (i = 0; i < num_ports; ++i) {
++		switch (connection_info->connections[i].port_function_id) {
++		case VISOR_FUNCTION_GENERIC:
++			string = "Generic";
++			break;
++		case VISOR_FUNCTION_DEBUGGER:
++			string = "Debugger";
++			break;
++		case VISOR_FUNCTION_HOTSYNC:
++			string = "HotSync";
++			break;
++		case VISOR_FUNCTION_CONSOLE:
++			string = "Console";
++			break;
++		case VISOR_FUNCTION_REMOTE_FILE_SYS:
++			string = "Remote File System";
++			break;
++		default:
++			string = "unknown";
++			break;
++		}
++		dev_info(dev, "%s: port %d, is for %s use\n",
++			serial->type->description,
++			connection_info->connections[i].port, string);
++	}
+ 	dev_info(dev, "%s: Number of ports: %d\n", serial->type->description,
+ 		num_ports);
+ 
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 16b54b1ff20e..53ddfafa440b 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -3155,7 +3155,11 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 	struct rb_node *node;
+ 	int ret = 0;
+ 
++	spin_lock(&root->fs_info->trans_lock);
+ 	cur_trans = root->fs_info->running_transaction;
++	if (cur_trans)
++		refcount_inc(&cur_trans->use_count);
++	spin_unlock(&root->fs_info->trans_lock);
+ 	if (!cur_trans)
+ 		return 0;
+ 
+@@ -3164,6 +3168,7 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 	head = btrfs_find_delayed_ref_head(delayed_refs, bytenr);
+ 	if (!head) {
+ 		spin_unlock(&delayed_refs->lock);
++		btrfs_put_transaction(cur_trans);
+ 		return 0;
+ 	}
+ 
+@@ -3180,6 +3185,7 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 		mutex_lock(&head->mutex);
+ 		mutex_unlock(&head->mutex);
+ 		btrfs_put_delayed_ref_head(head);
++		btrfs_put_transaction(cur_trans);
+ 		return -EAGAIN;
+ 	}
+ 	spin_unlock(&delayed_refs->lock);
+@@ -3212,6 +3218,7 @@ static noinline int check_delayed_ref(struct btrfs_root *root,
+ 	}
+ 	spin_unlock(&head->lock);
+ 	mutex_unlock(&head->mutex);
++	btrfs_put_transaction(cur_trans);
+ 	return ret;
+ }
+ 
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index 9ea08326f876..a7e8fdb5fc72 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -812,22 +812,26 @@ xfs_file_fallocate(
+ 		if (error)
+ 			goto out_unlock;
+ 	} else if (mode & FALLOC_FL_INSERT_RANGE) {
+-		unsigned int blksize_mask = i_blocksize(inode) - 1;
++		unsigned int	blksize_mask = i_blocksize(inode) - 1;
++		loff_t		isize = i_size_read(inode);
+ 
+-		new_size = i_size_read(inode) + len;
+ 		if (offset & blksize_mask || len & blksize_mask) {
+ 			error = -EINVAL;
+ 			goto out_unlock;
+ 		}
+ 
+-		/* check the new inode size does not wrap through zero */
+-		if (new_size > inode->i_sb->s_maxbytes) {
++		/*
++		 * New inode size must not exceed ->s_maxbytes, accounting for
++		 * possible signed overflow.
++		 */
++		if (inode->i_sb->s_maxbytes - isize < len) {
+ 			error = -EFBIG;
+ 			goto out_unlock;
+ 		}
++		new_size = isize + len;
+ 
+ 		/* Offset should be less than i_size */
+-		if (offset >= i_size_read(inode)) {
++		if (offset >= isize) {
+ 			error = -EINVAL;
+ 			goto out_unlock;
+ 		}
+diff --git a/kernel/time/clocksource.c b/kernel/time/clocksource.c
+index 65f9e3f24dde..0e1b4be93dbf 100644
+--- a/kernel/time/clocksource.c
++++ b/kernel/time/clocksource.c
+@@ -119,6 +119,16 @@ static DEFINE_SPINLOCK(watchdog_lock);
+ static int watchdog_running;
+ static atomic_t watchdog_reset_pending;
+ 
++static void inline clocksource_watchdog_lock(unsigned long *flags)
++{
++	spin_lock_irqsave(&watchdog_lock, *flags);
++}
++
++static void inline clocksource_watchdog_unlock(unsigned long *flags)
++{
++	spin_unlock_irqrestore(&watchdog_lock, *flags);
++}
++
+ static int clocksource_watchdog_kthread(void *data);
+ static void __clocksource_change_rating(struct clocksource *cs, int rating);
+ 
+@@ -142,9 +152,19 @@ static void __clocksource_unstable(struct clocksource *cs)
+ 	cs->flags &= ~(CLOCK_SOURCE_VALID_FOR_HRES | CLOCK_SOURCE_WATCHDOG);
+ 	cs->flags |= CLOCK_SOURCE_UNSTABLE;
+ 
++	/*
++	 * If the clocksource is registered clocksource_watchdog_kthread() will
++	 * re-rate and re-select.
++	 */
++	if (list_empty(&cs->list)) {
++		cs->rating = 0;
++		return;
++	}
++
+ 	if (cs->mark_unstable)
+ 		cs->mark_unstable(cs);
+ 
++	/* kick clocksource_watchdog_kthread() */
+ 	if (finished_booting)
+ 		schedule_work(&watchdog_work);
+ }
+@@ -164,7 +184,7 @@ void clocksource_mark_unstable(struct clocksource *cs)
+ 
+ 	spin_lock_irqsave(&watchdog_lock, flags);
+ 	if (!(cs->flags & CLOCK_SOURCE_UNSTABLE)) {
+-		if (list_empty(&cs->wd_list))
++		if (!list_empty(&cs->list) && list_empty(&cs->wd_list))
+ 			list_add(&cs->wd_list, &watchdog_list);
+ 		__clocksource_unstable(cs);
+ 	}
+@@ -319,9 +339,8 @@ static void clocksource_resume_watchdog(void)
+ 
+ static void clocksource_enqueue_watchdog(struct clocksource *cs)
+ {
+-	unsigned long flags;
++	INIT_LIST_HEAD(&cs->wd_list);
+ 
+-	spin_lock_irqsave(&watchdog_lock, flags);
+ 	if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+ 		/* cs is a clocksource to be watched. */
+ 		list_add(&cs->wd_list, &watchdog_list);
+@@ -331,7 +350,6 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
+ 		if (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS)
+ 			cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
+ 	}
+-	spin_unlock_irqrestore(&watchdog_lock, flags);
+ }
+ 
+ static void clocksource_select_watchdog(bool fallback)
+@@ -373,9 +391,6 @@ static void clocksource_select_watchdog(bool fallback)
+ 
+ static void clocksource_dequeue_watchdog(struct clocksource *cs)
+ {
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&watchdog_lock, flags);
+ 	if (cs != watchdog) {
+ 		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+ 			/* cs is a watched clocksource. */
+@@ -384,21 +399,19 @@ static void clocksource_dequeue_watchdog(struct clocksource *cs)
+ 			clocksource_stop_watchdog();
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&watchdog_lock, flags);
+ }
+ 
+ static int __clocksource_watchdog_kthread(void)
+ {
+ 	struct clocksource *cs, *tmp;
+ 	unsigned long flags;
+-	LIST_HEAD(unstable);
+ 	int select = 0;
+ 
+ 	spin_lock_irqsave(&watchdog_lock, flags);
+ 	list_for_each_entry_safe(cs, tmp, &watchdog_list, wd_list) {
+ 		if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
+ 			list_del_init(&cs->wd_list);
+-			list_add(&cs->wd_list, &unstable);
++			__clocksource_change_rating(cs, 0);
+ 			select = 1;
+ 		}
+ 		if (cs->flags & CLOCK_SOURCE_RESELECT) {
+@@ -410,11 +423,6 @@ static int __clocksource_watchdog_kthread(void)
+ 	clocksource_stop_watchdog();
+ 	spin_unlock_irqrestore(&watchdog_lock, flags);
+ 
+-	/* Needs to be done outside of watchdog lock */
+-	list_for_each_entry_safe(cs, tmp, &unstable, wd_list) {
+-		list_del_init(&cs->wd_list);
+-		__clocksource_change_rating(cs, 0);
+-	}
+ 	return select;
+ }
+ 
+@@ -447,6 +455,9 @@ static inline int __clocksource_watchdog_kthread(void) { return 0; }
+ static bool clocksource_is_watchdog(struct clocksource *cs) { return false; }
+ void clocksource_mark_unstable(struct clocksource *cs) { }
+ 
++static void inline clocksource_watchdog_lock(unsigned long *flags) { }
++static void inline clocksource_watchdog_unlock(unsigned long *flags) { }
++
+ #endif /* CONFIG_CLOCKSOURCE_WATCHDOG */
+ 
+ /**
+@@ -775,14 +786,19 @@ EXPORT_SYMBOL_GPL(__clocksource_update_freq_scale);
+  */
+ int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
+ {
++	unsigned long flags;
+ 
+ 	/* Initialize mult/shift and max_idle_ns */
+ 	__clocksource_update_freq_scale(cs, scale, freq);
+ 
+ 	/* Add clocksource to the clocksource list */
+ 	mutex_lock(&clocksource_mutex);
++
++	clocksource_watchdog_lock(&flags);
+ 	clocksource_enqueue(cs);
+ 	clocksource_enqueue_watchdog(cs);
++	clocksource_watchdog_unlock(&flags);
++
+ 	clocksource_select();
+ 	clocksource_select_watchdog(false);
+ 	mutex_unlock(&clocksource_mutex);
+@@ -804,8 +820,13 @@ static void __clocksource_change_rating(struct clocksource *cs, int rating)
+  */
+ void clocksource_change_rating(struct clocksource *cs, int rating)
+ {
++	unsigned long flags;
++
+ 	mutex_lock(&clocksource_mutex);
++	clocksource_watchdog_lock(&flags);
+ 	__clocksource_change_rating(cs, rating);
++	clocksource_watchdog_unlock(&flags);
++
+ 	clocksource_select();
+ 	clocksource_select_watchdog(false);
+ 	mutex_unlock(&clocksource_mutex);
+@@ -817,6 +838,8 @@ EXPORT_SYMBOL(clocksource_change_rating);
+  */
+ static int clocksource_unbind(struct clocksource *cs)
+ {
++	unsigned long flags;
++
+ 	if (clocksource_is_watchdog(cs)) {
+ 		/* Select and try to install a replacement watchdog. */
+ 		clocksource_select_watchdog(true);
+@@ -830,8 +853,12 @@ static int clocksource_unbind(struct clocksource *cs)
+ 		if (curr_clocksource == cs)
+ 			return -EBUSY;
+ 	}
++
++	clocksource_watchdog_lock(&flags);
+ 	clocksource_dequeue_watchdog(cs);
+ 	list_del_init(&cs->list);
++	clocksource_watchdog_unlock(&flags);
++
+ 	return 0;
+ }
+ 
+diff --git a/kernel/trace/trace_uprobe.c b/kernel/trace/trace_uprobe.c
+index df08863e6d53..fff97dc0b70f 100644
+--- a/kernel/trace/trace_uprobe.c
++++ b/kernel/trace/trace_uprobe.c
+@@ -55,6 +55,7 @@ struct trace_uprobe {
+ 	struct list_head		list;
+ 	struct trace_uprobe_filter	filter;
+ 	struct uprobe_consumer		consumer;
++	struct path			path;
+ 	struct inode			*inode;
+ 	char				*filename;
+ 	unsigned long			offset;
+@@ -287,7 +288,7 @@ static void free_trace_uprobe(struct trace_uprobe *tu)
+ 	for (i = 0; i < tu->tp.nr_args; i++)
+ 		traceprobe_free_probe_arg(&tu->tp.args[i]);
+ 
+-	iput(tu->inode);
++	path_put(&tu->path);
+ 	kfree(tu->tp.call.class->system);
+ 	kfree(tu->tp.call.name);
+ 	kfree(tu->filename);
+@@ -361,7 +362,6 @@ static int register_trace_uprobe(struct trace_uprobe *tu)
+ static int create_trace_uprobe(int argc, char **argv)
+ {
+ 	struct trace_uprobe *tu;
+-	struct inode *inode;
+ 	char *arg, *event, *group, *filename;
+ 	char buf[MAX_EVENT_NAME_LEN];
+ 	struct path path;
+@@ -369,7 +369,6 @@ static int create_trace_uprobe(int argc, char **argv)
+ 	bool is_delete, is_return;
+ 	int i, ret;
+ 
+-	inode = NULL;
+ 	ret = 0;
+ 	is_delete = false;
+ 	is_return = false;
+@@ -435,21 +434,16 @@ static int create_trace_uprobe(int argc, char **argv)
+ 	}
+ 	/* Find the last occurrence, in case the path contains ':' too. */
+ 	arg = strrchr(argv[1], ':');
+-	if (!arg) {
+-		ret = -EINVAL;
+-		goto fail_address_parse;
+-	}
++	if (!arg)
++		return -EINVAL;
+ 
+ 	*arg++ = '\0';
+ 	filename = argv[1];
+ 	ret = kern_path(filename, LOOKUP_FOLLOW, &path);
+ 	if (ret)
+-		goto fail_address_parse;
+-
+-	inode = igrab(d_inode(path.dentry));
+-	path_put(&path);
++		return ret;
+ 
+-	if (!inode || !S_ISREG(inode->i_mode)) {
++	if (!d_is_reg(path.dentry)) {
+ 		ret = -EINVAL;
+ 		goto fail_address_parse;
+ 	}
+@@ -488,7 +482,7 @@ static int create_trace_uprobe(int argc, char **argv)
+ 		goto fail_address_parse;
+ 	}
+ 	tu->offset = offset;
+-	tu->inode = inode;
++	tu->path = path;
+ 	tu->filename = kstrdup(filename, GFP_KERNEL);
+ 
+ 	if (!tu->filename) {
+@@ -556,7 +550,7 @@ static int create_trace_uprobe(int argc, char **argv)
+ 	return ret;
+ 
+ fail_address_parse:
+-	iput(inode);
++	path_put(&path);
+ 
+ 	pr_info("Failed to parse address or file.\n");
+ 
+@@ -935,6 +929,7 @@ probe_event_enable(struct trace_uprobe *tu, struct trace_event_file *file,
+ 		goto err_flags;
+ 
+ 	tu->consumer.filter = filter;
++	tu->inode = d_real_inode(tu->path.dentry);
+ 	ret = uprobe_register(tu->inode, tu->offset, &tu->consumer);
+ 	if (ret)
+ 		goto err_buffer;
+@@ -980,6 +975,7 @@ probe_event_disable(struct trace_uprobe *tu, struct trace_event_file *file)
+ 	WARN_ON(!uprobe_filter_is_empty(&tu->filter));
+ 
+ 	uprobe_unregister(tu->inode, tu->offset, &tu->consumer);
++	tu->inode = NULL;
+ 	tu->tp.flags &= file ? ~TP_FLAG_TRACE : ~TP_FLAG_PROFILE;
+ 
+ 	uprobe_buffer_disable();
+diff --git a/kernel/tracepoint.c b/kernel/tracepoint.c
+index 671b13457387..1e37da2e0c25 100644
+--- a/kernel/tracepoint.c
++++ b/kernel/tracepoint.c
+@@ -207,7 +207,7 @@ static int tracepoint_add_func(struct tracepoint *tp,
+ 			lockdep_is_held(&tracepoints_mutex));
+ 	old = func_add(&tp_funcs, func, prio);
+ 	if (IS_ERR(old)) {
+-		WARN_ON_ONCE(1);
++		WARN_ON_ONCE(PTR_ERR(old) != -ENOMEM);
+ 		return PTR_ERR(old);
+ 	}
+ 
+@@ -239,7 +239,7 @@ static int tracepoint_remove_func(struct tracepoint *tp,
+ 			lockdep_is_held(&tracepoints_mutex));
+ 	old = func_remove(&tp_funcs, func);
+ 	if (IS_ERR(old)) {
+-		WARN_ON_ONCE(1);
++		WARN_ON_ONCE(PTR_ERR(old) != -ENOMEM);
+ 		return PTR_ERR(old);
+ 	}
+ 
+diff --git a/lib/errseq.c b/lib/errseq.c
+index df782418b333..81f9e33aa7e7 100644
+--- a/lib/errseq.c
++++ b/lib/errseq.c
+@@ -111,27 +111,22 @@ EXPORT_SYMBOL(errseq_set);
+  * errseq_sample() - Grab current errseq_t value.
+  * @eseq: Pointer to errseq_t to be sampled.
+  *
+- * This function allows callers to sample an errseq_t value, marking it as
+- * "seen" if required.
++ * This function allows callers to initialise their errseq_t variable.
++ * If the error has been "seen", new callers will not see an old error.
++ * If there is an unseen error in @eseq, the caller of this function will
++ * see it the next time it checks for an error.
+  *
++ * Context: Any context.
+  * Return: The current errseq value.
+  */
+ errseq_t errseq_sample(errseq_t *eseq)
+ {
+ 	errseq_t old = READ_ONCE(*eseq);
+-	errseq_t new = old;
+ 
+-	/*
+-	 * For the common case of no errors ever having been set, we can skip
+-	 * marking the SEEN bit. Once an error has been set, the value will
+-	 * never go back to zero.
+-	 */
+-	if (old != 0) {
+-		new |= ERRSEQ_SEEN;
+-		if (old != new)
+-			cmpxchg(eseq, old, new);
+-	}
+-	return new;
++	/* If nobody has seen this error yet, then we can be the first. */
++	if (!(old & ERRSEQ_SEEN))
++		old = 0;
++	return old;
+ }
+ EXPORT_SYMBOL(errseq_sample);
+ 
+diff --git a/lib/swiotlb.c b/lib/swiotlb.c
+index 44f7eb408fdb..0331de0e9144 100644
+--- a/lib/swiotlb.c
++++ b/lib/swiotlb.c
+@@ -750,7 +750,7 @@ swiotlb_alloc_buffer(struct device *dev, size_t size, dma_addr_t *dma_handle,
+ 	swiotlb_tbl_unmap_single(dev, phys_addr, size, DMA_TO_DEVICE,
+ 			DMA_ATTR_SKIP_CPU_SYNC);
+ out_warn:
+-	if ((attrs & DMA_ATTR_NO_WARN) && printk_ratelimit()) {
++	if (!(attrs & DMA_ATTR_NO_WARN) && printk_ratelimit()) {
+ 		dev_warn(dev,
+ 			"swiotlb: coherent allocation failed, size=%zu\n",
+ 			size);
+diff --git a/sound/core/pcm_compat.c b/sound/core/pcm_compat.c
+index 06d7c40af570..6491afbb5fd5 100644
+--- a/sound/core/pcm_compat.c
++++ b/sound/core/pcm_compat.c
+@@ -423,6 +423,8 @@ static int snd_pcm_ioctl_xfern_compat(struct snd_pcm_substream *substream,
+ 		return -ENOTTY;
+ 	if (substream->stream != dir)
+ 		return -EINVAL;
++	if (substream->runtime->status->state == SNDRV_PCM_STATE_OPEN)
++		return -EBADFD;
+ 
+ 	if ((ch = substream->runtime->channels) > 128)
+ 		return -EINVAL;
+diff --git a/sound/core/seq/seq_virmidi.c b/sound/core/seq/seq_virmidi.c
+index f48a4cd24ffc..289ae6bb81d9 100644
+--- a/sound/core/seq/seq_virmidi.c
++++ b/sound/core/seq/seq_virmidi.c
+@@ -174,12 +174,12 @@ static void snd_virmidi_output_trigger(struct snd_rawmidi_substream *substream,
+ 			}
+ 			return;
+ 		}
++		spin_lock_irqsave(&substream->runtime->lock, flags);
+ 		if (vmidi->event.type != SNDRV_SEQ_EVENT_NONE) {
+ 			if (snd_seq_kernel_client_dispatch(vmidi->client, &vmidi->event, in_atomic(), 0) < 0)
+-				return;
++				goto out;
+ 			vmidi->event.type = SNDRV_SEQ_EVENT_NONE;
+ 		}
+-		spin_lock_irqsave(&substream->runtime->lock, flags);
+ 		while (1) {
+ 			count = __snd_rawmidi_transmit_peek(substream, buf, sizeof(buf));
+ 			if (count <= 0)
+diff --git a/sound/drivers/aloop.c b/sound/drivers/aloop.c
+index 1063a4377502..eab7f594ebe7 100644
+--- a/sound/drivers/aloop.c
++++ b/sound/drivers/aloop.c
+@@ -296,6 +296,8 @@ static int loopback_trigger(struct snd_pcm_substream *substream, int cmd)
+ 		cable->pause |= stream;
+ 		loopback_timer_stop(dpcm);
+ 		spin_unlock(&cable->lock);
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			loopback_active_notify(dpcm);
+ 		break;
+ 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+ 	case SNDRV_PCM_TRIGGER_RESUME:
+@@ -304,6 +306,8 @@ static int loopback_trigger(struct snd_pcm_substream *substream, int cmd)
+ 		cable->pause &= ~stream;
+ 		loopback_timer_start(dpcm);
+ 		spin_unlock(&cable->lock);
++		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
++			loopback_active_notify(dpcm);
+ 		break;
+ 	default:
+ 		return -EINVAL;
+@@ -827,9 +831,11 @@ static int loopback_rate_shift_get(struct snd_kcontrol *kcontrol,
+ {
+ 	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+ 	
++	mutex_lock(&loopback->cable_lock);
+ 	ucontrol->value.integer.value[0] =
+ 		loopback->setup[kcontrol->id.subdevice]
+ 			       [kcontrol->id.device].rate_shift;
++	mutex_unlock(&loopback->cable_lock);
+ 	return 0;
+ }
+ 
+@@ -861,9 +867,11 @@ static int loopback_notify_get(struct snd_kcontrol *kcontrol,
+ {
+ 	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+ 	
++	mutex_lock(&loopback->cable_lock);
+ 	ucontrol->value.integer.value[0] =
+ 		loopback->setup[kcontrol->id.subdevice]
+ 			       [kcontrol->id.device].notify;
++	mutex_unlock(&loopback->cable_lock);
+ 	return 0;
+ }
+ 
+@@ -875,12 +883,14 @@ static int loopback_notify_put(struct snd_kcontrol *kcontrol,
+ 	int change = 0;
+ 
+ 	val = ucontrol->value.integer.value[0] ? 1 : 0;
++	mutex_lock(&loopback->cable_lock);
+ 	if (val != loopback->setup[kcontrol->id.subdevice]
+ 				[kcontrol->id.device].notify) {
+ 		loopback->setup[kcontrol->id.subdevice]
+ 			[kcontrol->id.device].notify = val;
+ 		change = 1;
+ 	}
++	mutex_unlock(&loopback->cable_lock);
+ 	return change;
+ }
+ 
+@@ -888,13 +898,18 @@ static int loopback_active_get(struct snd_kcontrol *kcontrol,
+ 			       struct snd_ctl_elem_value *ucontrol)
+ {
+ 	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+-	struct loopback_cable *cable = loopback->cables
+-			[kcontrol->id.subdevice][kcontrol->id.device ^ 1];
++	struct loopback_cable *cable;
++
+ 	unsigned int val = 0;
+ 
+-	if (cable != NULL)
+-		val = (cable->running & (1 << SNDRV_PCM_STREAM_PLAYBACK)) ?
+-									1 : 0;
++	mutex_lock(&loopback->cable_lock);
++	cable = loopback->cables[kcontrol->id.subdevice][kcontrol->id.device ^ 1];
++	if (cable != NULL) {
++		unsigned int running = cable->running ^ cable->pause;
++
++		val = (running & (1 << SNDRV_PCM_STREAM_PLAYBACK)) ? 1 : 0;
++	}
++	mutex_unlock(&loopback->cable_lock);
+ 	ucontrol->value.integer.value[0] = val;
+ 	return 0;
+ }
+@@ -937,9 +952,11 @@ static int loopback_rate_get(struct snd_kcontrol *kcontrol,
+ {
+ 	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+ 	
++	mutex_lock(&loopback->cable_lock);
+ 	ucontrol->value.integer.value[0] =
+ 		loopback->setup[kcontrol->id.subdevice]
+ 			       [kcontrol->id.device].rate;
++	mutex_unlock(&loopback->cable_lock);
+ 	return 0;
+ }
+ 
+@@ -959,9 +976,11 @@ static int loopback_channels_get(struct snd_kcontrol *kcontrol,
+ {
+ 	struct loopback *loopback = snd_kcontrol_chip(kcontrol);
+ 	
++	mutex_lock(&loopback->cable_lock);
+ 	ucontrol->value.integer.value[0] =
+ 		loopback->setup[kcontrol->id.subdevice]
+ 			       [kcontrol->id.device].channels;
++	mutex_unlock(&loopback->cable_lock);
+ 	return 0;
+ }
+ 
+diff --git a/sound/firewire/amdtp-stream.c b/sound/firewire/amdtp-stream.c
+index 4a1dc145327b..cb9acfe60f6a 100644
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@ -773,8 +773,6 @@ static void amdtp_stream_first_callback(struct fw_iso_context *context,
+ 	u32 cycle;
+ 	unsigned int packets;
+ 
+-	s->max_payload_length = amdtp_stream_get_max_payload(s);
+-
+ 	/*
+ 	 * For in-stream, first packet has come.
+ 	 * For out-stream, prepared to transmit first packet
+@@ -879,6 +877,9 @@ int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
+ 
+ 	amdtp_stream_update(s);
+ 
++	if (s->direction == AMDTP_IN_STREAM)
++		s->max_payload_length = amdtp_stream_get_max_payload(s);
++
+ 	if (s->flags & CIP_NO_HEADER)
+ 		s->tag = TAG_NO_CIP_HEADER;
+ 	else
+diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
+index 8c238e51bb5a..2dd34dd77447 100644
+--- a/sound/pci/hda/patch_realtek.c
++++ b/sound/pci/hda/patch_realtek.c
+@@ -3832,7 +3832,7 @@ static void alc280_fixup_hp_gpio4(struct hda_codec *codec,
+ 	}
+ }
+ 
+-#if IS_REACHABLE(INPUT)
++#if IS_REACHABLE(CONFIG_INPUT)
+ static void gpio2_mic_hotkey_event(struct hda_codec *codec,
+ 				   struct hda_jack_callback *event)
+ {
+diff --git a/tools/power/acpi/Makefile.config b/tools/power/acpi/Makefile.config
+index 2cccbba64418..f304be71c278 100644
+--- a/tools/power/acpi/Makefile.config
++++ b/tools/power/acpi/Makefile.config
+@@ -56,6 +56,7 @@ INSTALL_SCRIPT = ${INSTALL_PROGRAM}
+ # to compile vs uClibc, that can be done here as well.
+ CROSS = #/usr/i386-linux-uclibc/usr/bin/i386-uclibc-
+ CROSS_COMPILE ?= $(CROSS)
++LD = $(CC)
+ HOSTCC = gcc
+ 
+ # check if compiler option is supported
+diff --git a/tools/testing/selftests/firmware/fw_filesystem.sh b/tools/testing/selftests/firmware/fw_filesystem.sh
+index f9508e1a4058..6b63b6bf2661 100755
+--- a/tools/testing/selftests/firmware/fw_filesystem.sh
++++ b/tools/testing/selftests/firmware/fw_filesystem.sh
+@@ -46,9 +46,11 @@ test_finish()
+ 		echo "$OLD_TIMEOUT" >/sys/class/firmware/timeout
+ 	fi
+ 	if [ "$OLD_FWPATH" = "" ]; then
+-		OLD_FWPATH=" "
++		# A zero-length write won't work; write a null byte
++		printf '\000' >/sys/module/firmware_class/parameters/path
++	else
++		echo -n "$OLD_FWPATH" >/sys/module/firmware_class/parameters/path
+ 	fi
+-	echo -n "$OLD_FWPATH" >/sys/module/firmware_class/parameters/path
+ 	rm -f "$FW"
+ 	rmdir "$FWPATH"
+ }
