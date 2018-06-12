@@ -60,7 +60,7 @@ if ($rel > 1) {
 else {
     # just do git log
     #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$ver;
-    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ';
+    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ..'.$tag;
     @log_lines = `$cmd`;
 }
 
