@@ -1,0 +1,1735 @@
+diff --git a/Makefile b/Makefile
+index 1d740dbe676d..e4ddbad49636 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 17
+-SUBLEVEL = 4
++SUBLEVEL = 5
+ EXTRAVERSION =
+ NAME = Merciless Moray
+ 
+diff --git a/arch/arm/boot/dts/imx6q.dtsi b/arch/arm/boot/dts/imx6q.dtsi
+index ae7b3f107893..5185300cc11f 100644
+--- a/arch/arm/boot/dts/imx6q.dtsi
++++ b/arch/arm/boot/dts/imx6q.dtsi
+@@ -96,7 +96,7 @@
+ 					clocks = <&clks IMX6Q_CLK_ECSPI5>,
+ 						 <&clks IMX6Q_CLK_ECSPI5>;
+ 					clock-names = "ipg", "per";
+-					dmas = <&sdma 11 7 1>, <&sdma 12 7 2>;
++					dmas = <&sdma 11 8 1>, <&sdma 12 8 2>;
+ 					dma-names = "rx", "tx";
+ 					status = "disabled";
+ 				};
+diff --git a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dtsi b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dtsi
+index 0cfd701809de..a1b31013ab6e 100644
+--- a/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dtsi
++++ b/arch/arm64/boot/dts/amlogic/meson-gxl-s905x-p212.dtsi
+@@ -189,3 +189,10 @@
+ &usb0 {
+ 	status = "okay";
+ };
++
++&usb2_phy0 {
++	/*
++	 * HDMI_5V is also used as supply for the USB VBUS.
++	 */
++	phy-supply = <&hdmi_5v>;
++};
+diff --git a/arch/x86/include/asm/pgalloc.h b/arch/x86/include/asm/pgalloc.h
+index 263c142a6a6c..f65e9e1cea4c 100644
+--- a/arch/x86/include/asm/pgalloc.h
++++ b/arch/x86/include/asm/pgalloc.h
+@@ -184,6 +184,9 @@ static inline p4d_t *p4d_alloc_one(struct mm_struct *mm, unsigned long addr)
+ 
+ static inline void p4d_free(struct mm_struct *mm, p4d_t *p4d)
+ {
++	if (!pgtable_l5_enabled)
++		return;
++
+ 	BUG_ON((unsigned long)p4d & (PAGE_SIZE-1));
+ 	free_page((unsigned long)p4d);
+ }
+diff --git a/drivers/acpi/osl.c b/drivers/acpi/osl.c
+index 7ca41bf023c9..8df9abfa947b 100644
+--- a/drivers/acpi/osl.c
++++ b/drivers/acpi/osl.c
+@@ -45,6 +45,8 @@
+ #include <linux/uaccess.h>
+ #include <linux/io-64-nonatomic-lo-hi.h>
+ 
++#include "acpica/accommon.h"
++#include "acpica/acnamesp.h"
+ #include "internal.h"
+ 
+ #define _COMPONENT		ACPI_OS_SERVICES
+@@ -1490,6 +1492,76 @@ int acpi_check_region(resource_size_t start, resource_size_t n,
+ }
+ EXPORT_SYMBOL(acpi_check_region);
+ 
++static acpi_status acpi_deactivate_mem_region(acpi_handle handle, u32 level,
++					      void *_res, void **return_value)
++{
++	struct acpi_mem_space_context **mem_ctx;
++	union acpi_operand_object *handler_obj;
++	union acpi_operand_object *region_obj2;
++	union acpi_operand_object *region_obj;
++	struct resource *res = _res;
++	acpi_status status;
++
++	region_obj = acpi_ns_get_attached_object(handle);
++	if (!region_obj)
++		return AE_OK;
++
++	handler_obj = region_obj->region.handler;
++	if (!handler_obj)
++		return AE_OK;
++
++	if (region_obj->region.space_id != ACPI_ADR_SPACE_SYSTEM_MEMORY)
++		return AE_OK;
++
++	if (!(region_obj->region.flags & AOPOBJ_SETUP_COMPLETE))
++		return AE_OK;
++
++	region_obj2 = acpi_ns_get_secondary_object(region_obj);
++	if (!region_obj2)
++		return AE_OK;
++
++	mem_ctx = (void *)&region_obj2->extra.region_context;
++
++	if (!(mem_ctx[0]->address >= res->start &&
++	      mem_ctx[0]->address < res->end))
++		return AE_OK;
++
++	status = handler_obj->address_space.setup(region_obj,
++						  ACPI_REGION_DEACTIVATE,
++						  NULL, (void **)mem_ctx);
++	if (ACPI_SUCCESS(status))
++		region_obj->region.flags &= ~(AOPOBJ_SETUP_COMPLETE);
++
++	return status;
++}
++
++/**
++ * acpi_release_memory - Release any mappings done to a memory region
++ * @handle: Handle to namespace node
++ * @res: Memory resource
++ * @level: A level that terminates the search
++ *
++ * Walks through @handle and unmaps all SystemMemory Operation Regions that
++ * overlap with @res and that have already been activated (mapped).
++ *
++ * This is a helper that allows drivers to place special requirements on memory
++ * region that may overlap with operation regions, primarily allowing them to
++ * safely map the region as non-cached memory.
++ *
++ * The unmapped Operation Regions will be automatically remapped next time they
++ * are called, so the drivers do not need to do anything else.
++ */
++acpi_status acpi_release_memory(acpi_handle handle, struct resource *res,
++				u32 level)
++{
++	if (!(res->flags & IORESOURCE_MEM))
++		return AE_TYPE;
++
++	return acpi_walk_namespace(ACPI_TYPE_REGION, handle, level,
++				   acpi_deactivate_mem_region, NULL, res, NULL);
++}
++EXPORT_SYMBOL_GPL(acpi_release_memory);
++
+ /*
+  * Let drivers know whether the resource checks are effective
+  */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+index 34af664b9f93..6fcc537d7779 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c
+@@ -2080,10 +2080,18 @@ bool amdgpu_device_asic_has_dc_support(enum amd_asic_type asic_type)
+ 	switch (asic_type) {
+ #if defined(CONFIG_DRM_AMD_DC)
+ 	case CHIP_BONAIRE:
+-	case CHIP_HAWAII:
+ 	case CHIP_KAVERI:
+ 	case CHIP_KABINI:
+ 	case CHIP_MULLINS:
++		/*
++		 * We have systems in the wild with these ASICs that require
++		 * LVDS and VGA support which is not supported with DC.
++		 *
++		 * Fallback to the non-DC driver here by default so as not to
++		 * cause regressions.
++		 */
++		return amdgpu_dc > 0;
++	case CHIP_HAWAII:
+ 	case CHIP_CARRIZO:
+ 	case CHIP_STONEY:
+ 	case CHIP_POLARIS11:
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+index 6d08cde8443c..b52f26e7db98 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_object.c
+@@ -749,8 +749,7 @@ int amdgpu_bo_pin_restricted(struct amdgpu_bo *bo, u32 domain,
+ 	domain = amdgpu_mem_type_to_domain(bo->tbo.mem.mem_type);
+ 	if (domain == AMDGPU_GEM_DOMAIN_VRAM) {
+ 		adev->vram_pin_size += amdgpu_bo_size(bo);
+-		if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+-			adev->invisible_pin_size += amdgpu_bo_size(bo);
++		adev->invisible_pin_size += amdgpu_vram_mgr_bo_invisible_size(bo);
+ 	} else if (domain == AMDGPU_GEM_DOMAIN_GTT) {
+ 		adev->gart_pin_size += amdgpu_bo_size(bo);
+ 	}
+@@ -777,25 +776,22 @@ int amdgpu_bo_unpin(struct amdgpu_bo *bo)
+ 	bo->pin_count--;
+ 	if (bo->pin_count)
+ 		return 0;
+-	for (i = 0; i < bo->placement.num_placement; i++) {
+-		bo->placements[i].lpfn = 0;
+-		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
+-	}
+-	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+-	if (unlikely(r)) {
+-		dev_err(adev->dev, "%p validate failed for unpin\n", bo);
+-		goto error;
+-	}
+ 
+ 	if (bo->tbo.mem.mem_type == TTM_PL_VRAM) {
+ 		adev->vram_pin_size -= amdgpu_bo_size(bo);
+-		if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS)
+-			adev->invisible_pin_size -= amdgpu_bo_size(bo);
++		adev->invisible_pin_size -= amdgpu_vram_mgr_bo_invisible_size(bo);
+ 	} else if (bo->tbo.mem.mem_type == TTM_PL_TT) {
+ 		adev->gart_pin_size -= amdgpu_bo_size(bo);
+ 	}
+ 
+-error:
++	for (i = 0; i < bo->placement.num_placement; i++) {
++		bo->placements[i].lpfn = 0;
++		bo->placements[i].flags &= ~TTM_PL_FLAG_NO_EVICT;
++	}
++	r = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
++	if (unlikely(r))
++		dev_err(adev->dev, "%p validate failed for unpin\n", bo);
++
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+index 6ea7de863041..379e9ff173f1 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -73,6 +73,7 @@ bool amdgpu_gtt_mgr_has_gart_addr(struct ttm_mem_reg *mem);
+ uint64_t amdgpu_gtt_mgr_usage(struct ttm_mem_type_manager *man);
+ int amdgpu_gtt_mgr_recover(struct ttm_mem_type_manager *man);
+ 
++u64 amdgpu_vram_mgr_bo_invisible_size(struct amdgpu_bo *bo);
+ uint64_t amdgpu_vram_mgr_usage(struct ttm_mem_type_manager *man);
+ uint64_t amdgpu_vram_mgr_vis_usage(struct ttm_mem_type_manager *man);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index 58e495330b38..87e89cc12397 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -84,6 +84,7 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
+ 	}
+ 
+ 	hdr = (const struct common_firmware_header *)adev->vcn.fw->data;
++	adev->vcn.fw_version = le32_to_cpu(hdr->ucode_version);
+ 	family_id = le32_to_cpu(hdr->ucode_version) & 0xff;
+ 	version_major = (le32_to_cpu(hdr->ucode_version) >> 24) & 0xff;
+ 	version_minor = (le32_to_cpu(hdr->ucode_version) >> 8) & 0xff;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+index da55a78d7380..11aa36aa304b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vm.c
+@@ -1442,7 +1442,9 @@ static int amdgpu_vm_bo_split_mapping(struct amdgpu_device *adev,
+ 			uint64_t count;
+ 
+ 			max_entries = min(max_entries, 16ull * 1024ull);
+-			for (count = 1; count < max_entries; ++count) {
++			for (count = 1;
++			     count < max_entries / (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
++			     ++count) {
+ 				uint64_t idx = pfn + count;
+ 
+ 				if (pages_addr[idx] !=
+@@ -1455,7 +1457,7 @@ static int amdgpu_vm_bo_split_mapping(struct amdgpu_device *adev,
+ 				dma_addr = pages_addr;
+ 			} else {
+ 				addr = pages_addr[pfn];
+-				max_entries = count;
++				max_entries = count * (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
+ 			}
+ 
+ 		} else if (flags & AMDGPU_PTE_VALID) {
+@@ -1470,7 +1472,7 @@ static int amdgpu_vm_bo_split_mapping(struct amdgpu_device *adev,
+ 		if (r)
+ 			return r;
+ 
+-		pfn += last - start + 1;
++		pfn += (last - start + 1) / (PAGE_SIZE / AMDGPU_GPU_PAGE_SIZE);
+ 		if (nodes && nodes->size == pfn) {
+ 			pfn = 0;
+ 			++nodes;
+@@ -2112,7 +2114,8 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
+ 			before->last = saddr - 1;
+ 			before->offset = tmp->offset;
+ 			before->flags = tmp->flags;
+-			list_add(&before->list, &tmp->list);
++			before->bo_va = tmp->bo_va;
++			list_add(&before->list, &tmp->bo_va->invalids);
+ 		}
+ 
+ 		/* Remember mapping split at the end */
+@@ -2122,7 +2125,8 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
+ 			after->offset = tmp->offset;
+ 			after->offset += after->start - tmp->start;
+ 			after->flags = tmp->flags;
+-			list_add(&after->list, &tmp->list);
++			after->bo_va = tmp->bo_va;
++			list_add(&after->list, &tmp->bo_va->invalids);
+ 		}
+ 
+ 		list_del(&tmp->list);
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+index 9aca653bec07..b6333f92ba45 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c
+@@ -96,6 +96,38 @@ static u64 amdgpu_vram_mgr_vis_size(struct amdgpu_device *adev,
+ 		adev->gmc.visible_vram_size : end) - start;
+ }
+ 
++/**
++ * amdgpu_vram_mgr_bo_invisible_size - CPU invisible BO size
++ *
++ * @bo: &amdgpu_bo buffer object (must be in VRAM)
++ *
++ * Returns:
++ * How much of the given &amdgpu_bo buffer object lies in CPU invisible VRAM.
++ */
++u64 amdgpu_vram_mgr_bo_invisible_size(struct amdgpu_bo *bo)
++{
++	struct amdgpu_device *adev = amdgpu_ttm_adev(bo->tbo.bdev);
++	struct ttm_mem_reg *mem = &bo->tbo.mem;
++	struct drm_mm_node *nodes = mem->mm_node;
++	unsigned pages = mem->num_pages;
++	u64 usage = 0;
++
++	if (adev->gmc.visible_vram_size == adev->gmc.real_vram_size)
++		return 0;
++
++	if (mem->start >= adev->gmc.visible_vram_size >> PAGE_SHIFT)
++		return amdgpu_bo_size(bo);
++
++	while (nodes && pages) {
++		usage += nodes->size << PAGE_SHIFT;
++		usage -= amdgpu_vram_mgr_vis_size(adev, nodes);
++		pages -= nodes->size;
++		++nodes;
++	}
++
++	return usage;
++}
++
+ /**
+  * amdgpu_vram_mgr_new - allocate new ranges
+  *
+@@ -135,7 +167,8 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 		num_nodes = DIV_ROUND_UP(mem->num_pages, pages_per_node);
+ 	}
+ 
+-	nodes = kcalloc(num_nodes, sizeof(*nodes), GFP_KERNEL);
++	nodes = kvmalloc_array(num_nodes, sizeof(*nodes),
++			       GFP_KERNEL | __GFP_ZERO);
+ 	if (!nodes)
+ 		return -ENOMEM;
+ 
+@@ -190,7 +223,7 @@ static int amdgpu_vram_mgr_new(struct ttm_mem_type_manager *man,
+ 		drm_mm_remove_node(&nodes[i]);
+ 	spin_unlock(&mgr->lock);
+ 
+-	kfree(nodes);
++	kvfree(nodes);
+ 	return r == -ENOSPC ? 0 : r;
+ }
+ 
+@@ -229,7 +262,7 @@ static void amdgpu_vram_mgr_del(struct ttm_mem_type_manager *man,
+ 	atomic64_sub(usage, &mgr->usage);
+ 	atomic64_sub(vis_usage, &mgr->vis_usage);
+ 
+-	kfree(mem->mm_node);
++	kvfree(mem->mm_node);
+ 	mem->mm_node = NULL;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+index 428d1928e44e..ac9617269a2f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/vce_v3_0.c
+@@ -467,8 +467,8 @@ static int vce_v3_0_hw_init(void *handle)
+ 	struct amdgpu_device *adev = (struct amdgpu_device *)handle;
+ 
+ 	vce_v3_0_override_vce_clock_gating(adev, true);
+-	if (!(adev->flags & AMD_IS_APU))
+-		amdgpu_asic_set_vce_clocks(adev, 10000, 10000);
++
++	amdgpu_asic_set_vce_clocks(adev, 10000, 10000);
+ 
+ 	for (i = 0; i < adev->vce.num_rings; i++)
+ 		adev->vce.ring[i].ready = false;
+diff --git a/drivers/gpu/drm/amd/amdgpu/vi.c b/drivers/gpu/drm/amd/amdgpu/vi.c
+index 126f1276d347..9ae350dad235 100644
+--- a/drivers/gpu/drm/amd/amdgpu/vi.c
++++ b/drivers/gpu/drm/amd/amdgpu/vi.c
+@@ -728,33 +728,59 @@ static int vi_set_uvd_clock(struct amdgpu_device *adev, u32 clock,
+ 		return r;
+ 
+ 	tmp = RREG32_SMC(cntl_reg);
+-	tmp &= ~(CG_DCLK_CNTL__DCLK_DIR_CNTL_EN_MASK |
+-		CG_DCLK_CNTL__DCLK_DIVIDER_MASK);
++
++	if (adev->flags & AMD_IS_APU)
++		tmp &= ~CG_DCLK_CNTL__DCLK_DIVIDER_MASK;
++	else
++		tmp &= ~(CG_DCLK_CNTL__DCLK_DIR_CNTL_EN_MASK |
++				CG_DCLK_CNTL__DCLK_DIVIDER_MASK);
+ 	tmp |= dividers.post_divider;
+ 	WREG32_SMC(cntl_reg, tmp);
+ 
+ 	for (i = 0; i < 100; i++) {
+-		if (RREG32_SMC(status_reg) & CG_DCLK_STATUS__DCLK_STATUS_MASK)
+-			break;
++		tmp = RREG32_SMC(status_reg);
++		if (adev->flags & AMD_IS_APU) {
++			if (tmp & 0x10000)
++				break;
++		} else {
++			if (tmp & CG_DCLK_STATUS__DCLK_STATUS_MASK)
++				break;
++		}
+ 		mdelay(10);
+ 	}
+ 	if (i == 100)
+ 		return -ETIMEDOUT;
+-
+ 	return 0;
+ }
+ 
++#define ixGNB_CLK1_DFS_CNTL 0xD82200F0
++#define ixGNB_CLK1_STATUS   0xD822010C
++#define ixGNB_CLK2_DFS_CNTL 0xD8220110
++#define ixGNB_CLK2_STATUS   0xD822012C
++#define ixGNB_CLK3_DFS_CNTL 0xD8220130
++#define ixGNB_CLK3_STATUS   0xD822014C
++
+ static int vi_set_uvd_clocks(struct amdgpu_device *adev, u32 vclk, u32 dclk)
+ {
+ 	int r;
+ 
+-	r = vi_set_uvd_clock(adev, vclk, ixCG_VCLK_CNTL, ixCG_VCLK_STATUS);
+-	if (r)
+-		return r;
++	if (adev->flags & AMD_IS_APU) {
++		r = vi_set_uvd_clock(adev, vclk, ixGNB_CLK2_DFS_CNTL, ixGNB_CLK2_STATUS);
++		if (r)
++			return r;
+ 
+-	r = vi_set_uvd_clock(adev, dclk, ixCG_DCLK_CNTL, ixCG_DCLK_STATUS);
+-	if (r)
+-		return r;
++		r = vi_set_uvd_clock(adev, dclk, ixGNB_CLK1_DFS_CNTL, ixGNB_CLK1_STATUS);
++		if (r)
++			return r;
++	} else {
++		r = vi_set_uvd_clock(adev, vclk, ixCG_VCLK_CNTL, ixCG_VCLK_STATUS);
++		if (r)
++			return r;
++
++		r = vi_set_uvd_clock(adev, dclk, ixCG_DCLK_CNTL, ixCG_DCLK_STATUS);
++		if (r)
++			return r;
++	}
+ 
+ 	return 0;
+ }
+@@ -764,6 +790,22 @@ static int vi_set_vce_clocks(struct amdgpu_device *adev, u32 evclk, u32 ecclk)
+ 	int r, i;
+ 	struct atom_clock_dividers dividers;
+ 	u32 tmp;
++	u32 reg_ctrl;
++	u32 reg_status;
++	u32 status_mask;
++	u32 reg_mask;
++
++	if (adev->flags & AMD_IS_APU) {
++		reg_ctrl = ixGNB_CLK3_DFS_CNTL;
++		reg_status = ixGNB_CLK3_STATUS;
++		status_mask = 0x00010000;
++		reg_mask = CG_ECLK_CNTL__ECLK_DIVIDER_MASK;
++	} else {
++		reg_ctrl = ixCG_ECLK_CNTL;
++		reg_status = ixCG_ECLK_STATUS;
++		status_mask = CG_ECLK_STATUS__ECLK_STATUS_MASK;
++		reg_mask = CG_ECLK_CNTL__ECLK_DIR_CNTL_EN_MASK | CG_ECLK_CNTL__ECLK_DIVIDER_MASK;
++	}
+ 
+ 	r = amdgpu_atombios_get_clock_dividers(adev,
+ 					       COMPUTE_GPUCLK_INPUT_FLAG_DEFAULT_GPUCLK,
+@@ -772,24 +814,25 @@ static int vi_set_vce_clocks(struct amdgpu_device *adev, u32 evclk, u32 ecclk)
+ 		return r;
+ 
+ 	for (i = 0; i < 100; i++) {
+-		if (RREG32_SMC(ixCG_ECLK_STATUS) & CG_ECLK_STATUS__ECLK_STATUS_MASK)
++		if (RREG32_SMC(reg_status) & status_mask)
+ 			break;
+ 		mdelay(10);
+ 	}
++
+ 	if (i == 100)
+ 		return -ETIMEDOUT;
+ 
+-	tmp = RREG32_SMC(ixCG_ECLK_CNTL);
+-	tmp &= ~(CG_ECLK_CNTL__ECLK_DIR_CNTL_EN_MASK |
+-		CG_ECLK_CNTL__ECLK_DIVIDER_MASK);
++	tmp = RREG32_SMC(reg_ctrl);
++	tmp &= ~reg_mask;
+ 	tmp |= dividers.post_divider;
+-	WREG32_SMC(ixCG_ECLK_CNTL, tmp);
++	WREG32_SMC(reg_ctrl, tmp);
+ 
+ 	for (i = 0; i < 100; i++) {
+-		if (RREG32_SMC(ixCG_ECLK_STATUS) & CG_ECLK_STATUS__ECLK_STATUS_MASK)
++		if (RREG32_SMC(reg_status) & status_mask)
+ 			break;
+ 		mdelay(10);
+ 	}
++
+ 	if (i == 100)
+ 		return -ETIMEDOUT;
+ 
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 27579443cdc5..79afffa00772 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -46,6 +46,7 @@
+ #include <linux/moduleparam.h>
+ #include <linux/version.h>
+ #include <linux/types.h>
++#include <linux/pm_runtime.h>
+ 
+ #include <drm/drmP.h>
+ #include <drm/drm_atomic.h>
+@@ -927,6 +928,7 @@ amdgpu_dm_update_connector_after_detect(struct amdgpu_dm_connector *aconnector)
+ 		drm_mode_connector_update_edid_property(connector, NULL);
+ 		aconnector->num_modes = 0;
+ 		aconnector->dc_sink = NULL;
++		aconnector->edid = NULL;
+ 	}
+ 
+ 	mutex_unlock(&dev->mode_config.mutex);
+@@ -3965,10 +3967,11 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
+ 	if (acrtc->base.state->event)
+ 		prepare_flip_isr(acrtc);
+ 
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++
+ 	surface_updates->surface = dc_stream_get_status(acrtc_state->stream)->plane_states[0];
+ 	surface_updates->flip_addr = &addr;
+ 
+-
+ 	dc_commit_updates_for_stream(adev->dm.dc,
+ 					     surface_updates,
+ 					     1,
+@@ -3981,9 +3984,6 @@ static void amdgpu_dm_do_flip(struct drm_crtc *crtc,
+ 			 __func__,
+ 			 addr.address.grph.addr.high_part,
+ 			 addr.address.grph.addr.low_part);
+-
+-
+-	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+ }
+ 
+ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
+@@ -4149,6 +4149,7 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 	struct drm_connector *connector;
+ 	struct drm_connector_state *old_con_state, *new_con_state;
+ 	struct dm_crtc_state *dm_old_crtc_state, *dm_new_crtc_state;
++	int crtc_disable_count = 0;
+ 
+ 	drm_atomic_helper_update_legacy_modeset_state(dev, state);
+ 
+@@ -4211,6 +4212,8 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 			if (dm_old_crtc_state->stream)
+ 				remove_stream(adev, acrtc, dm_old_crtc_state->stream);
+ 
++			pm_runtime_get_noresume(dev->dev);
++
+ 			acrtc->enabled = true;
+ 			acrtc->hw_mode = new_crtc_state->mode;
+ 			crtc->hwmode = new_crtc_state->mode;
+@@ -4348,6 +4351,9 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 		struct amdgpu_crtc *acrtc = to_amdgpu_crtc(crtc);
+ 		bool modeset_needed;
+ 
++		if (old_crtc_state->active && !new_crtc_state->active)
++			crtc_disable_count++;
++
+ 		dm_new_crtc_state = to_dm_crtc_state(new_crtc_state);
+ 		dm_old_crtc_state = to_dm_crtc_state(old_crtc_state);
+ 		modeset_needed = modeset_required(
+@@ -4396,6 +4402,14 @@ static void amdgpu_dm_atomic_commit_tail(struct drm_atomic_state *state)
+ 		drm_atomic_helper_wait_for_flip_done(dev, state);
+ 
+ 	drm_atomic_helper_cleanup_planes(dev, state);
++
++	/* Finally, drop a runtime PM reference for each newly disabled CRTC,
++	 * so we can put the GPU into runtime suspend if we're not driving any
++	 * displays anymore
++	 */
++	for (i = 0; i < crtc_disable_count; i++)
++		pm_runtime_put_autosuspend(dev->dev);
++	pm_runtime_mark_last_busy(dev->dev);
+ }
+ 
+ 
+diff --git a/drivers/gpu/drm/atmel-hlcdc/atmel_hlcdc_plane.c b/drivers/gpu/drm/atmel-hlcdc/atmel_hlcdc_plane.c
+index e18800ed7cd1..7b8191eae68a 100644
+--- a/drivers/gpu/drm/atmel-hlcdc/atmel_hlcdc_plane.c
++++ b/drivers/gpu/drm/atmel-hlcdc/atmel_hlcdc_plane.c
+@@ -875,7 +875,7 @@ static int atmel_hlcdc_plane_init_properties(struct atmel_hlcdc_plane *plane,
+ 		drm_object_attach_property(&plane->base.base,
+ 					   props->alpha, 255);
+ 
+-	if (desc->layout.xstride && desc->layout.pstride) {
++	if (desc->layout.xstride[0] && desc->layout.pstride[0]) {
+ 		int ret;
+ 
+ 		ret = drm_plane_create_rotation_property(&plane->base,
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index 633c18785c1e..b25cc5aa8fbe 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1862,9 +1862,17 @@ static void i9xx_pipestat_irq_ack(struct drm_i915_private *dev_priv,
+ 
+ 		/*
+ 		 * Clear the PIPE*STAT regs before the IIR
++		 *
++		 * Toggle the enable bits to make sure we get an
++		 * edge in the ISR pipe event bit if we don't clear
++		 * all the enabled status bits. Otherwise the edge
++		 * triggered IIR on i965/g4x wouldn't notice that
++		 * an interrupt is still pending.
+ 		 */
+-		if (pipe_stats[pipe])
+-			I915_WRITE(reg, enable_mask | pipe_stats[pipe]);
++		if (pipe_stats[pipe]) {
++			I915_WRITE(reg, pipe_stats[pipe]);
++			I915_WRITE(reg, enable_mask);
++		}
+ 	}
+ 	spin_unlock(&dev_priv->irq_lock);
+ }
+diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
+index 8a69a9275e28..29dc0a57e466 100644
+--- a/drivers/gpu/drm/i915/i915_reg.h
++++ b/drivers/gpu/drm/i915/i915_reg.h
+@@ -2565,12 +2565,17 @@ enum i915_power_well_id {
+ #define _3D_CHICKEN	_MMIO(0x2084)
+ #define  _3D_CHICKEN_HIZ_PLANE_DISABLE_MSAA_4X_SNB	(1 << 10)
+ #define _3D_CHICKEN2	_MMIO(0x208c)
++
++#define FF_SLICE_CHICKEN	_MMIO(0x2088)
++#define  FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX	(1 << 1)
++
+ /* Disables pipelining of read flushes past the SF-WIZ interface.
+  * Required on all Ironlake steppings according to the B-Spec, but the
+  * particular danger of not doing so is not specified.
+  */
+ # define _3D_CHICKEN2_WM_READ_PIPELINED			(1 << 14)
+ #define _3D_CHICKEN3	_MMIO(0x2090)
++#define  _3D_CHICKEN_SF_PROVOKING_VERTEX_FIX		(1 << 12)
+ #define  _3D_CHICKEN_SF_DISABLE_OBJEND_CULL		(1 << 10)
+ #define  _3D_CHICKEN3_AA_LINE_QUALITY_FIX_ENABLE	(1 << 5)
+ #define  _3D_CHICKEN3_SF_DISABLE_FASTCLIP_CULL		(1 << 5)
+diff --git a/drivers/gpu/drm/i915/intel_crt.c b/drivers/gpu/drm/i915/intel_crt.c
+index c0a8805b277f..d26827c44fb0 100644
+--- a/drivers/gpu/drm/i915/intel_crt.c
++++ b/drivers/gpu/drm/i915/intel_crt.c
+@@ -304,6 +304,9 @@ intel_crt_mode_valid(struct drm_connector *connector,
+ 	int max_dotclk = dev_priv->max_dotclk_freq;
+ 	int max_clock;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	if (mode->clock < 25000)
+ 		return MODE_CLOCK_LOW;
+ 
+@@ -337,6 +340,12 @@ static bool intel_crt_compute_config(struct intel_encoder *encoder,
+ 				     struct intel_crtc_state *pipe_config,
+ 				     struct drm_connector_state *conn_state)
+ {
++	struct drm_display_mode *adjusted_mode =
++		&pipe_config->base.adjusted_mode;
++
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	return true;
+ }
+ 
+@@ -344,6 +353,12 @@ static bool pch_crt_compute_config(struct intel_encoder *encoder,
+ 				   struct intel_crtc_state *pipe_config,
+ 				   struct drm_connector_state *conn_state)
+ {
++	struct drm_display_mode *adjusted_mode =
++		&pipe_config->base.adjusted_mode;
++
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	pipe_config->has_pch_encoder = true;
+ 
+ 	return true;
+@@ -354,6 +369,11 @@ static bool hsw_crt_compute_config(struct intel_encoder *encoder,
+ 				   struct drm_connector_state *conn_state)
+ {
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
++	struct drm_display_mode *adjusted_mode =
++		&pipe_config->base.adjusted_mode;
++
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
+ 
+ 	pipe_config->has_pch_encoder = true;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_ddi.c b/drivers/gpu/drm/i915/intel_ddi.c
+index 8c2d778560f0..1d14ebc7480d 100644
+--- a/drivers/gpu/drm/i915/intel_ddi.c
++++ b/drivers/gpu/drm/i915/intel_ddi.c
+@@ -2205,7 +2205,8 @@ static void intel_ddi_pre_enable_dp(struct intel_encoder *encoder,
+ 		intel_prepare_dp_ddi_buffers(encoder, crtc_state);
+ 
+ 	intel_ddi_init_dp_buf_reg(encoder);
+-	intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_ON);
++	if (!is_mst)
++		intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_ON);
+ 	intel_dp_start_link_train(intel_dp);
+ 	if (port != PORT_A || INTEL_GEN(dev_priv) >= 9)
+ 		intel_dp_stop_link_train(intel_dp);
+@@ -2303,12 +2304,15 @@ static void intel_ddi_post_disable_dp(struct intel_encoder *encoder,
+ 	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+ 	struct intel_digital_port *dig_port = enc_to_dig_port(&encoder->base);
+ 	struct intel_dp *intel_dp = &dig_port->dp;
++	bool is_mst = intel_crtc_has_type(old_crtc_state,
++					  INTEL_OUTPUT_DP_MST);
+ 
+ 	/*
+ 	 * Power down sink before disabling the port, otherwise we end
+ 	 * up getting interrupts from the sink on detecting link loss.
+ 	 */
+-	intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_OFF);
++	if (!is_mst)
++		intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_OFF);
+ 
+ 	intel_disable_ddi_buf(encoder);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 56004ffbd8bb..84011e08adc3 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -14211,12 +14211,22 @@ static enum drm_mode_status
+ intel_mode_valid(struct drm_device *dev,
+ 		 const struct drm_display_mode *mode)
+ {
++	/*
++	 * Can't reject DBLSCAN here because Xorg ddxen can add piles
++	 * of DBLSCAN modes to the output's mode list when they detect
++	 * the scaling mode property on the connector. And they don't
++	 * ask the kernel to validate those modes in any way until
++	 * modeset time at which point the client gets a protocol error.
++	 * So in order to not upset those clients we silently ignore the
++	 * DBLSCAN flag on such connectors. For other connectors we will
++	 * reject modes with the DBLSCAN flag in encoder->compute_config().
++	 * And we always reject DBLSCAN modes in connector->mode_valid()
++	 * as we never want such modes on the connector's mode list.
++	 */
++
+ 	if (mode->vscan > 1)
+ 		return MODE_NO_VSCAN;
+ 
+-	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+-		return MODE_NO_DBLESCAN;
+-
+ 	if (mode->flags & DRM_MODE_FLAG_HSKEW)
+ 		return MODE_H_ILLEGAL;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index b7b4cfdeb974..cd6e87756509 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -423,6 +423,9 @@ intel_dp_mode_valid(struct drm_connector *connector,
+ 	int max_rate, mode_rate, max_lanes, max_link_clock;
+ 	int max_dotclk;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	max_dotclk = intel_dp_downstream_max_dotclock(intel_dp);
+ 
+ 	if (intel_dp_is_edp(intel_dp) && fixed_mode) {
+@@ -1760,7 +1763,10 @@ intel_dp_compute_config(struct intel_encoder *encoder,
+ 						conn_state->scaling_mode);
+ 	}
+ 
+-	if ((IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) &&
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
++	if (HAS_GMCH_DISPLAY(dev_priv) &&
+ 	    adjusted_mode->flags & DRM_MODE_FLAG_INTERLACE)
+ 		return false;
+ 
+@@ -2759,16 +2765,6 @@ static void intel_disable_dp(struct intel_encoder *encoder,
+ static void g4x_disable_dp(struct intel_encoder *encoder,
+ 			   const struct intel_crtc_state *old_crtc_state,
+ 			   const struct drm_connector_state *old_conn_state)
+-{
+-	intel_disable_dp(encoder, old_crtc_state, old_conn_state);
+-
+-	/* disable the port before the pipe on g4x */
+-	intel_dp_link_down(encoder, old_crtc_state);
+-}
+-
+-static void ilk_disable_dp(struct intel_encoder *encoder,
+-			   const struct intel_crtc_state *old_crtc_state,
+-			   const struct drm_connector_state *old_conn_state)
+ {
+ 	intel_disable_dp(encoder, old_crtc_state, old_conn_state);
+ }
+@@ -2784,13 +2780,19 @@ static void vlv_disable_dp(struct intel_encoder *encoder,
+ 	intel_disable_dp(encoder, old_crtc_state, old_conn_state);
+ }
+ 
+-static void ilk_post_disable_dp(struct intel_encoder *encoder,
++static void g4x_post_disable_dp(struct intel_encoder *encoder,
+ 				const struct intel_crtc_state *old_crtc_state,
+ 				const struct drm_connector_state *old_conn_state)
+ {
+ 	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
+ 	enum port port = encoder->port;
+ 
++	/*
++	 * Bspec does not list a specific disable sequence for g4x DP.
++	 * Follow the ilk+ sequence (disable pipe before the port) for
++	 * g4x DP as it does not suffer from underruns like the normal
++	 * g4x modeset sequence (disable pipe after the port).
++	 */
+ 	intel_dp_link_down(encoder, old_crtc_state);
+ 
+ 	/* Only ilk+ has port A */
+@@ -6327,7 +6329,7 @@ intel_dp_init_connector(struct intel_digital_port *intel_dig_port,
+ 	drm_connector_init(dev, connector, &intel_dp_connector_funcs, type);
+ 	drm_connector_helper_add(connector, &intel_dp_connector_helper_funcs);
+ 
+-	if (!IS_VALLEYVIEW(dev_priv) && !IS_CHERRYVIEW(dev_priv))
++	if (!HAS_GMCH_DISPLAY(dev_priv))
+ 		connector->interlace_allowed = true;
+ 	connector->doublescan_allowed = 0;
+ 
+@@ -6426,15 +6428,11 @@ bool intel_dp_init(struct drm_i915_private *dev_priv,
+ 		intel_encoder->enable = vlv_enable_dp;
+ 		intel_encoder->disable = vlv_disable_dp;
+ 		intel_encoder->post_disable = vlv_post_disable_dp;
+-	} else if (INTEL_GEN(dev_priv) >= 5) {
+-		intel_encoder->pre_enable = g4x_pre_enable_dp;
+-		intel_encoder->enable = g4x_enable_dp;
+-		intel_encoder->disable = ilk_disable_dp;
+-		intel_encoder->post_disable = ilk_post_disable_dp;
+ 	} else {
+ 		intel_encoder->pre_enable = g4x_pre_enable_dp;
+ 		intel_encoder->enable = g4x_enable_dp;
+ 		intel_encoder->disable = g4x_disable_dp;
++		intel_encoder->post_disable = g4x_post_disable_dp;
+ 	}
+ 
+ 	intel_dig_port->dp.output_reg = output_reg;
+diff --git a/drivers/gpu/drm/i915/intel_dp_mst.c b/drivers/gpu/drm/i915/intel_dp_mst.c
+index c3de0918ee13..5890500a3a8b 100644
+--- a/drivers/gpu/drm/i915/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/intel_dp_mst.c
+@@ -48,6 +48,9 @@ static bool intel_dp_mst_compute_config(struct intel_encoder *encoder,
+ 	bool reduce_m_n = drm_dp_has_quirk(&intel_dp->desc,
+ 					   DP_DPCD_QUIRK_LIMITED_M_N);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	pipe_config->has_pch_encoder = false;
+ 	bpp = 24;
+ 	if (intel_dp->compliance.test_data.bpc) {
+@@ -180,9 +183,11 @@ static void intel_mst_post_disable_dp(struct intel_encoder *encoder,
+ 	intel_dp->active_mst_links--;
+ 
+ 	intel_mst->connector = NULL;
+-	if (intel_dp->active_mst_links == 0)
++	if (intel_dp->active_mst_links == 0) {
++		intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_OFF);
+ 		intel_dig_port->base.post_disable(&intel_dig_port->base,
+ 						  old_crtc_state, NULL);
++	}
+ 
+ 	DRM_DEBUG_KMS("active links %d\n", intel_dp->active_mst_links);
+ }
+@@ -223,7 +228,11 @@ static void intel_mst_pre_enable_dp(struct intel_encoder *encoder,
+ 
+ 	DRM_DEBUG_KMS("active links %d\n", intel_dp->active_mst_links);
+ 
++	if (intel_dp->active_mst_links == 0)
++		intel_dp_sink_dpms(intel_dp, DRM_MODE_DPMS_ON);
++
+ 	drm_dp_send_power_updown_phy(&intel_dp->mst_mgr, connector->port, true);
++
+ 	if (intel_dp->active_mst_links == 0)
+ 		intel_dig_port->base.pre_enable(&intel_dig_port->base,
+ 						pipe_config, NULL);
+@@ -360,6 +369,9 @@ intel_dp_mst_mode_valid(struct drm_connector *connector,
+ 	if (!intel_dp)
+ 		return MODE_ERROR;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	max_link_clock = intel_dp_max_link_rate(intel_dp);
+ 	max_lanes = intel_dp_max_lane_count(intel_dp);
+ 
+diff --git a/drivers/gpu/drm/i915/intel_dsi.c b/drivers/gpu/drm/i915/intel_dsi.c
+index 51a1d6868b1e..384b37e2da70 100644
+--- a/drivers/gpu/drm/i915/intel_dsi.c
++++ b/drivers/gpu/drm/i915/intel_dsi.c
+@@ -326,6 +326,9 @@ static bool intel_dsi_compute_config(struct intel_encoder *encoder,
+ 						conn_state->scaling_mode);
+ 	}
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	/* DSI uses short packets for sync events, so clear mode flags for DSI */
+ 	adjusted_mode->flags = 0;
+ 
+@@ -1266,6 +1269,9 @@ intel_dsi_mode_valid(struct drm_connector *connector,
+ 
+ 	DRM_DEBUG_KMS("\n");
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	if (fixed_mode) {
+ 		if (mode->hdisplay > fixed_mode->hdisplay)
+ 			return MODE_PANEL;
+diff --git a/drivers/gpu/drm/i915/intel_dvo.c b/drivers/gpu/drm/i915/intel_dvo.c
+index eb0c559b2715..6604806f89d5 100644
+--- a/drivers/gpu/drm/i915/intel_dvo.c
++++ b/drivers/gpu/drm/i915/intel_dvo.c
+@@ -219,6 +219,9 @@ intel_dvo_mode_valid(struct drm_connector *connector,
+ 	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+ 	int target_clock = mode->clock;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	/* XXX: Validate clock range */
+ 
+ 	if (fixed_mode) {
+@@ -254,6 +257,9 @@ static bool intel_dvo_compute_config(struct intel_encoder *encoder,
+ 	if (fixed_mode)
+ 		intel_fixed_panel_mode(fixed_mode, adjusted_mode);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	return true;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index 1baef4ac7ecb..383f9df4145e 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -1557,6 +1557,9 @@ intel_hdmi_mode_valid(struct drm_connector *connector,
+ 	bool force_dvi =
+ 		READ_ONCE(to_intel_digital_connector_state(connector->state)->force_audio) == HDMI_AUDIO_OFF_DVI;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	clock = mode->clock;
+ 
+ 	if ((mode->flags & DRM_MODE_FLAG_3D_MASK) == DRM_MODE_FLAG_3D_FRAME_PACKING)
+@@ -1677,6 +1680,9 @@ bool intel_hdmi_compute_config(struct intel_encoder *encoder,
+ 	int desired_bpp;
+ 	bool force_dvi = intel_conn_state->force_audio == HDMI_AUDIO_OFF_DVI;
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	pipe_config->has_hdmi_sink = !force_dvi && intel_hdmi->has_hdmi_sink;
+ 
+ 	if (pipe_config->has_hdmi_sink)
+diff --git a/drivers/gpu/drm/i915/intel_lrc.c b/drivers/gpu/drm/i915/intel_lrc.c
+index 8704f7f8d072..df5ba1de8aea 100644
+--- a/drivers/gpu/drm/i915/intel_lrc.c
++++ b/drivers/gpu/drm/i915/intel_lrc.c
+@@ -1386,11 +1386,21 @@ static u32 *gen9_init_indirectctx_bb(struct intel_engine_cs *engine, u32 *batch)
+ 	/* WaFlushCoherentL3CacheLinesAtContextSwitch:skl,bxt,glk */
+ 	batch = gen8_emit_flush_coherentl3_wa(engine, batch);
+ 
++	*batch++ = MI_LOAD_REGISTER_IMM(3);
++
+ 	/* WaDisableGatherAtSetShaderCommonSlice:skl,bxt,kbl,glk */
+-	*batch++ = MI_LOAD_REGISTER_IMM(1);
+ 	*batch++ = i915_mmio_reg_offset(COMMON_SLICE_CHICKEN2);
+ 	*batch++ = _MASKED_BIT_DISABLE(
+ 			GEN9_DISABLE_GATHER_AT_SET_SHADER_COMMON_SLICE);
++
++	/* BSpec: 11391 */
++	*batch++ = i915_mmio_reg_offset(FF_SLICE_CHICKEN);
++	*batch++ = _MASKED_BIT_ENABLE(FF_SLICE_CHICKEN_CL_PROVOKING_VERTEX_FIX);
++
++	/* BSpec: 11299 */
++	*batch++ = i915_mmio_reg_offset(_3D_CHICKEN3);
++	*batch++ = _MASKED_BIT_ENABLE(_3D_CHICKEN_SF_PROVOKING_VERTEX_FIX);
++
+ 	*batch++ = MI_NOOP;
+ 
+ 	/* WaClearSlmSpaceAtContextSwitch:kbl */
+diff --git a/drivers/gpu/drm/i915/intel_lvds.c b/drivers/gpu/drm/i915/intel_lvds.c
+index e125d16a1aa7..34dd1e5233ac 100644
+--- a/drivers/gpu/drm/i915/intel_lvds.c
++++ b/drivers/gpu/drm/i915/intel_lvds.c
+@@ -380,6 +380,8 @@ intel_lvds_mode_valid(struct drm_connector *connector,
+ 	struct drm_display_mode *fixed_mode = intel_connector->panel.fixed_mode;
+ 	int max_pixclk = to_i915(connector->dev)->max_dotclk_freq;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
+ 	if (mode->hdisplay > fixed_mode->hdisplay)
+ 		return MODE_PANEL;
+ 	if (mode->vdisplay > fixed_mode->vdisplay)
+@@ -429,6 +431,9 @@ static bool intel_lvds_compute_config(struct intel_encoder *intel_encoder,
+ 	intel_fixed_panel_mode(intel_connector->panel.fixed_mode,
+ 			       adjusted_mode);
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	if (HAS_PCH_SPLIT(dev_priv)) {
+ 		pipe_config->has_pch_encoder = true;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
+index 96e213ec202d..d253e3a06e30 100644
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -1160,6 +1160,9 @@ static bool intel_sdvo_compute_config(struct intel_encoder *encoder,
+ 							   adjusted_mode);
+ 	}
+ 
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
+ 	/*
+ 	 * Make the CRTC code factor in the SDVO pixel multiplier.  The
+ 	 * SDVO device will factor out the multiplier during mode_set.
+@@ -1621,6 +1624,9 @@ intel_sdvo_mode_valid(struct drm_connector *connector,
+ 	struct intel_sdvo *intel_sdvo = intel_attached_sdvo(connector);
+ 	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	if (intel_sdvo->pixel_clock_min > mode->clock)
+ 		return MODE_CLOCK_LOW;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
+index 885fc3809f7f..b55b5c157e38 100644
+--- a/drivers/gpu/drm/i915/intel_tv.c
++++ b/drivers/gpu/drm/i915/intel_tv.c
+@@ -850,6 +850,9 @@ intel_tv_mode_valid(struct drm_connector *connector,
+ 	const struct tv_mode *tv_mode = intel_tv_mode_find(connector->state);
+ 	int max_dotclk = to_i915(connector->dev)->max_dotclk_freq;
+ 
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return MODE_NO_DBLESCAN;
++
+ 	if (mode->clock > max_dotclk)
+ 		return MODE_CLOCK_HIGH;
+ 
+@@ -877,16 +880,21 @@ intel_tv_compute_config(struct intel_encoder *encoder,
+ 			struct drm_connector_state *conn_state)
+ {
+ 	const struct tv_mode *tv_mode = intel_tv_mode_find(conn_state);
++	struct drm_display_mode *adjusted_mode =
++		&pipe_config->base.adjusted_mode;
+ 
+ 	if (!tv_mode)
+ 		return false;
+ 
+-	pipe_config->base.adjusted_mode.crtc_clock = tv_mode->clock;
++	if (adjusted_mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		return false;
++
++	adjusted_mode->crtc_clock = tv_mode->clock;
+ 	DRM_DEBUG_KMS("forcing bpc to 8 for TV\n");
+ 	pipe_config->pipe_bpp = 8*3;
+ 
+ 	/* TV has it's own notion of sync and other mode flags, so clear them. */
+-	pipe_config->base.adjusted_mode.flags = 0;
++	adjusted_mode->flags = 0;
+ 
+ 	/*
+ 	 * FIXME: We don't check whether the input mode is actually what we want
+diff --git a/drivers/gpu/drm/qxl/qxl_display.c b/drivers/gpu/drm/qxl/qxl_display.c
+index ecb35ed0eac8..61e51516fec5 100644
+--- a/drivers/gpu/drm/qxl/qxl_display.c
++++ b/drivers/gpu/drm/qxl/qxl_display.c
+@@ -630,7 +630,7 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
+ 	struct qxl_cursor_cmd *cmd;
+ 	struct qxl_cursor *cursor;
+ 	struct drm_gem_object *obj;
+-	struct qxl_bo *cursor_bo = NULL, *user_bo = NULL;
++	struct qxl_bo *cursor_bo = NULL, *user_bo = NULL, *old_cursor_bo = NULL;
+ 	int ret;
+ 	void *user_ptr;
+ 	int size = 64*64*4;
+@@ -684,7 +684,7 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
+ 							   cursor_bo, 0);
+ 		cmd->type = QXL_CURSOR_SET;
+ 
+-		qxl_bo_unref(&qcrtc->cursor_bo);
++		old_cursor_bo = qcrtc->cursor_bo;
+ 		qcrtc->cursor_bo = cursor_bo;
+ 		cursor_bo = NULL;
+ 	} else {
+@@ -704,6 +704,9 @@ static void qxl_cursor_atomic_update(struct drm_plane *plane,
+ 	qxl_push_cursor_ring_release(qdev, release, QXL_CMD_CURSOR, false);
+ 	qxl_release_fence_buffer_objects(release);
+ 
++	if (old_cursor_bo)
++		qxl_bo_unref(&old_cursor_bo);
++
+ 	qxl_bo_unref(&cursor_bo);
+ 
+ 	return;
+diff --git a/drivers/gpu/drm/sti/Kconfig b/drivers/gpu/drm/sti/Kconfig
+index cca4b3c9aeb5..1963cc1b1cc5 100644
+--- a/drivers/gpu/drm/sti/Kconfig
++++ b/drivers/gpu/drm/sti/Kconfig
+@@ -1,6 +1,6 @@
+ config DRM_STI
+ 	tristate "DRM Support for STMicroelectronics SoC stiH4xx Series"
+-	depends on DRM && (ARCH_STI || ARCH_MULTIPLATFORM)
++	depends on OF && DRM && (ARCH_STI || ARCH_MULTIPLATFORM)
+ 	select RESET_CONTROLLER
+ 	select DRM_KMS_HELPER
+ 	select DRM_GEM_CMA_HELPER
+@@ -8,6 +8,5 @@ config DRM_STI
+ 	select DRM_PANEL
+ 	select FW_LOADER
+ 	select SND_SOC_HDMI_CODEC if SND_SOC
+-	select OF
+ 	help
+ 	  Choose this option to enable DRM on STM stiH4xx chipset
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index c3d92d537240..8045871335b5 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -17,7 +17,6 @@
+ #include <drm/drm_encoder.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_of.h>
+-#include <drm/drm_panel.h>
+ 
+ #include <uapi/drm/drm_mode.h>
+ 
+@@ -350,9 +349,6 @@ static void sun4i_tcon0_mode_set_lvds(struct sun4i_tcon *tcon,
+ static void sun4i_tcon0_mode_set_rgb(struct sun4i_tcon *tcon,
+ 				     const struct drm_display_mode *mode)
+ {
+-	struct drm_panel *panel = tcon->panel;
+-	struct drm_connector *connector = panel->connector;
+-	struct drm_display_info display_info = connector->display_info;
+ 	unsigned int bp, hsync, vsync;
+ 	u8 clk_delay;
+ 	u32 val = 0;
+@@ -410,27 +406,6 @@ static void sun4i_tcon0_mode_set_rgb(struct sun4i_tcon *tcon,
+ 	if (mode->flags & DRM_MODE_FLAG_PVSYNC)
+ 		val |= SUN4I_TCON0_IO_POL_VSYNC_POSITIVE;
+ 
+-	/*
+-	 * On A20 and similar SoCs, the only way to achieve Positive Edge
+-	 * (Rising Edge), is setting dclk clock phase to 2/3(240°).
+-	 * By default TCON works in Negative Edge(Falling Edge),
+-	 * this is why phase is set to 0 in that case.
+-	 * Unfortunately there's no way to logically invert dclk through
+-	 * IO_POL register.
+-	 * The only acceptable way to work, triple checked with scope,
+-	 * is using clock phase set to 0° for Negative Edge and set to 240°
+-	 * for Positive Edge.
+-	 * On A33 and similar SoCs there would be a 90° phase option,
+-	 * but it divides also dclk by 2.
+-	 * Following code is a way to avoid quirks all around TCON
+-	 * and DOTCLOCK drivers.
+-	 */
+-	if (display_info.bus_flags & DRM_BUS_FLAG_PIXDATA_POSEDGE)
+-		clk_set_phase(tcon->dclk, 240);
+-
+-	if (display_info.bus_flags & DRM_BUS_FLAG_PIXDATA_NEGEDGE)
+-		clk_set_phase(tcon->dclk, 0);
+-
+ 	regmap_update_bits(tcon->regs, SUN4I_TCON0_IO_POL_REG,
+ 			   SUN4I_TCON0_IO_POL_HSYNC_POSITIVE | SUN4I_TCON0_IO_POL_VSYNC_POSITIVE,
+ 			   val);
+diff --git a/drivers/iio/accel/mma8452.c b/drivers/iio/accel/mma8452.c
+index 7a2da7f9d4dc..5485b35fe553 100644
+--- a/drivers/iio/accel/mma8452.c
++++ b/drivers/iio/accel/mma8452.c
+@@ -1034,7 +1034,7 @@ static irqreturn_t mma8452_interrupt(int irq, void *p)
+ 	if (src < 0)
+ 		return IRQ_NONE;
+ 
+-	if (!(src & data->chip_info->enabled_events))
++	if (!(src & (data->chip_info->enabled_events | MMA8452_INT_DRDY)))
+ 		return IRQ_NONE;
+ 
+ 	if (src & MMA8452_INT_DRDY) {
+diff --git a/drivers/staging/android/ion/ion_heap.c b/drivers/staging/android/ion/ion_heap.c
+index 772dad65396e..f32c12439eee 100644
+--- a/drivers/staging/android/ion/ion_heap.c
++++ b/drivers/staging/android/ion/ion_heap.c
+@@ -29,7 +29,7 @@ void *ion_heap_map_kernel(struct ion_heap *heap,
+ 	struct page **tmp = pages;
+ 
+ 	if (!pages)
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	if (buffer->flags & ION_FLAG_CACHED)
+ 		pgprot = PAGE_KERNEL;
+diff --git a/drivers/tty/n_tty.c b/drivers/tty/n_tty.c
+index cbe98bc2b998..431742201709 100644
+--- a/drivers/tty/n_tty.c
++++ b/drivers/tty/n_tty.c
+@@ -124,6 +124,8 @@ struct n_tty_data {
+ 	struct mutex output_lock;
+ };
+ 
++#define MASK(x) ((x) & (N_TTY_BUF_SIZE - 1))
++
+ static inline size_t read_cnt(struct n_tty_data *ldata)
+ {
+ 	return ldata->read_head - ldata->read_tail;
+@@ -141,6 +143,7 @@ static inline unsigned char *read_buf_addr(struct n_tty_data *ldata, size_t i)
+ 
+ static inline unsigned char echo_buf(struct n_tty_data *ldata, size_t i)
+ {
++	smp_rmb(); /* Matches smp_wmb() in add_echo_byte(). */
+ 	return ldata->echo_buf[i & (N_TTY_BUF_SIZE - 1)];
+ }
+ 
+@@ -316,9 +319,7 @@ static inline void put_tty_queue(unsigned char c, struct n_tty_data *ldata)
+ static void reset_buffer_flags(struct n_tty_data *ldata)
+ {
+ 	ldata->read_head = ldata->canon_head = ldata->read_tail = 0;
+-	ldata->echo_head = ldata->echo_tail = ldata->echo_commit = 0;
+ 	ldata->commit_head = 0;
+-	ldata->echo_mark = 0;
+ 	ldata->line_start = 0;
+ 
+ 	ldata->erasing = 0;
+@@ -617,12 +618,19 @@ static size_t __process_echoes(struct tty_struct *tty)
+ 	old_space = space = tty_write_room(tty);
+ 
+ 	tail = ldata->echo_tail;
+-	while (ldata->echo_commit != tail) {
++	while (MASK(ldata->echo_commit) != MASK(tail)) {
+ 		c = echo_buf(ldata, tail);
+ 		if (c == ECHO_OP_START) {
+ 			unsigned char op;
+ 			int no_space_left = 0;
+ 
++			/*
++			 * Since add_echo_byte() is called without holding
++			 * output_lock, we might see only portion of multi-byte
++			 * operation.
++			 */
++			if (MASK(ldata->echo_commit) == MASK(tail + 1))
++				goto not_yet_stored;
+ 			/*
+ 			 * If the buffer byte is the start of a multi-byte
+ 			 * operation, get the next byte, which is either the
+@@ -634,6 +642,8 @@ static size_t __process_echoes(struct tty_struct *tty)
+ 				unsigned int num_chars, num_bs;
+ 
+ 			case ECHO_OP_ERASE_TAB:
++				if (MASK(ldata->echo_commit) == MASK(tail + 2))
++					goto not_yet_stored;
+ 				num_chars = echo_buf(ldata, tail + 2);
+ 
+ 				/*
+@@ -728,7 +738,8 @@ static size_t __process_echoes(struct tty_struct *tty)
+ 	/* If the echo buffer is nearly full (so that the possibility exists
+ 	 * of echo overrun before the next commit), then discard enough
+ 	 * data at the tail to prevent a subsequent overrun */
+-	while (ldata->echo_commit - tail >= ECHO_DISCARD_WATERMARK) {
++	while (ldata->echo_commit > tail &&
++	       ldata->echo_commit - tail >= ECHO_DISCARD_WATERMARK) {
+ 		if (echo_buf(ldata, tail) == ECHO_OP_START) {
+ 			if (echo_buf(ldata, tail + 1) == ECHO_OP_ERASE_TAB)
+ 				tail += 3;
+@@ -738,6 +749,7 @@ static size_t __process_echoes(struct tty_struct *tty)
+ 			tail++;
+ 	}
+ 
++ not_yet_stored:
+ 	ldata->echo_tail = tail;
+ 	return old_space - space;
+ }
+@@ -748,6 +760,7 @@ static void commit_echoes(struct tty_struct *tty)
+ 	size_t nr, old, echoed;
+ 	size_t head;
+ 
++	mutex_lock(&ldata->output_lock);
+ 	head = ldata->echo_head;
+ 	ldata->echo_mark = head;
+ 	old = ldata->echo_commit - ldata->echo_tail;
+@@ -756,10 +769,12 @@ static void commit_echoes(struct tty_struct *tty)
+ 	 * is over the threshold (and try again each time another
+ 	 * block is accumulated) */
+ 	nr = head - ldata->echo_tail;
+-	if (nr < ECHO_COMMIT_WATERMARK || (nr % ECHO_BLOCK > old % ECHO_BLOCK))
++	if (nr < ECHO_COMMIT_WATERMARK ||
++	    (nr % ECHO_BLOCK > old % ECHO_BLOCK)) {
++		mutex_unlock(&ldata->output_lock);
+ 		return;
++	}
+ 
+-	mutex_lock(&ldata->output_lock);
+ 	ldata->echo_commit = head;
+ 	echoed = __process_echoes(tty);
+ 	mutex_unlock(&ldata->output_lock);
+@@ -810,7 +825,9 @@ static void flush_echoes(struct tty_struct *tty)
+ 
+ static inline void add_echo_byte(unsigned char c, struct n_tty_data *ldata)
+ {
+-	*echo_buf_addr(ldata, ldata->echo_head++) = c;
++	*echo_buf_addr(ldata, ldata->echo_head) = c;
++	smp_wmb(); /* Matches smp_rmb() in echo_buf(). */
++	ldata->echo_head++;
+ }
+ 
+ /**
+@@ -978,14 +995,15 @@ static void eraser(unsigned char c, struct tty_struct *tty)
+ 	}
+ 
+ 	seen_alnums = 0;
+-	while (ldata->read_head != ldata->canon_head) {
++	while (MASK(ldata->read_head) != MASK(ldata->canon_head)) {
+ 		head = ldata->read_head;
+ 
+ 		/* erase a single possibly multibyte character */
+ 		do {
+ 			head--;
+ 			c = read_buf(ldata, head);
+-		} while (is_continuation(c, tty) && head != ldata->canon_head);
++		} while (is_continuation(c, tty) &&
++			 MASK(head) != MASK(ldata->canon_head));
+ 
+ 		/* do not partially erase */
+ 		if (is_continuation(c, tty))
+@@ -1027,7 +1045,7 @@ static void eraser(unsigned char c, struct tty_struct *tty)
+ 				 * This info is used to go back the correct
+ 				 * number of columns.
+ 				 */
+-				while (tail != ldata->canon_head) {
++				while (MASK(tail) != MASK(ldata->canon_head)) {
+ 					tail--;
+ 					c = read_buf(ldata, tail);
+ 					if (c == '\t') {
+@@ -1302,7 +1320,7 @@ n_tty_receive_char_special(struct tty_struct *tty, unsigned char c)
+ 			finish_erasing(ldata);
+ 			echo_char(c, tty);
+ 			echo_char_raw('\n', ldata);
+-			while (tail != ldata->read_head) {
++			while (MASK(tail) != MASK(ldata->read_head)) {
+ 				echo_char(read_buf(ldata, tail), tty);
+ 				tail++;
+ 			}
+@@ -1878,30 +1896,21 @@ static int n_tty_open(struct tty_struct *tty)
+ 	struct n_tty_data *ldata;
+ 
+ 	/* Currently a malloc failure here can panic */
+-	ldata = vmalloc(sizeof(*ldata));
++	ldata = vzalloc(sizeof(*ldata));
+ 	if (!ldata)
+-		goto err;
++		return -ENOMEM;
+ 
+ 	ldata->overrun_time = jiffies;
+ 	mutex_init(&ldata->atomic_read_lock);
+ 	mutex_init(&ldata->output_lock);
+ 
+ 	tty->disc_data = ldata;
+-	reset_buffer_flags(tty->disc_data);
+-	ldata->column = 0;
+-	ldata->canon_column = 0;
+-	ldata->num_overrun = 0;
+-	ldata->no_room = 0;
+-	ldata->lnext = 0;
+ 	tty->closing = 0;
+ 	/* indicate buffer work may resume */
+ 	clear_bit(TTY_LDISC_HALTED, &tty->flags);
+ 	n_tty_set_termios(tty, NULL);
+ 	tty_unthrottle(tty);
+-
+ 	return 0;
+-err:
+-	return -ENOMEM;
+ }
+ 
+ static inline int input_available_p(struct tty_struct *tty, int poll)
+@@ -2411,7 +2420,7 @@ static unsigned long inq_canon(struct n_tty_data *ldata)
+ 	tail = ldata->read_tail;
+ 	nr = head - tail;
+ 	/* Skip EOF-chars.. */
+-	while (head != tail) {
++	while (MASK(head) != MASK(tail)) {
+ 		if (test_bit(tail & (N_TTY_BUF_SIZE - 1), ldata->read_flags) &&
+ 		    read_buf(ldata, tail) == __DISABLED_CHAR)
+ 			nr--;
+diff --git a/drivers/tty/serdev/core.c b/drivers/tty/serdev/core.c
+index df93b727e984..9e59f4788589 100644
+--- a/drivers/tty/serdev/core.c
++++ b/drivers/tty/serdev/core.c
+@@ -617,6 +617,7 @@ EXPORT_SYMBOL_GPL(__serdev_device_driver_register);
+ static void __exit serdev_exit(void)
+ {
+ 	bus_unregister(&serdev_bus_type);
++	ida_destroy(&ctrl_ida);
+ }
+ module_exit(serdev_exit);
+ 
+diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
+index 3296a05cda2d..f80a300b5d68 100644
+--- a/drivers/tty/serial/8250/8250_pci.c
++++ b/drivers/tty/serial/8250/8250_pci.c
+@@ -3339,9 +3339,7 @@ static const struct pci_device_id blacklist[] = {
+ 	/* multi-io cards handled by parport_serial */
+ 	{ PCI_DEVICE(0x4348, 0x7053), }, /* WCH CH353 2S1P */
+ 	{ PCI_DEVICE(0x4348, 0x5053), }, /* WCH CH353 1S1P */
+-	{ PCI_DEVICE(0x4348, 0x7173), }, /* WCH CH355 4S */
+ 	{ PCI_DEVICE(0x1c00, 0x3250), }, /* WCH CH382 2S1P */
+-	{ PCI_DEVICE(0x1c00, 0x3470), }, /* WCH CH384 4S */
+ 
+ 	/* Moxa Smartio MUE boards handled by 8250_moxa */
+ 	{ PCI_VDEVICE(MOXA, 0x1024), },
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index f97251f39c26..ec17c9fd6470 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -784,7 +784,7 @@ int vc_allocate(unsigned int currcons)	/* return 0 on success */
+ 	if (!*vc->vc_uni_pagedir_loc)
+ 		con_set_default_unimap(vc);
+ 
+-	vc->vc_screenbuf = kmalloc(vc->vc_screenbuf_size, GFP_KERNEL);
++	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
+ 	if (!vc->vc_screenbuf)
+ 		goto err_free;
+ 
+@@ -871,7 +871,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 
+ 	if (new_screen_size > (4 << 20))
+ 		return -EINVAL;
+-	newscreen = kmalloc(new_screen_size, GFP_USER);
++	newscreen = kzalloc(new_screen_size, GFP_USER);
+ 	if (!newscreen)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 7b366a6c0b49..998b32d0167e 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -1758,6 +1758,9 @@ static const struct usb_device_id acm_ids[] = {
+ 	{ USB_DEVICE(0x11ca, 0x0201), /* VeriFone Mx870 Gadget Serial */
+ 	.driver_info = SINGLE_RX_URB,
+ 	},
++	{ USB_DEVICE(0x1965, 0x0018), /* Uniden UBC125XLT */
++	.driver_info = NO_UNION_NORMAL, /* has no union descriptor */
++	},
+ 	{ USB_DEVICE(0x22b8, 0x7000), /* Motorola Q Phone */
+ 	.driver_info = NO_UNION_NORMAL, /* has no union descriptor */
+ 	},
+diff --git a/drivers/usb/dwc2/hcd_queue.c b/drivers/usb/dwc2/hcd_queue.c
+index e34ad5e65350..6baa75da7907 100644
+--- a/drivers/usb/dwc2/hcd_queue.c
++++ b/drivers/usb/dwc2/hcd_queue.c
+@@ -383,7 +383,7 @@ static unsigned long *dwc2_get_ls_map(struct dwc2_hsotg *hsotg,
+ 	/* Get the map and adjust if this is a multi_tt hub */
+ 	map = qh->dwc_tt->periodic_bitmaps;
+ 	if (qh->dwc_tt->usb_tt->multi)
+-		map += DWC2_ELEMENTS_PER_LS_BITMAP * qh->ttport;
++		map += DWC2_ELEMENTS_PER_LS_BITMAP * (qh->ttport - 1);
+ 
+ 	return map;
+ }
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index e5ace8995b3b..99e7547f234f 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -878,12 +878,12 @@ void xhci_free_virt_device(struct xhci_hcd *xhci, int slot_id)
+ 
+ 	dev = xhci->devs[slot_id];
+ 
+-	trace_xhci_free_virt_device(dev);
+-
+ 	xhci->dcbaa->dev_context_ptrs[slot_id] = 0;
+ 	if (!dev)
+ 		return;
+ 
++	trace_xhci_free_virt_device(dev);
++
+ 	if (dev->tt_info)
+ 		old_active_eps = dev->tt_info->active_eps;
+ 
+diff --git a/drivers/usb/host/xhci-trace.h b/drivers/usb/host/xhci-trace.h
+index 410544ffe78f..88b427434bd8 100644
+--- a/drivers/usb/host/xhci-trace.h
++++ b/drivers/usb/host/xhci-trace.h
+@@ -171,6 +171,37 @@ DEFINE_EVENT(xhci_log_trb, xhci_dbc_gadget_ep_queue,
+ 	TP_ARGS(ring, trb)
+ );
+ 
++DECLARE_EVENT_CLASS(xhci_log_free_virt_dev,
++	TP_PROTO(struct xhci_virt_device *vdev),
++	TP_ARGS(vdev),
++	TP_STRUCT__entry(
++		__field(void *, vdev)
++		__field(unsigned long long, out_ctx)
++		__field(unsigned long long, in_ctx)
++		__field(u8, fake_port)
++		__field(u8, real_port)
++		__field(u16, current_mel)
++
++	),
++	TP_fast_assign(
++		__entry->vdev = vdev;
++		__entry->in_ctx = (unsigned long long) vdev->in_ctx->dma;
++		__entry->out_ctx = (unsigned long long) vdev->out_ctx->dma;
++		__entry->fake_port = (u8) vdev->fake_port;
++		__entry->real_port = (u8) vdev->real_port;
++		__entry->current_mel = (u16) vdev->current_mel;
++		),
++	TP_printk("vdev %p ctx %llx | %llx fake_port %d real_port %d current_mel %d",
++		__entry->vdev, __entry->in_ctx, __entry->out_ctx,
++		__entry->fake_port, __entry->real_port, __entry->current_mel
++	)
++);
++
++DEFINE_EVENT(xhci_log_free_virt_dev, xhci_free_virt_device,
++	TP_PROTO(struct xhci_virt_device *vdev),
++	TP_ARGS(vdev)
++);
++
+ DECLARE_EVENT_CLASS(xhci_log_virt_dev,
+ 	TP_PROTO(struct xhci_virt_device *vdev),
+ 	TP_ARGS(vdev),
+@@ -208,11 +239,6 @@ DEFINE_EVENT(xhci_log_virt_dev, xhci_alloc_virt_device,
+ 	TP_ARGS(vdev)
+ );
+ 
+-DEFINE_EVENT(xhci_log_virt_dev, xhci_free_virt_device,
+-	TP_PROTO(struct xhci_virt_device *vdev),
+-	TP_ARGS(vdev)
+-);
+-
+ DEFINE_EVENT(xhci_log_virt_dev, xhci_setup_device,
+ 	TP_PROTO(struct xhci_virt_device *vdev),
+ 	TP_ARGS(vdev)
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index eb6c26cbe579..ee0cc1d90b51 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -95,6 +95,9 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x8156) }, /* B&G H3000 link cable */
+ 	{ USB_DEVICE(0x10C4, 0x815E) }, /* Helicomm IP-Link 1220-DVM */
+ 	{ USB_DEVICE(0x10C4, 0x815F) }, /* Timewave HamLinkUSB */
++	{ USB_DEVICE(0x10C4, 0x817C) }, /* CESINEL MEDCAL N Power Quality Monitor */
++	{ USB_DEVICE(0x10C4, 0x817D) }, /* CESINEL MEDCAL NT Power Quality Monitor */
++	{ USB_DEVICE(0x10C4, 0x817E) }, /* CESINEL MEDCAL S Power Quality Monitor */
+ 	{ USB_DEVICE(0x10C4, 0x818B) }, /* AVIT Research USB to TTL */
+ 	{ USB_DEVICE(0x10C4, 0x819F) }, /* MJS USB Toslink Switcher */
+ 	{ USB_DEVICE(0x10C4, 0x81A6) }, /* ThinkOptics WavIt */
+@@ -112,6 +115,9 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x826B) }, /* Cygnal Integrated Products, Inc., Fasttrax GPS demonstration module */
+ 	{ USB_DEVICE(0x10C4, 0x8281) }, /* Nanotec Plug & Drive */
+ 	{ USB_DEVICE(0x10C4, 0x8293) }, /* Telegesis ETRX2USB */
++	{ USB_DEVICE(0x10C4, 0x82EF) }, /* CESINEL FALCO 6105 AC Power Supply */
++	{ USB_DEVICE(0x10C4, 0x82F1) }, /* CESINEL MEDCAL EFD Earth Fault Detector */
++	{ USB_DEVICE(0x10C4, 0x82F2) }, /* CESINEL MEDCAL ST Network Analyzer */
+ 	{ USB_DEVICE(0x10C4, 0x82F4) }, /* Starizona MicroTouch */
+ 	{ USB_DEVICE(0x10C4, 0x82F9) }, /* Procyon AVS */
+ 	{ USB_DEVICE(0x10C4, 0x8341) }, /* Siemens MC35PU GPRS Modem */
+@@ -124,7 +130,9 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x8470) }, /* Juniper Networks BX Series System Console */
+ 	{ USB_DEVICE(0x10C4, 0x8477) }, /* Balluff RFID */
+ 	{ USB_DEVICE(0x10C4, 0x84B6) }, /* Starizona Hyperion */
++	{ USB_DEVICE(0x10C4, 0x851E) }, /* CESINEL MEDCAL PT Network Analyzer */
+ 	{ USB_DEVICE(0x10C4, 0x85A7) }, /* LifeScan OneTouch Verio IQ */
++	{ USB_DEVICE(0x10C4, 0x85B8) }, /* CESINEL ReCon T Energy Logger */
+ 	{ USB_DEVICE(0x10C4, 0x85EA) }, /* AC-Services IBUS-IF */
+ 	{ USB_DEVICE(0x10C4, 0x85EB) }, /* AC-Services CIS-IBUS */
+ 	{ USB_DEVICE(0x10C4, 0x85F8) }, /* Virtenio Preon32 */
+@@ -134,17 +142,23 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x8857) },	/* CEL EM357 ZigBee USB Stick */
+ 	{ USB_DEVICE(0x10C4, 0x88A4) }, /* MMB Networks ZigBee USB Device */
+ 	{ USB_DEVICE(0x10C4, 0x88A5) }, /* Planet Innovation Ingeni ZigBee USB Device */
++	{ USB_DEVICE(0x10C4, 0x88FB) }, /* CESINEL MEDCAL STII Network Analyzer */
++	{ USB_DEVICE(0x10C4, 0x8938) }, /* CESINEL MEDCAL S II Network Analyzer */
+ 	{ USB_DEVICE(0x10C4, 0x8946) }, /* Ketra N1 Wireless Interface */
+ 	{ USB_DEVICE(0x10C4, 0x8962) }, /* Brim Brothers charging dock */
+ 	{ USB_DEVICE(0x10C4, 0x8977) },	/* CEL MeshWorks DevKit Device */
+ 	{ USB_DEVICE(0x10C4, 0x8998) }, /* KCF Technologies PRN */
++	{ USB_DEVICE(0x10C4, 0x89A4) }, /* CESINEL FTBC Flexible Thyristor Bridge Controller */
+ 	{ USB_DEVICE(0x10C4, 0x8A2A) }, /* HubZ dual ZigBee and Z-Wave dongle */
+ 	{ USB_DEVICE(0x10C4, 0x8A5E) }, /* CEL EM3588 ZigBee USB Stick Long Range */
+ 	{ USB_DEVICE(0x10C4, 0x8B34) }, /* Qivicon ZigBee USB Radio Stick */
+ 	{ USB_DEVICE(0x10C4, 0xEA60) }, /* Silicon Labs factory default */
+ 	{ USB_DEVICE(0x10C4, 0xEA61) }, /* Silicon Labs factory default */
++	{ USB_DEVICE(0x10C4, 0xEA63) }, /* Silicon Labs Windows Update (CP2101-4/CP2102N) */
+ 	{ USB_DEVICE(0x10C4, 0xEA70) }, /* Silicon Labs factory default */
+ 	{ USB_DEVICE(0x10C4, 0xEA71) }, /* Infinity GPS-MIC-1 Radio Monophone */
++	{ USB_DEVICE(0x10C4, 0xEA7A) }, /* Silicon Labs Windows Update (CP2105) */
++	{ USB_DEVICE(0x10C4, 0xEA7B) }, /* Silicon Labs Windows Update (CP2108) */
+ 	{ USB_DEVICE(0x10C4, 0xF001) }, /* Elan Digital Systems USBscope50 */
+ 	{ USB_DEVICE(0x10C4, 0xF002) }, /* Elan Digital Systems USBwave12 */
+ 	{ USB_DEVICE(0x10C4, 0xF003) }, /* Elan Digital Systems USBpulse100 */
+diff --git a/drivers/usb/typec/tcpm.c b/drivers/usb/typec/tcpm.c
+index ded49e3bf2b0..9b29b67191bc 100644
+--- a/drivers/usb/typec/tcpm.c
++++ b/drivers/usb/typec/tcpm.c
+@@ -388,17 +388,18 @@ static void _tcpm_log(struct tcpm_port *port, const char *fmt, va_list args)
+ 	u64 ts_nsec = local_clock();
+ 	unsigned long rem_nsec;
+ 
++	mutex_lock(&port->logbuffer_lock);
+ 	if (!port->logbuffer[port->logbuffer_head]) {
+ 		port->logbuffer[port->logbuffer_head] =
+ 				kzalloc(LOG_BUFFER_ENTRY_SIZE, GFP_KERNEL);
+-		if (!port->logbuffer[port->logbuffer_head])
++		if (!port->logbuffer[port->logbuffer_head]) {
++			mutex_unlock(&port->logbuffer_lock);
+ 			return;
++		}
+ 	}
+ 
+ 	vsnprintf(tmpbuffer, sizeof(tmpbuffer), fmt, args);
+ 
+-	mutex_lock(&port->logbuffer_lock);
+-
+ 	if (tcpm_log_full(port)) {
+ 		port->logbuffer_head = max(port->logbuffer_head - 1, 0);
+ 		strcpy(tmpbuffer, "overflow");
+diff --git a/drivers/usb/typec/ucsi/ucsi.c b/drivers/usb/typec/ucsi/ucsi.c
+index bd5cca5632b3..8d0a6fe748bd 100644
+--- a/drivers/usb/typec/ucsi/ucsi.c
++++ b/drivers/usb/typec/ucsi/ucsi.c
+@@ -350,6 +350,19 @@ static void ucsi_connector_change(struct work_struct *work)
+ 	}
+ 
+ 	if (con->status.change & UCSI_CONSTAT_CONNECT_CHANGE) {
++		typec_set_pwr_role(con->port, con->status.pwr_dir);
++
++		switch (con->status.partner_type) {
++		case UCSI_CONSTAT_PARTNER_TYPE_UFP:
++			typec_set_data_role(con->port, TYPEC_HOST);
++			break;
++		case UCSI_CONSTAT_PARTNER_TYPE_DFP:
++			typec_set_data_role(con->port, TYPEC_DEVICE);
++			break;
++		default:
++			break;
++		}
++
+ 		if (con->status.connected)
+ 			ucsi_register_partner(con);
+ 		else
+diff --git a/drivers/usb/typec/ucsi/ucsi_acpi.c b/drivers/usb/typec/ucsi/ucsi_acpi.c
+index 44eb4e1ea817..a18112a83fae 100644
+--- a/drivers/usb/typec/ucsi/ucsi_acpi.c
++++ b/drivers/usb/typec/ucsi/ucsi_acpi.c
+@@ -79,6 +79,11 @@ static int ucsi_acpi_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
++	/* This will make sure we can use ioremap_nocache() */
++	status = acpi_release_memory(ACPI_HANDLE(&pdev->dev), res, 1);
++	if (ACPI_FAILURE(status))
++		return -ENOMEM;
++
+ 	/*
+ 	 * NOTE: The memory region for the data structures is used also in an
+ 	 * operation region, which means ACPI has already reserved it. Therefore
+diff --git a/include/linux/acpi.h b/include/linux/acpi.h
+index 15bfb15c2fa5..a6a7ae897b40 100644
+--- a/include/linux/acpi.h
++++ b/include/linux/acpi.h
+@@ -443,6 +443,9 @@ int acpi_check_resource_conflict(const struct resource *res);
+ int acpi_check_region(resource_size_t start, resource_size_t n,
+ 		      const char *name);
+ 
++acpi_status acpi_release_memory(acpi_handle handle, struct resource *res,
++				u32 level);
++
+ int acpi_resources_are_enforced(void);
+ 
+ #ifdef CONFIG_HIBERNATION
+diff --git a/net/ipv6/netfilter/ip6t_rpfilter.c b/net/ipv6/netfilter/ip6t_rpfilter.c
+index d12f511929f5..0fe61ede77c6 100644
+--- a/net/ipv6/netfilter/ip6t_rpfilter.c
++++ b/net/ipv6/netfilter/ip6t_rpfilter.c
+@@ -48,6 +48,8 @@ static bool rpfilter_lookup_reverse6(struct net *net, const struct sk_buff *skb,
+ 	}
+ 
+ 	fl6.flowi6_mark = flags & XT_RPFILTER_VALID_MARK ? skb->mark : 0;
++	if ((flags & XT_RPFILTER_LOOSE) == 0)
++		fl6.flowi6_oif = dev->ifindex;
+ 
+ 	rt = (void *)ip6_route_lookup(net, &fl6, skb, lookup_flags);
+ 	if (rt->dst.error)
+diff --git a/net/netfilter/nf_tables_core.c b/net/netfilter/nf_tables_core.c
+index 40e744572283..32b7896929f3 100644
+--- a/net/netfilter/nf_tables_core.c
++++ b/net/netfilter/nf_tables_core.c
+@@ -208,7 +208,8 @@ nft_do_chain(struct nft_pktinfo *pkt, void *priv)
+ 
+ 	switch (regs.verdict.code) {
+ 	case NFT_JUMP:
+-		BUG_ON(stackptr >= NFT_JUMP_STACK_SIZE);
++		if (WARN_ON_ONCE(stackptr >= NFT_JUMP_STACK_SIZE))
++			return NF_DROP;
+ 		jumpstack[stackptr].chain = chain;
+ 		jumpstack[stackptr].rule  = rule;
+ 		jumpstack[stackptr].rulenum = rulenum;
+diff --git a/net/netfilter/xt_connmark.c b/net/netfilter/xt_connmark.c
+index 94df000abb92..29c38aa7f726 100644
+--- a/net/netfilter/xt_connmark.c
++++ b/net/netfilter/xt_connmark.c
+@@ -211,7 +211,7 @@ static int __init connmark_mt_init(void)
+ static void __exit connmark_mt_exit(void)
+ {
+ 	xt_unregister_match(&connmark_mt_reg);
+-	xt_unregister_target(connmark_tg_reg);
++	xt_unregister_targets(connmark_tg_reg, ARRAY_SIZE(connmark_tg_reg));
+ }
+ 
+ module_init(connmark_mt_init);
