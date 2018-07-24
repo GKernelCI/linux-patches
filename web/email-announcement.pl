@@ -33,6 +33,7 @@ $result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
 if ($rel > 1) {
 	$oldtag = $ver.'-'.($rel-1);
     $cmd='git -C '.${LOCAL_TMP}.'/linux-patches rev-list '.$oldtag;
+    printf ("1 cmd is $cmd\n");
     @output = `$cmd`;
 
     foreach $line (@output) { 
@@ -49,18 +50,22 @@ if ($rel > 1) {
 
     if ($have_history == 1) {
         $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$oldtag.'..'.$tag;
+    	printf ("2 cmd is $cmd\n");
         @log_lines = `$cmd`;
         $have_history = 1;
     }
     else {
         $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$tag;
+    	printf ("3 cmd is $cmd\n");
         @log_lines = `$cmd`;
     }
 }
 else {
     # just do git log
     #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$ver;
-    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ..'.$tag;
+    #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ..'.$tag;
+    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" '.$tag.'...master';
+    printf ("4 cmd is $cmd\n");
     @log_lines = `$cmd`;
 }
 
