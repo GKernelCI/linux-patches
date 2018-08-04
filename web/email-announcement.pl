@@ -22,9 +22,11 @@ else { # support for kernels >= 3.0
 $have_history = 0;
 $website_base = 'http://dev.gentoo.org/~mpagano/genpatches';
 
+$result = `rm -rf ${LOCAL_TMP}/linux-patches`;
 $result = `cd $LOCAL_TMP`;
 $result = `git -C ${LOCAL_TMP}/linux-patches reset`;
-$result = `git clone $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+#$result = `git clone --depth=50 $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+$result = `git clone -b $ver --single-branch $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
 
 # checkout branch
 $result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
