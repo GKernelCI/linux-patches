@@ -10,6 +10,7 @@ use File::Basename;
 use File::Copy;
 use URI::Escape;
 use Cwd;
+use lib '.';
 use gentoo_sources_web;
 use Sort::Versions;
 
