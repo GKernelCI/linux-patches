@@ -1,0 +1,110 @@
+From: Florian Westphal <fw@strlen.de>
+To: <netfilter-devel@vger.kernel.org>
+Cc: kfm@plushkava.net, Florian Westphal <fw@strlen.de>
+Subject: [PATCH nf] netfilter: nf_tables: fix set double-free in abort path
+Date: Thu,  7 Mar 2019 20:30:41 +0100
+X-Mailer: git-send-email 2.19.2
+
+The abort path can cause a double-free of an (anon) set.
+
+Added-and-to-be-aborted rule looks like this:
+
+udp dport { 137, 138 } drop
+
+The to-be-aborted transaction list looks like this:
+newset
+newsetelem
+newsetelem
+rule
+
+This gets walked in reverse order, so first pass disables
+the rule, the set elements, then the set.
+
+After synchronize_rcu(), we then destroy those in same order:
+rule, set element, set element, newset.
+
+Problem is that the (anon) set has already been bound to the rule,
+so the rule (lookup expression destructor) already frees the set,
+when then cause use-after-free when trying to delete the elements
+from this set, then try to free the set again when handling the
+newset expression.
+
+To resolve this, check in first phase if the newset is bound already.
+If so, remove the newset transaction from the list, rule destructor
+will handle cleanup.
+
+This is still causes the use-after-free on set element removal.
+To handle this, move all affected set elements to a extra list
+and process it first.
+
+This forces strict 'destroy elements, then set' ordering.
+
+Fixes: f6ac8585897684 ("netfilter: nf_tables: unbind set in rule from commit path")
+Bugzilla: https://bugzilla.netfilter.org/show_bug.cgi?id=1325
+Signed-off-by: Florian Westphal <fw@strlen.de>
+
+--- a/net/netfilter/nf_tables_api.c	2019-03-07 21:49:45.776492810 -0000
++++ b/net/netfilter/nf_tables_api.c	2019-03-07 21:49:57.067493081 -0000
+@@ -6634,10 +6634,39 @@ static void nf_tables_abort_release(stru
+ 	kfree(trans);
+ }
+ 
++static void __nf_tables_newset_abort(struct net *net,
++				     struct nft_trans *set_trans,
++				     struct list_head *set_elements)
++{
++	const struct nft_set *set = nft_trans_set(set_trans);
++	struct nft_trans *trans, *next;
++
++	if (!nft_trans_set_bound(set_trans))
++		return;
++
++	/* When abort is in progress, NFT_MSG_NEWRULE will remove the
++	 * set if its bound, so we need to remove the NEWSET transaction,
++	 * else the set is released twice.  NEWSETELEM need to be moved
++	 * to special list to ensure 'free elements, then set' ordering.
++	 */
++	list_for_each_entry_safe_reverse(trans, next,
++					 &net->nft.commit_list, list) {
++		if (trans == set_trans)
++			break;
++
++		if (trans->msg_type == NFT_MSG_NEWSETELEM &&
++		    nft_trans_set(trans) == set)
++			list_move(&trans->list, set_elements);
++	}
++
++	nft_trans_destroy(set_trans);
++}
++
+ static int __nf_tables_abort(struct net *net)
+ {
+ 	struct nft_trans *trans, *next;
+ 	struct nft_trans_elem *te;
++	LIST_HEAD(set_elements);
+ 
+ 	list_for_each_entry_safe_reverse(trans, next, &net->nft.commit_list,
+ 					 list) {
+@@ -6693,6 +6722,8 @@ static int __nf_tables_abort(struct net
+ 			trans->ctx.table->use--;
+ 			if (!nft_trans_set_bound(trans))
+ 				list_del_rcu(&nft_trans_set(trans)->list);
++
++			__nf_tables_newset_abort(net, trans, &set_elements);
+ 			break;
+ 		case NFT_MSG_DELSET:
+ 			trans->ctx.table->use++;
+@@ -6739,6 +6770,13 @@ static int __nf_tables_abort(struct net
+ 
+ 	synchronize_rcu();
+ 
++	/* free set elements before the set they belong to is freed */
++	list_for_each_entry_safe_reverse(trans, next,
++					 &set_elements, list) {
++		list_del(&trans->list);
++		nf_tables_abort_release(trans);
++	}
++
+ 	list_for_each_entry_safe_reverse(trans, next,
+ 					 &net->nft.commit_list, list) {
+ 		list_del(&trans->list);
