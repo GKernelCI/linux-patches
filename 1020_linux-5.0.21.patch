@@ -1,0 +1,1443 @@
+diff --git a/Makefile b/Makefile
+index 25390977536b..93701ca8f3a6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 5
+ PATCHLEVEL = 0
+-SUBLEVEL = 20
++SUBLEVEL = 21
+ EXTRAVERSION =
+ NAME = Shy Crocodile
+ 
+diff --git a/drivers/crypto/vmx/ghash.c b/drivers/crypto/vmx/ghash.c
+index dd8b8716467a..2d1a8cd35509 100644
+--- a/drivers/crypto/vmx/ghash.c
++++ b/drivers/crypto/vmx/ghash.c
+@@ -1,22 +1,14 @@
++// SPDX-License-Identifier: GPL-2.0
+ /**
+  * GHASH routines supporting VMX instructions on the Power 8
+  *
+- * Copyright (C) 2015 International Business Machines Inc.
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; version 2 only.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ * Copyright (C) 2015, 2019 International Business Machines Inc.
+  *
+  * Author: Marcelo Henrique Cerri <mhcerri@br.ibm.com>
++ *
++ * Extended by Daniel Axtens <dja@axtens.net> to replace the fallback
++ * mechanism. The new approach is based on arm64 code, which is:
++ *   Copyright (C) 2014 - 2018 Linaro Ltd. <ard.biesheuvel@linaro.org>
+  */
+ 
+ #include <linux/types.h>
+@@ -39,71 +31,25 @@ void gcm_ghash_p8(u64 Xi[2], const u128 htable[16],
+ 		  const u8 *in, size_t len);
+ 
+ struct p8_ghash_ctx {
++	/* key used by vector asm */
+ 	u128 htable[16];
+-	struct crypto_shash *fallback;
++	/* key used by software fallback */
++	be128 key;
+ };
+ 
+ struct p8_ghash_desc_ctx {
+ 	u64 shash[2];
+ 	u8 buffer[GHASH_DIGEST_SIZE];
+ 	int bytes;
+-	struct shash_desc fallback_desc;
+ };
+ 
+-static int p8_ghash_init_tfm(struct crypto_tfm *tfm)
+-{
+-	const char *alg = "ghash-generic";
+-	struct crypto_shash *fallback;
+-	struct crypto_shash *shash_tfm = __crypto_shash_cast(tfm);
+-	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(tfm);
+-
+-	fallback = crypto_alloc_shash(alg, 0, CRYPTO_ALG_NEED_FALLBACK);
+-	if (IS_ERR(fallback)) {
+-		printk(KERN_ERR
+-		       "Failed to allocate transformation for '%s': %ld\n",
+-		       alg, PTR_ERR(fallback));
+-		return PTR_ERR(fallback);
+-	}
+-
+-	crypto_shash_set_flags(fallback,
+-			       crypto_shash_get_flags((struct crypto_shash
+-						       *) tfm));
+-
+-	/* Check if the descsize defined in the algorithm is still enough. */
+-	if (shash_tfm->descsize < sizeof(struct p8_ghash_desc_ctx)
+-	    + crypto_shash_descsize(fallback)) {
+-		printk(KERN_ERR
+-		       "Desc size of the fallback implementation (%s) does not match the expected value: %lu vs %u\n",
+-		       alg,
+-		       shash_tfm->descsize - sizeof(struct p8_ghash_desc_ctx),
+-		       crypto_shash_descsize(fallback));
+-		return -EINVAL;
+-	}
+-	ctx->fallback = fallback;
+-
+-	return 0;
+-}
+-
+-static void p8_ghash_exit_tfm(struct crypto_tfm *tfm)
+-{
+-	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(tfm);
+-
+-	if (ctx->fallback) {
+-		crypto_free_shash(ctx->fallback);
+-		ctx->fallback = NULL;
+-	}
+-}
+-
+ static int p8_ghash_init(struct shash_desc *desc)
+ {
+-	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(crypto_shash_tfm(desc->tfm));
+ 	struct p8_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+ 
+ 	dctx->bytes = 0;
+ 	memset(dctx->shash, 0, GHASH_DIGEST_SIZE);
+-	dctx->fallback_desc.tfm = ctx->fallback;
+-	dctx->fallback_desc.flags = desc->flags;
+-	return crypto_shash_init(&dctx->fallback_desc);
++	return 0;
+ }
+ 
+ static int p8_ghash_setkey(struct crypto_shash *tfm, const u8 *key,
+@@ -121,7 +67,51 @@ static int p8_ghash_setkey(struct crypto_shash *tfm, const u8 *key,
+ 	disable_kernel_vsx();
+ 	pagefault_enable();
+ 	preempt_enable();
+-	return crypto_shash_setkey(ctx->fallback, key, keylen);
++
++	memcpy(&ctx->key, key, GHASH_BLOCK_SIZE);
++
++	return 0;
++}
++
++static inline void __ghash_block(struct p8_ghash_ctx *ctx,
++				 struct p8_ghash_desc_ctx *dctx)
++{
++	if (!IN_INTERRUPT) {
++		preempt_disable();
++		pagefault_disable();
++		enable_kernel_vsx();
++		gcm_ghash_p8(dctx->shash, ctx->htable,
++				dctx->buffer, GHASH_DIGEST_SIZE);
++		disable_kernel_vsx();
++		pagefault_enable();
++		preempt_enable();
++	} else {
++		crypto_xor((u8 *)dctx->shash, dctx->buffer, GHASH_BLOCK_SIZE);
++		gf128mul_lle((be128 *)dctx->shash, &ctx->key);
++	}
++}
++
++static inline void __ghash_blocks(struct p8_ghash_ctx *ctx,
++				  struct p8_ghash_desc_ctx *dctx,
++				  const u8 *src, unsigned int srclen)
++{
++	if (!IN_INTERRUPT) {
++		preempt_disable();
++		pagefault_disable();
++		enable_kernel_vsx();
++		gcm_ghash_p8(dctx->shash, ctx->htable,
++				src, srclen);
++		disable_kernel_vsx();
++		pagefault_enable();
++		preempt_enable();
++	} else {
++		while (srclen >= GHASH_BLOCK_SIZE) {
++			crypto_xor((u8 *)dctx->shash, src, GHASH_BLOCK_SIZE);
++			gf128mul_lle((be128 *)dctx->shash, &ctx->key);
++			srclen -= GHASH_BLOCK_SIZE;
++			src += GHASH_BLOCK_SIZE;
++		}
++	}
+ }
+ 
+ static int p8_ghash_update(struct shash_desc *desc,
+@@ -131,49 +121,33 @@ static int p8_ghash_update(struct shash_desc *desc,
+ 	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(crypto_shash_tfm(desc->tfm));
+ 	struct p8_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+ 
+-	if (IN_INTERRUPT) {
+-		return crypto_shash_update(&dctx->fallback_desc, src,
+-					   srclen);
+-	} else {
+-		if (dctx->bytes) {
+-			if (dctx->bytes + srclen < GHASH_DIGEST_SIZE) {
+-				memcpy(dctx->buffer + dctx->bytes, src,
+-				       srclen);
+-				dctx->bytes += srclen;
+-				return 0;
+-			}
++	if (dctx->bytes) {
++		if (dctx->bytes + srclen < GHASH_DIGEST_SIZE) {
+ 			memcpy(dctx->buffer + dctx->bytes, src,
+-			       GHASH_DIGEST_SIZE - dctx->bytes);
+-			preempt_disable();
+-			pagefault_disable();
+-			enable_kernel_vsx();
+-			gcm_ghash_p8(dctx->shash, ctx->htable,
+-				     dctx->buffer, GHASH_DIGEST_SIZE);
+-			disable_kernel_vsx();
+-			pagefault_enable();
+-			preempt_enable();
+-			src += GHASH_DIGEST_SIZE - dctx->bytes;
+-			srclen -= GHASH_DIGEST_SIZE - dctx->bytes;
+-			dctx->bytes = 0;
+-		}
+-		len = srclen & ~(GHASH_DIGEST_SIZE - 1);
+-		if (len) {
+-			preempt_disable();
+-			pagefault_disable();
+-			enable_kernel_vsx();
+-			gcm_ghash_p8(dctx->shash, ctx->htable, src, len);
+-			disable_kernel_vsx();
+-			pagefault_enable();
+-			preempt_enable();
+-			src += len;
+-			srclen -= len;
+-		}
+-		if (srclen) {
+-			memcpy(dctx->buffer, src, srclen);
+-			dctx->bytes = srclen;
++				srclen);
++			dctx->bytes += srclen;
++			return 0;
+ 		}
+-		return 0;
++		memcpy(dctx->buffer + dctx->bytes, src,
++			GHASH_DIGEST_SIZE - dctx->bytes);
++
++		__ghash_block(ctx, dctx);
++
++		src += GHASH_DIGEST_SIZE - dctx->bytes;
++		srclen -= GHASH_DIGEST_SIZE - dctx->bytes;
++		dctx->bytes = 0;
++	}
++	len = srclen & ~(GHASH_DIGEST_SIZE - 1);
++	if (len) {
++		__ghash_blocks(ctx, dctx, src, len);
++		src += len;
++		srclen -= len;
+ 	}
++	if (srclen) {
++		memcpy(dctx->buffer, src, srclen);
++		dctx->bytes = srclen;
++	}
++	return 0;
+ }
+ 
+ static int p8_ghash_final(struct shash_desc *desc, u8 *out)
+@@ -182,25 +156,14 @@ static int p8_ghash_final(struct shash_desc *desc, u8 *out)
+ 	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(crypto_shash_tfm(desc->tfm));
+ 	struct p8_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+ 
+-	if (IN_INTERRUPT) {
+-		return crypto_shash_final(&dctx->fallback_desc, out);
+-	} else {
+-		if (dctx->bytes) {
+-			for (i = dctx->bytes; i < GHASH_DIGEST_SIZE; i++)
+-				dctx->buffer[i] = 0;
+-			preempt_disable();
+-			pagefault_disable();
+-			enable_kernel_vsx();
+-			gcm_ghash_p8(dctx->shash, ctx->htable,
+-				     dctx->buffer, GHASH_DIGEST_SIZE);
+-			disable_kernel_vsx();
+-			pagefault_enable();
+-			preempt_enable();
+-			dctx->bytes = 0;
+-		}
+-		memcpy(out, dctx->shash, GHASH_DIGEST_SIZE);
+-		return 0;
++	if (dctx->bytes) {
++		for (i = dctx->bytes; i < GHASH_DIGEST_SIZE; i++)
++			dctx->buffer[i] = 0;
++		__ghash_block(ctx, dctx);
++		dctx->bytes = 0;
+ 	}
++	memcpy(out, dctx->shash, GHASH_DIGEST_SIZE);
++	return 0;
+ }
+ 
+ struct shash_alg p8_ghash_alg = {
+@@ -215,11 +178,8 @@ struct shash_alg p8_ghash_alg = {
+ 		 .cra_name = "ghash",
+ 		 .cra_driver_name = "p8_ghash",
+ 		 .cra_priority = 1000,
+-		 .cra_flags = CRYPTO_ALG_NEED_FALLBACK,
+ 		 .cra_blocksize = GHASH_BLOCK_SIZE,
+ 		 .cra_ctxsize = sizeof(struct p8_ghash_ctx),
+ 		 .cra_module = THIS_MODULE,
+-		 .cra_init = p8_ghash_init_tfm,
+-		 .cra_exit = p8_ghash_exit_tfm,
+ 	},
+ };
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index f89fc6ea6078..4eeece3576e1 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -3123,13 +3123,18 @@ static int bond_slave_netdev_event(unsigned long event,
+ 	case NETDEV_CHANGE:
+ 		/* For 802.3ad mode only:
+ 		 * Getting invalid Speed/Duplex values here will put slave
+-		 * in weird state. So mark it as link-fail for the time
+-		 * being and let link-monitoring (miimon) set it right when
+-		 * correct speeds/duplex are available.
++		 * in weird state. Mark it as link-fail if the link was
++		 * previously up or link-down if it hasn't yet come up, and
++		 * let link-monitoring (miimon) set it right when correct
++		 * speeds/duplex are available.
+ 		 */
+ 		if (bond_update_speed_duplex(slave) &&
+-		    BOND_MODE(bond) == BOND_MODE_8023AD)
+-			slave->link = BOND_LINK_FAIL;
++		    BOND_MODE(bond) == BOND_MODE_8023AD) {
++			if (slave->last_link_up)
++				slave->link = BOND_LINK_FAIL;
++			else
++				slave->link = BOND_LINK_DOWN;
++		}
+ 
+ 		if (BOND_MODE(bond) == BOND_MODE_8023AD)
+ 			bond_3ad_adapter_speed_duplex_changed(slave);
+diff --git a/drivers/net/dsa/mv88e6xxx/chip.c b/drivers/net/dsa/mv88e6xxx/chip.c
+index 6cba05a80892..5a81ce42b808 100644
+--- a/drivers/net/dsa/mv88e6xxx/chip.c
++++ b/drivers/net/dsa/mv88e6xxx/chip.c
+@@ -892,7 +892,7 @@ static uint64_t _mv88e6xxx_get_ethtool_stat(struct mv88e6xxx_chip *chip,
+ 			err = mv88e6xxx_port_read(chip, port, s->reg + 1, &reg);
+ 			if (err)
+ 				return U64_MAX;
+-			high = reg;
++			low |= ((u32)reg) << 16;
+ 		}
+ 		break;
+ 	case STATS_TYPE_BANK1:
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index c6ddbc0e084e..300dbfdd4ae8 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1636,6 +1636,8 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_cp_ring_info *cpr,
+ 		skb = bnxt_copy_skb(bnapi, data_ptr, len, dma_addr);
+ 		bnxt_reuse_rx_data(rxr, cons, data);
+ 		if (!skb) {
++			if (agg_bufs)
++				bnxt_reuse_rx_agg_bufs(cpr, cp_cons, agg_bufs);
+ 			rc = -ENOMEM;
+ 			goto next_rx;
+ 		}
+@@ -6336,7 +6338,7 @@ static int bnxt_alloc_ctx_mem(struct bnxt *bp)
+ 	if (!ctx || (ctx->flags & BNXT_CTX_FLAG_INITED))
+ 		return 0;
+ 
+-	if (bp->flags & BNXT_FLAG_ROCE_CAP) {
++	if ((bp->flags & BNXT_FLAG_ROCE_CAP) && !is_kdump_kernel()) {
+ 		pg_lvl = 2;
+ 		extra_qps = 65536;
+ 		extra_srqs = 8192;
+@@ -7504,22 +7506,23 @@ static void bnxt_clear_int_mode(struct bnxt *bp)
+ 	bp->flags &= ~BNXT_FLAG_USING_MSIX;
+ }
+ 
+-int bnxt_reserve_rings(struct bnxt *bp)
++int bnxt_reserve_rings(struct bnxt *bp, bool irq_re_init)
+ {
+ 	int tcs = netdev_get_num_tc(bp->dev);
+-	bool reinit_irq = false;
++	bool irq_cleared = false;
+ 	int rc;
+ 
+ 	if (!bnxt_need_reserve_rings(bp))
+ 		return 0;
+ 
+-	if (BNXT_NEW_RM(bp) && (bnxt_get_num_msix(bp) != bp->total_irqs)) {
++	if (irq_re_init && BNXT_NEW_RM(bp) &&
++	    bnxt_get_num_msix(bp) != bp->total_irqs) {
+ 		bnxt_ulp_irq_stop(bp);
+ 		bnxt_clear_int_mode(bp);
+-		reinit_irq = true;
++		irq_cleared = true;
+ 	}
+ 	rc = __bnxt_reserve_rings(bp);
+-	if (reinit_irq) {
++	if (irq_cleared) {
+ 		if (!rc)
+ 			rc = bnxt_init_int_mode(bp);
+ 		bnxt_ulp_irq_restart(bp, rc);
+@@ -8418,7 +8421,7 @@ static int __bnxt_open_nic(struct bnxt *bp, bool irq_re_init, bool link_re_init)
+ 			return rc;
+ 		}
+ 	}
+-	rc = bnxt_reserve_rings(bp);
++	rc = bnxt_reserve_rings(bp, irq_re_init);
+ 	if (rc)
+ 		return rc;
+ 	if ((bp->flags & BNXT_FLAG_RFS) &&
+@@ -10276,7 +10279,7 @@ static int bnxt_set_dflt_rings(struct bnxt *bp, bool sh)
+ 
+ 	if (sh)
+ 		bp->flags |= BNXT_FLAG_SHARED_RINGS;
+-	dflt_rings = netif_get_num_default_rss_queues();
++	dflt_rings = is_kdump_kernel() ? 1 : netif_get_num_default_rss_queues();
+ 	/* Reduce default rings on multi-port cards so that total default
+ 	 * rings do not exceed CPU count.
+ 	 */
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 2fb653e0048d..c09b20b08395 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -20,6 +20,7 @@
+ 
+ #include <linux/interrupt.h>
+ #include <linux/rhashtable.h>
++#include <linux/crash_dump.h>
+ #include <net/devlink.h>
+ #include <net/dst_metadata.h>
+ #include <net/switchdev.h>
+@@ -1367,7 +1368,8 @@ struct bnxt {
+ #define BNXT_CHIP_TYPE_NITRO_A0(bp) ((bp)->flags & BNXT_FLAG_CHIP_NITRO_A0)
+ #define BNXT_RX_PAGE_MODE(bp)	((bp)->flags & BNXT_FLAG_RX_PAGE_MODE)
+ #define BNXT_SUPPORTS_TPA(bp)	(!BNXT_CHIP_TYPE_NITRO_A0(bp) &&	\
+-				 !(bp->flags & BNXT_FLAG_CHIP_P5))
++				 !(bp->flags & BNXT_FLAG_CHIP_P5) &&	\
++				 !is_kdump_kernel())
+ 
+ /* Chip class phase 5 */
+ #define BNXT_CHIP_P5(bp)			\
+@@ -1776,7 +1778,7 @@ unsigned int bnxt_get_avail_stat_ctxs_for_en(struct bnxt *bp);
+ unsigned int bnxt_get_max_func_cp_rings(struct bnxt *bp);
+ unsigned int bnxt_get_avail_cp_rings_for_en(struct bnxt *bp);
+ int bnxt_get_avail_msix(struct bnxt *bp, int num);
+-int bnxt_reserve_rings(struct bnxt *bp);
++int bnxt_reserve_rings(struct bnxt *bp, bool irq_re_init);
+ void bnxt_tx_disable(struct bnxt *bp);
+ void bnxt_tx_enable(struct bnxt *bp);
+ int bnxt_hwrm_set_pause(struct bnxt *);
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index adabbe94a259..e1460e391952 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -788,7 +788,7 @@ static int bnxt_set_channels(struct net_device *dev,
+ 			 */
+ 		}
+ 	} else {
+-		rc = bnxt_reserve_rings(bp);
++		rc = bnxt_reserve_rings(bp, true);
+ 	}
+ 
+ 	return rc;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
+index ea45a9b8179e..7dd3f445afb6 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ulp.c
+@@ -150,7 +150,7 @@ static int bnxt_req_msix_vecs(struct bnxt_en_dev *edev, int ulp_id,
+ 			bnxt_close_nic(bp, true, false);
+ 			rc = bnxt_open_nic(bp, true, false);
+ 		} else {
+-			rc = bnxt_reserve_rings(bp);
++			rc = bnxt_reserve_rings(bp, true);
+ 		}
+ 	}
+ 	if (rc) {
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+index c116f96956fe..f2aba5b160c2 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_flower.c
+@@ -228,6 +228,9 @@ static void cxgb4_process_flow_match(struct net_device *dev,
+ 		fs->val.ivlan = vlan_tci;
+ 		fs->mask.ivlan = vlan_tci_mask;
+ 
++		fs->val.ivlan_vld = 1;
++		fs->mask.ivlan_vld = 1;
++
+ 		/* Chelsio adapters use ivlan_vld bit to match vlan packets
+ 		 * as 802.1Q. Also, when vlan tag is present in packets,
+ 		 * ethtype match is used then to match on ethtype of inner
+@@ -238,8 +241,6 @@ static void cxgb4_process_flow_match(struct net_device *dev,
+ 		 * ethtype value with ethtype of inner header.
+ 		 */
+ 		if (fs->val.ethtype == ETH_P_8021Q) {
+-			fs->val.ivlan_vld = 1;
+-			fs->mask.ivlan_vld = 1;
+ 			fs->val.ethtype = 0;
+ 			fs->mask.ethtype = 0;
+ 		}
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index 2b03f6187a24..29d3399c4995 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -7139,10 +7139,21 @@ int t4_fixup_host_params(struct adapter *adap, unsigned int page_size,
+ 			 unsigned int cache_line_size)
+ {
+ 	unsigned int page_shift = fls(page_size) - 1;
++	unsigned int sge_hps = page_shift - 10;
+ 	unsigned int stat_len = cache_line_size > 64 ? 128 : 64;
+ 	unsigned int fl_align = cache_line_size < 32 ? 32 : cache_line_size;
+ 	unsigned int fl_align_log = fls(fl_align) - 1;
+ 
++	t4_write_reg(adap, SGE_HOST_PAGE_SIZE_A,
++		     HOSTPAGESIZEPF0_V(sge_hps) |
++		     HOSTPAGESIZEPF1_V(sge_hps) |
++		     HOSTPAGESIZEPF2_V(sge_hps) |
++		     HOSTPAGESIZEPF3_V(sge_hps) |
++		     HOSTPAGESIZEPF4_V(sge_hps) |
++		     HOSTPAGESIZEPF5_V(sge_hps) |
++		     HOSTPAGESIZEPF6_V(sge_hps) |
++		     HOSTPAGESIZEPF7_V(sge_hps));
++
+ 	if (is_t4(adap->params.chip)) {
+ 		t4_set_reg_field(adap, SGE_CONTROL_A,
+ 				 INGPADBOUNDARY_V(INGPADBOUNDARY_M) |
+diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
+index a96ad20ee484..878ccce1dfcd 100644
+--- a/drivers/net/ethernet/freescale/fec_main.c
++++ b/drivers/net/ethernet/freescale/fec_main.c
+@@ -3556,7 +3556,7 @@ failed_init:
+ 	if (fep->reg_phy)
+ 		regulator_disable(fep->reg_phy);
+ failed_reset:
+-	pm_runtime_put(&pdev->dev);
++	pm_runtime_put_noidle(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ failed_regulator:
+ 	clk_disable_unprepare(fep->clk_ahb);
+diff --git a/drivers/net/ethernet/marvell/mvneta.c b/drivers/net/ethernet/marvell/mvneta.c
+index 8433fb9c3eee..ea0236a2e18b 100644
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@ -4619,7 +4619,7 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	err = register_netdev(dev);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to register\n");
+-		goto err_free_stats;
++		goto err_netdev;
+ 	}
+ 
+ 	netdev_info(dev, "Using %s mac address %pM\n", mac_from,
+@@ -4630,14 +4630,12 @@ static int mvneta_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_netdev:
+-	unregister_netdev(dev);
+ 	if (pp->bm_priv) {
+ 		mvneta_bm_pool_destroy(pp->bm_priv, pp->pool_long, 1 << pp->id);
+ 		mvneta_bm_pool_destroy(pp->bm_priv, pp->pool_short,
+ 				       1 << pp->id);
+ 		mvneta_bm_put(pp->bm_priv);
+ 	}
+-err_free_stats:
+ 	free_percpu(pp->stats);
+ err_free_ports:
+ 	free_percpu(pp->ports);
+diff --git a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 70031e2b2294..f063ba69eb17 100644
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@ -1412,7 +1412,7 @@ static inline void mvpp2_xlg_max_rx_size_set(struct mvpp2_port *port)
+ /* Set defaults to the MVPP2 port */
+ static void mvpp2_defaults_set(struct mvpp2_port *port)
+ {
+-	int tx_port_num, val, queue, ptxq, lrxq;
++	int tx_port_num, val, queue, lrxq;
+ 
+ 	if (port->priv->hw_version == MVPP21) {
+ 		/* Update TX FIFO MIN Threshold */
+@@ -1433,11 +1433,9 @@ static void mvpp2_defaults_set(struct mvpp2_port *port)
+ 	mvpp2_write(port->priv, MVPP2_TXP_SCHED_FIXED_PRIO_REG, 0);
+ 
+ 	/* Close bandwidth for all queues */
+-	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++) {
+-		ptxq = mvpp2_txq_phys(port->id, queue);
++	for (queue = 0; queue < MVPP2_MAX_TXQ; queue++)
+ 		mvpp2_write(port->priv,
+-			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(ptxq), 0);
+-	}
++			    MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(queue), 0);
+ 
+ 	/* Set refill period to 1 usec, refill tokens
+ 	 * and bucket size to maximum
+@@ -2293,7 +2291,7 @@ static void mvpp2_txq_deinit(struct mvpp2_port *port,
+ 	txq->descs_dma         = 0;
+ 
+ 	/* Set minimum bandwidth for disabled TXQs */
+-	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->id), 0);
++	mvpp2_write(port->priv, MVPP2_TXQ_SCHED_TOKEN_CNTR_REG(txq->log_id), 0);
+ 
+ 	/* Set Tx descriptors queue starting address and size */
+ 	thread = mvpp2_cpu_to_thread(port->priv, get_cpu());
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 2d269acdbc8e..631a600bec4d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3789,6 +3789,12 @@ static netdev_features_t mlx5e_fix_features(struct net_device *netdev,
+ 			netdev_warn(netdev, "Disabling LRO, not supported in legacy RQ\n");
+ 	}
+ 
++	if (MLX5E_GET_PFLAG(params, MLX5E_PFLAG_RX_CQE_COMPRESS)) {
++		features &= ~NETIF_F_RXHASH;
++		if (netdev->features & NETIF_F_RXHASH)
++			netdev_warn(netdev, "Disabling rxhash, not supported when CQE compress is active\n");
++	}
++
+ 	mutex_unlock(&priv->state_lock);
+ 
+ 	return features;
+@@ -3915,6 +3921,9 @@ int mlx5e_hwstamp_set(struct mlx5e_priv *priv, struct ifreq *ifr)
+ 	memcpy(&priv->tstamp, &config, sizeof(config));
+ 	mutex_unlock(&priv->state_lock);
+ 
++	/* might need to fix some features */
++	netdev_update_features(priv->netdev);
++
+ 	return copy_to_user(ifr->ifr_data, &config,
+ 			    sizeof(config)) ? -EFAULT : 0;
+ }
+@@ -4744,6 +4753,10 @@ static void mlx5e_build_nic_netdev(struct net_device *netdev)
+ 	if (!priv->channels.params.scatter_fcs_en)
+ 		netdev->features  &= ~NETIF_F_RXFCS;
+ 
++	/* prefere CQE compression over rxhash */
++	if (MLX5E_GET_PFLAG(&priv->channels.params, MLX5E_PFLAG_RX_CQE_COMPRESS))
++		netdev->features &= ~NETIF_F_RXHASH;
++
+ #define FT_CAP(f) MLX5_CAP_FLOWTABLE(mdev, flow_table_properties_nic_receive.f)
+ 	if (FT_CAP(flow_modify_en) &&
+ 	    FT_CAP(modify_root) &&
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+index abbdd4906984..158b941ae911 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_core.c
+@@ -2247,7 +2247,7 @@ static struct mlx5_flow_root_namespace
+ 		cmds = mlx5_fs_cmd_get_default_ipsec_fpga_cmds(table_type);
+ 
+ 	/* Create the root namespace */
+-	root_ns = kvzalloc(sizeof(*root_ns), GFP_KERNEL);
++	root_ns = kzalloc(sizeof(*root_ns), GFP_KERNEL);
+ 	if (!root_ns)
+ 		return NULL;
+ 
+@@ -2390,6 +2390,7 @@ static void cleanup_egress_acls_root_ns(struct mlx5_core_dev *dev)
+ 		cleanup_root_ns(steering->esw_egress_root_ns[i]);
+ 
+ 	kfree(steering->esw_egress_root_ns);
++	steering->esw_egress_root_ns = NULL;
+ }
+ 
+ static void cleanup_ingress_acls_root_ns(struct mlx5_core_dev *dev)
+@@ -2404,6 +2405,7 @@ static void cleanup_ingress_acls_root_ns(struct mlx5_core_dev *dev)
+ 		cleanup_root_ns(steering->esw_ingress_root_ns[i]);
+ 
+ 	kfree(steering->esw_ingress_root_ns);
++	steering->esw_ingress_root_ns = NULL;
+ }
+ 
+ void mlx5_cleanup_fs(struct mlx5_core_dev *dev)
+@@ -2572,6 +2574,7 @@ cleanup_root_ns:
+ 	for (i--; i >= 0; i--)
+ 		cleanup_root_ns(steering->esw_egress_root_ns[i]);
+ 	kfree(steering->esw_egress_root_ns);
++	steering->esw_egress_root_ns = NULL;
+ 	return err;
+ }
+ 
+@@ -2599,6 +2602,7 @@ cleanup_root_ns:
+ 	for (i--; i >= 0; i--)
+ 		cleanup_root_ns(steering->esw_ingress_root_ns[i]);
+ 	kfree(steering->esw_ingress_root_ns);
++	steering->esw_ingress_root_ns = NULL;
+ 	return err;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_erp.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_erp.c
+index 2941967e1cc5..2e5ebcd01b4b 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_erp.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_acl_erp.c
+@@ -1169,13 +1169,12 @@ mlxsw_sp_acl_erp_delta_fill(const struct mlxsw_sp_acl_erp_key *parent_key,
+ 			return -EINVAL;
+ 	}
+ 	if (si == -1) {
+-		/* The masks are the same, this cannot happen.
+-		 * That means the caller is broken.
++		/* The masks are the same, this can happen in case eRPs with
++		 * the same mask were created in both A-TCAM and C-TCAM.
++		 * The only possible condition under which this can happen
++		 * is identical rule insertion. Delta is not possible here.
+ 		 */
+-		WARN_ON(1);
+-		*delta_start = 0;
+-		*delta_mask = 0;
+-		return 0;
++		return -EINVAL;
+ 	}
+ 	pmask = (unsigned char) parent_key->mask[__MASK_IDX(si)];
+ 	mask = (unsigned char) key->mask[__MASK_IDX(si)];
+diff --git a/drivers/net/ethernet/realtek/r8169.c b/drivers/net/ethernet/realtek/r8169.c
+index 365cddbfc684..cb65f6a48eba 100644
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@ -6814,6 +6814,8 @@ static int rtl8169_resume(struct device *device)
+ 	struct net_device *dev = dev_get_drvdata(device);
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 
++	rtl_rar_set(tp, dev->dev_addr);
++
+ 	clk_prepare_enable(tp->clk);
+ 
+ 	if (netif_running(dev))
+@@ -6847,6 +6849,7 @@ static int rtl8169_runtime_resume(struct device *device)
+ {
+ 	struct net_device *dev = dev_get_drvdata(device);
+ 	struct rtl8169_private *tp = netdev_priv(dev);
++
+ 	rtl_rar_set(tp, dev->dev_addr);
+ 
+ 	if (!tp->TxDescArray)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+index 3c749c327cbd..e09522c5509a 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_ethtool.c
+@@ -460,7 +460,7 @@ stmmac_get_pauseparam(struct net_device *netdev,
+ 	} else {
+ 		if (!linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+ 				       netdev->phydev->supported) ||
+-		    linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
++		    !linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
+ 				      netdev->phydev->supported))
+ 			return;
+ 	}
+@@ -491,7 +491,7 @@ stmmac_set_pauseparam(struct net_device *netdev,
+ 	} else {
+ 		if (!linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT,
+ 				       phy->supported) ||
+-		    linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
++		    !linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT,
+ 				      phy->supported))
+ 			return -EOPNOTSUPP;
+ 	}
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index f0e0593e54f3..8841c5de8979 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -2190,6 +2190,10 @@ static int stmmac_init_dma_engine(struct stmmac_priv *priv)
+ 	if (priv->plat->axi)
+ 		stmmac_axi(priv, priv->ioaddr, priv->plat->axi);
+ 
++	/* DMA CSR Channel configuration */
++	for (chan = 0; chan < dma_csr_ch; chan++)
++		stmmac_init_chan(priv, priv->ioaddr, priv->plat->dma_cfg, chan);
++
+ 	/* DMA RX Channel Configuration */
+ 	for (chan = 0; chan < rx_channels_count; chan++) {
+ 		rx_q = &priv->rx_queue[chan];
+@@ -2215,10 +2219,6 @@ static int stmmac_init_dma_engine(struct stmmac_priv *priv)
+ 				       tx_q->tx_tail_addr, chan);
+ 	}
+ 
+-	/* DMA CSR Channel configuration */
+-	for (chan = 0; chan < dma_csr_ch; chan++)
+-		stmmac_init_chan(priv, priv->ioaddr, priv->plat->dma_cfg, chan);
+-
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+index bdd351597b55..093a223fe408 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+@@ -267,7 +267,8 @@ int stmmac_mdio_reset(struct mii_bus *bus)
+ 			of_property_read_u32_array(np,
+ 				"snps,reset-delays-us", data->delays, 3);
+ 
+-			if (gpio_request(data->reset_gpio, "mdio-reset"))
++			if (devm_gpio_request(priv->device, data->reset_gpio,
++					      "mdio-reset"))
+ 				return 0;
+ 		}
+ 
+diff --git a/drivers/net/phy/marvell10g.c b/drivers/net/phy/marvell10g.c
+index 6bac602094bd..8438f2f40d3d 100644
+--- a/drivers/net/phy/marvell10g.c
++++ b/drivers/net/phy/marvell10g.c
+@@ -29,6 +29,9 @@
+ #define MDIO_AN_10GBT_CTRL_ADV_NBT_MASK	0x01e0
+ 
+ enum {
++	MV_PMA_BOOT		= 0xc050,
++	MV_PMA_BOOT_FATAL	= BIT(0),
++
+ 	MV_PCS_BASE_T		= 0x0000,
+ 	MV_PCS_BASE_R		= 0x1000,
+ 	MV_PCS_1000BASEX	= 0x2000,
+@@ -228,6 +231,16 @@ static int mv3310_probe(struct phy_device *phydev)
+ 	    (phydev->c45_ids.devices_in_package & mmd_mask) != mmd_mask)
+ 		return -ENODEV;
+ 
++	ret = phy_read_mmd(phydev, MDIO_MMD_PMAPMD, MV_PMA_BOOT);
++	if (ret < 0)
++		return ret;
++
++	if (ret & MV_PMA_BOOT_FATAL) {
++		dev_warn(&phydev->mdio.dev,
++			 "PHY failed to boot firmware, status=%04x\n", ret);
++		return -ENODEV;
++	}
++
+ 	priv = devm_kzalloc(&phydev->mdio.dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv)
+ 		return -ENOMEM;
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index 504282af27e5..921cc0571bd0 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -506,6 +506,7 @@ static int rx_submit (struct usbnet *dev, struct urb *urb, gfp_t flags)
+ 
+ 	if (netif_running (dev->net) &&
+ 	    netif_device_present (dev->net) &&
++	    test_bit(EVENT_DEV_OPEN, &dev->flags) &&
+ 	    !test_bit (EVENT_RX_HALT, &dev->flags) &&
+ 	    !test_bit (EVENT_DEV_ASLEEP, &dev->flags)) {
+ 		switch (retval = usb_submit_urb (urb, GFP_ATOMIC)) {
+@@ -1431,6 +1432,11 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 		spin_unlock_irqrestore(&dev->txq.lock, flags);
+ 		goto drop;
+ 	}
++	if (netif_queue_stopped(net)) {
++		usb_autopm_put_interface_async(dev->intf);
++		spin_unlock_irqrestore(&dev->txq.lock, flags);
++		goto drop;
++	}
+ 
+ #ifdef CONFIG_PM
+ 	/* if this triggers the device is still a sleep */
+diff --git a/drivers/xen/xen-pciback/pciback_ops.c b/drivers/xen/xen-pciback/pciback_ops.c
+index ea4a08b83fa0..787966f44589 100644
+--- a/drivers/xen/xen-pciback/pciback_ops.c
++++ b/drivers/xen/xen-pciback/pciback_ops.c
+@@ -127,8 +127,6 @@ void xen_pcibk_reset_device(struct pci_dev *dev)
+ 		if (pci_is_enabled(dev))
+ 			pci_disable_device(dev);
+ 
+-		pci_write_config_word(dev, PCI_COMMAND, 0);
+-
+ 		dev->is_busmaster = 0;
+ 	} else {
+ 		pci_read_config_word(dev, PCI_COMMAND, &cmd);
+diff --git a/include/linux/siphash.h b/include/linux/siphash.h
+index fa7a6b9cedbf..bf21591a9e5e 100644
+--- a/include/linux/siphash.h
++++ b/include/linux/siphash.h
+@@ -21,6 +21,11 @@ typedef struct {
+ 	u64 key[2];
+ } siphash_key_t;
+ 
++static inline bool siphash_key_is_zero(const siphash_key_t *key)
++{
++	return !(key->key[0] | key->key[1]);
++}
++
+ u64 __siphash_aligned(const void *data, size_t len, const siphash_key_t *key);
+ #ifndef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ u64 __siphash_unaligned(const void *data, size_t len, const siphash_key_t *key);
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 104a6669e344..7698460a3dd1 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -9,6 +9,7 @@
+ #include <linux/uidgid.h>
+ #include <net/inet_frag.h>
+ #include <linux/rcupdate.h>
++#include <linux/siphash.h>
+ 
+ struct tcpm_hash_bucket;
+ struct ctl_table_header;
+@@ -217,5 +218,6 @@ struct netns_ipv4 {
+ 	unsigned int	ipmr_seq;	/* protected by rtnl_mutex */
+ 
+ 	atomic_t	rt_genid;
++	siphash_key_t	ip_id_key;
+ };
+ #endif
+diff --git a/include/uapi/linux/tipc_config.h b/include/uapi/linux/tipc_config.h
+index 4b2c93b1934c..4955e1a9f1bc 100644
+--- a/include/uapi/linux/tipc_config.h
++++ b/include/uapi/linux/tipc_config.h
+@@ -307,8 +307,10 @@ static inline int TLV_SET(void *tlv, __u16 type, void *data, __u16 len)
+ 	tlv_ptr = (struct tlv_desc *)tlv;
+ 	tlv_ptr->tlv_type = htons(type);
+ 	tlv_ptr->tlv_len  = htons(tlv_len);
+-	if (len && data)
+-		memcpy(TLV_DATA(tlv_ptr), data, tlv_len);
++	if (len && data) {
++		memcpy(TLV_DATA(tlv_ptr), data, len);
++		memset(TLV_DATA(tlv_ptr) + len, 0, TLV_SPACE(len) - tlv_len);
++	}
+ 	return TLV_SPACE(len);
+ }
+ 
+@@ -405,8 +407,10 @@ static inline int TCM_SET(void *msg, __u16 cmd, __u16 flags,
+ 	tcm_hdr->tcm_len   = htonl(msg_len);
+ 	tcm_hdr->tcm_type  = htons(cmd);
+ 	tcm_hdr->tcm_flags = htons(flags);
+-	if (data_len && data)
++	if (data_len && data) {
+ 		memcpy(TCM_DATA(msg), data, data_len);
++		memset(TCM_DATA(msg) + data_len, 0, TCM_SPACE(data_len) - msg_len);
++	}
+ 	return TCM_SPACE(data_len);
+ }
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index c8e672ac32cb..a8d017035ae9 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5804,7 +5804,6 @@ static struct sk_buff *napi_frags_skb(struct napi_struct *napi)
+ 	skb_reset_mac_header(skb);
+ 	skb_gro_reset_offset(skb);
+ 
+-	eth = skb_gro_header_fast(skb, 0);
+ 	if (unlikely(skb_gro_header_hard(skb, hlen))) {
+ 		eth = skb_gro_header_slow(skb, hlen, 0);
+ 		if (unlikely(!eth)) {
+@@ -5814,6 +5813,7 @@ static struct sk_buff *napi_frags_skb(struct napi_struct *napi)
+ 			return NULL;
+ 		}
+ 	} else {
++		eth = (const struct ethhdr *)skb->data;
+ 		gro_pull_from_frag0(skb, hlen);
+ 		NAPI_GRO_CB(skb)->frag0 += hlen;
+ 		NAPI_GRO_CB(skb)->frag0_len -= hlen;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 40796b8bf820..e5bfd42fd083 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1001,7 +1001,11 @@ struct ubuf_info *sock_zerocopy_realloc(struct sock *sk, size_t size,
+ 			uarg->len++;
+ 			uarg->bytelen = bytelen;
+ 			atomic_set(&sk->sk_zckey, ++next);
+-			sock_zerocopy_get(uarg);
++
++			/* no extra ref when appending to datagram (MSG_MORE) */
++			if (sk->sk_type == SOCK_STREAM)
++				sock_zerocopy_get(uarg);
++
+ 			return uarg;
+ 		}
+ 	}
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index 765b2b32c4a4..1e79e1bca13c 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -187,6 +187,17 @@ static void ip_ma_put(struct ip_mc_list *im)
+ 	     pmc != NULL;					\
+ 	     pmc = rtnl_dereference(pmc->next_rcu))
+ 
++static void ip_sf_list_clear_all(struct ip_sf_list *psf)
++{
++	struct ip_sf_list *next;
++
++	while (psf) {
++		next = psf->sf_next;
++		kfree(psf);
++		psf = next;
++	}
++}
++
+ #ifdef CONFIG_IP_MULTICAST
+ 
+ /*
+@@ -632,6 +643,13 @@ static void igmpv3_clear_zeros(struct ip_sf_list **ppsf)
+ 	}
+ }
+ 
++static void kfree_pmc(struct ip_mc_list *pmc)
++{
++	ip_sf_list_clear_all(pmc->sources);
++	ip_sf_list_clear_all(pmc->tomb);
++	kfree(pmc);
++}
++
+ static void igmpv3_send_cr(struct in_device *in_dev)
+ {
+ 	struct ip_mc_list *pmc, *pmc_prev, *pmc_next;
+@@ -668,7 +686,7 @@ static void igmpv3_send_cr(struct in_device *in_dev)
+ 			else
+ 				in_dev->mc_tomb = pmc_next;
+ 			in_dev_put(pmc->interface);
+-			kfree(pmc);
++			kfree_pmc(pmc);
+ 		} else
+ 			pmc_prev = pmc;
+ 	}
+@@ -1213,14 +1231,18 @@ static void igmpv3_del_delrec(struct in_device *in_dev, struct ip_mc_list *im)
+ 		im->interface = pmc->interface;
+ 		if (im->sfmode == MCAST_INCLUDE) {
+ 			im->tomb = pmc->tomb;
++			pmc->tomb = NULL;
++
+ 			im->sources = pmc->sources;
++			pmc->sources = NULL;
++
+ 			for (psf = im->sources; psf; psf = psf->sf_next)
+ 				psf->sf_crcount = in_dev->mr_qrv ?: net->ipv4.sysctl_igmp_qrv;
+ 		} else {
+ 			im->crcount = in_dev->mr_qrv ?: net->ipv4.sysctl_igmp_qrv;
+ 		}
+ 		in_dev_put(pmc->interface);
+-		kfree(pmc);
++		kfree_pmc(pmc);
+ 	}
+ 	spin_unlock_bh(&im->lock);
+ }
+@@ -1241,21 +1263,18 @@ static void igmpv3_clear_delrec(struct in_device *in_dev)
+ 		nextpmc = pmc->next;
+ 		ip_mc_clear_src(pmc);
+ 		in_dev_put(pmc->interface);
+-		kfree(pmc);
++		kfree_pmc(pmc);
+ 	}
+ 	/* clear dead sources, too */
+ 	rcu_read_lock();
+ 	for_each_pmc_rcu(in_dev, pmc) {
+-		struct ip_sf_list *psf, *psf_next;
++		struct ip_sf_list *psf;
+ 
+ 		spin_lock_bh(&pmc->lock);
+ 		psf = pmc->tomb;
+ 		pmc->tomb = NULL;
+ 		spin_unlock_bh(&pmc->lock);
+-		for (; psf; psf = psf_next) {
+-			psf_next = psf->sf_next;
+-			kfree(psf);
+-		}
++		ip_sf_list_clear_all(psf);
+ 	}
+ 	rcu_read_unlock();
+ }
+@@ -2133,7 +2152,7 @@ static int ip_mc_add_src(struct in_device *in_dev, __be32 *pmca, int sfmode,
+ 
+ static void ip_mc_clear_src(struct ip_mc_list *pmc)
+ {
+-	struct ip_sf_list *psf, *nextpsf, *tomb, *sources;
++	struct ip_sf_list *tomb, *sources;
+ 
+ 	spin_lock_bh(&pmc->lock);
+ 	tomb = pmc->tomb;
+@@ -2145,14 +2164,8 @@ static void ip_mc_clear_src(struct ip_mc_list *pmc)
+ 	pmc->sfcount[MCAST_EXCLUDE] = 1;
+ 	spin_unlock_bh(&pmc->lock);
+ 
+-	for (psf = tomb; psf; psf = nextpsf) {
+-		nextpsf = psf->sf_next;
+-		kfree(psf);
+-	}
+-	for (psf = sources; psf; psf = nextpsf) {
+-		nextpsf = psf->sf_next;
+-		kfree(psf);
+-	}
++	ip_sf_list_clear_all(tomb);
++	ip_sf_list_clear_all(sources);
+ }
+ 
+ /* Join a multicast group
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index e8bb2e85c5a4..ac770940adb9 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -883,7 +883,7 @@ static int __ip_append_data(struct sock *sk,
+ 	int csummode = CHECKSUM_NONE;
+ 	struct rtable *rt = (struct rtable *)cork->dst;
+ 	unsigned int wmem_alloc_delta = 0;
+-	bool paged, extra_uref;
++	bool paged, extra_uref = false;
+ 	u32 tskey = 0;
+ 
+ 	skb = skb_peek_tail(queue);
+@@ -923,7 +923,7 @@ static int __ip_append_data(struct sock *sk,
+ 		uarg = sock_zerocopy_realloc(sk, length, skb_zcopy(skb));
+ 		if (!uarg)
+ 			return -ENOBUFS;
+-		extra_uref = true;
++		extra_uref = !skb;	/* only extra ref if !MSG_MORE */
+ 		if (rt->dst.dev->features & NETIF_F_SG &&
+ 		    csummode == CHECKSUM_PARTIAL) {
+ 			paged = true;
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 3c89ca325947..b66f78fad98c 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -500,15 +500,17 @@ EXPORT_SYMBOL(ip_idents_reserve);
+ 
+ void __ip_select_ident(struct net *net, struct iphdr *iph, int segs)
+ {
+-	static u32 ip_idents_hashrnd __read_mostly;
+ 	u32 hash, id;
+ 
+-	net_get_random_once(&ip_idents_hashrnd, sizeof(ip_idents_hashrnd));
++	/* Note the following code is not safe, but this is okay. */
++	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
++		get_random_bytes(&net->ipv4.ip_id_key,
++				 sizeof(net->ipv4.ip_id_key));
+ 
+-	hash = jhash_3words((__force u32)iph->daddr,
++	hash = siphash_3u32((__force u32)iph->daddr,
+ 			    (__force u32)iph->saddr,
+-			    iph->protocol ^ net_hash_mix(net),
+-			    ip_idents_hashrnd);
++			    iph->protocol,
++			    &net->ipv4.ip_id_key);
+ 	id = ip_idents_reserve(hash, segs);
+ 	iph->id = htons(id);
+ }
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index e71227390bec..de16c2e343ef 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1269,7 +1269,7 @@ static int __ip6_append_data(struct sock *sk,
+ 	int csummode = CHECKSUM_NONE;
+ 	unsigned int maxnonfragsize, headersize;
+ 	unsigned int wmem_alloc_delta = 0;
+-	bool paged, extra_uref;
++	bool paged, extra_uref = false;
+ 
+ 	skb = skb_peek_tail(queue);
+ 	if (!skb) {
+@@ -1338,7 +1338,7 @@ emsgsize:
+ 		uarg = sock_zerocopy_realloc(sk, length, skb_zcopy(skb));
+ 		if (!uarg)
+ 			return -ENOBUFS;
+-		extra_uref = true;
++		extra_uref = !skb;	/* only extra ref if !MSG_MORE */
+ 		if (rt->dst.dev->features & NETIF_F_SG &&
+ 		    csummode == CHECKSUM_PARTIAL) {
+ 			paged = true;
+diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
+index 4fe7c90962dd..868ae23dbae1 100644
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -10,15 +10,25 @@
+ #include <net/secure_seq.h>
+ #include <linux/netfilter.h>
+ 
+-static u32 __ipv6_select_ident(struct net *net, u32 hashrnd,
++static u32 __ipv6_select_ident(struct net *net,
+ 			       const struct in6_addr *dst,
+ 			       const struct in6_addr *src)
+ {
++	const struct {
++		struct in6_addr dst;
++		struct in6_addr src;
++	} __aligned(SIPHASH_ALIGNMENT) combined = {
++		.dst = *dst,
++		.src = *src,
++	};
+ 	u32 hash, id;
+ 
+-	hash = __ipv6_addr_jhash(dst, hashrnd);
+-	hash = __ipv6_addr_jhash(src, hash);
+-	hash ^= net_hash_mix(net);
++	/* Note the following code is not safe, but this is okay. */
++	if (unlikely(siphash_key_is_zero(&net->ipv4.ip_id_key)))
++		get_random_bytes(&net->ipv4.ip_id_key,
++				 sizeof(net->ipv4.ip_id_key));
++
++	hash = siphash(&combined, sizeof(combined), &net->ipv4.ip_id_key);
+ 
+ 	/* Treat id of 0 as unset and if we get 0 back from ip_idents_reserve,
+ 	 * set the hight order instead thus minimizing possible future
+@@ -41,7 +51,6 @@ static u32 __ipv6_select_ident(struct net *net, u32 hashrnd,
+  */
+ __be32 ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb)
+ {
+-	static u32 ip6_proxy_idents_hashrnd __read_mostly;
+ 	struct in6_addr buf[2];
+ 	struct in6_addr *addrs;
+ 	u32 id;
+@@ -53,11 +62,7 @@ __be32 ipv6_proxy_select_ident(struct net *net, struct sk_buff *skb)
+ 	if (!addrs)
+ 		return 0;
+ 
+-	net_get_random_once(&ip6_proxy_idents_hashrnd,
+-			    sizeof(ip6_proxy_idents_hashrnd));
+-
+-	id = __ipv6_select_ident(net, ip6_proxy_idents_hashrnd,
+-				 &addrs[1], &addrs[0]);
++	id = __ipv6_select_ident(net, &addrs[1], &addrs[0]);
+ 	return htonl(id);
+ }
+ EXPORT_SYMBOL_GPL(ipv6_proxy_select_ident);
+@@ -66,12 +71,9 @@ __be32 ipv6_select_ident(struct net *net,
+ 			 const struct in6_addr *daddr,
+ 			 const struct in6_addr *saddr)
+ {
+-	static u32 ip6_idents_hashrnd __read_mostly;
+ 	u32 id;
+ 
+-	net_get_random_once(&ip6_idents_hashrnd, sizeof(ip6_idents_hashrnd));
+-
+-	id = __ipv6_select_ident(net, ip6_idents_hashrnd, daddr, saddr);
++	id = __ipv6_select_ident(net, daddr, saddr);
+ 	return htonl(id);
+ }
+ EXPORT_SYMBOL(ipv6_select_ident);
+diff --git a/net/ipv6/raw.c b/net/ipv6/raw.c
+index 5a426226c762..5cb14eabfc65 100644
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@ -287,7 +287,9 @@ static int rawv6_bind(struct sock *sk, struct sockaddr *uaddr, int addr_len)
+ 			/* Binding to link-local address requires an interface */
+ 			if (!sk->sk_bound_dev_if)
+ 				goto out_unlock;
++		}
+ 
++		if (sk->sk_bound_dev_if) {
+ 			err = -ENODEV;
+ 			dev = dev_get_by_index_rcu(sock_net(sk),
+ 						   sk->sk_bound_dev_if);
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index b471afce1330..457a27016e74 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -2448,6 +2448,12 @@ static struct rt6_info *__ip6_route_redirect(struct net *net,
+ 	struct fib6_info *rt;
+ 	struct fib6_node *fn;
+ 
++	/* l3mdev_update_flow overrides oif if the device is enslaved; in
++	 * this case we must match on the real ingress device, so reset it
++	 */
++	if (fl6->flowi6_flags & FLOWI_FLAG_SKIP_NH_OIF)
++		fl6->flowi6_oif = skb->dev->ifindex;
++
+ 	/* Get the "current" route for this destination and
+ 	 * check if the redirect has come from appropriate router.
+ 	 *
+diff --git a/net/llc/llc_output.c b/net/llc/llc_output.c
+index 94425e421213..9e4b6bcf6920 100644
+--- a/net/llc/llc_output.c
++++ b/net/llc/llc_output.c
+@@ -72,6 +72,8 @@ int llc_build_and_send_ui_pkt(struct llc_sap *sap, struct sk_buff *skb,
+ 	rc = llc_mac_hdr_init(skb, skb->dev->dev_addr, dmac);
+ 	if (likely(!rc))
+ 		rc = dev_queue_xmit(skb);
++	else
++		kfree_skb(skb);
+ 	return rc;
+ }
+ 
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index d4b8355737d8..9d4ed81a33b9 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -766,7 +766,7 @@ int tcf_action_dump(struct sk_buff *skb, struct tc_action *actions[],
+ 
+ 	for (i = 0; i < TCA_ACT_MAX_PRIO && actions[i]; i++) {
+ 		a = actions[i];
+-		nest = nla_nest_start(skb, a->order);
++		nest = nla_nest_start(skb, i + 1);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 		err = tcf_action_dump_1(skb, a, bind, ref);
+@@ -1283,7 +1283,6 @@ tca_action_gd(struct net *net, struct nlattr *nla, struct nlmsghdr *n,
+ 			ret = PTR_ERR(act);
+ 			goto err;
+ 		}
+-		act->order = i;
+ 		attr_size += tcf_action_fill_size(act);
+ 		actions[i - 1] = act;
+ 	}
+diff --git a/net/tipc/core.c b/net/tipc/core.c
+index d7b0688c98dd..3ecca3b88bf8 100644
+--- a/net/tipc/core.c
++++ b/net/tipc/core.c
+@@ -66,10 +66,6 @@ static int __net_init tipc_init_net(struct net *net)
+ 	INIT_LIST_HEAD(&tn->node_list);
+ 	spin_lock_init(&tn->node_list_lock);
+ 
+-	err = tipc_socket_init();
+-	if (err)
+-		goto out_socket;
+-
+ 	err = tipc_sk_rht_init(net);
+ 	if (err)
+ 		goto out_sk_rht;
+@@ -79,9 +75,6 @@ static int __net_init tipc_init_net(struct net *net)
+ 		goto out_nametbl;
+ 
+ 	INIT_LIST_HEAD(&tn->dist_queue);
+-	err = tipc_topsrv_start(net);
+-	if (err)
+-		goto out_subscr;
+ 
+ 	err = tipc_bcast_init(net);
+ 	if (err)
+@@ -90,25 +83,19 @@ static int __net_init tipc_init_net(struct net *net)
+ 	return 0;
+ 
+ out_bclink:
+-	tipc_bcast_stop(net);
+-out_subscr:
+ 	tipc_nametbl_stop(net);
+ out_nametbl:
+ 	tipc_sk_rht_destroy(net);
+ out_sk_rht:
+-	tipc_socket_stop();
+-out_socket:
+ 	return err;
+ }
+ 
+ static void __net_exit tipc_exit_net(struct net *net)
+ {
+-	tipc_topsrv_stop(net);
+ 	tipc_net_stop(net);
+ 	tipc_bcast_stop(net);
+ 	tipc_nametbl_stop(net);
+ 	tipc_sk_rht_destroy(net);
+-	tipc_socket_stop();
+ }
+ 
+ static struct pernet_operations tipc_net_ops = {
+@@ -118,6 +105,11 @@ static struct pernet_operations tipc_net_ops = {
+ 	.size = sizeof(struct tipc_net),
+ };
+ 
++static struct pernet_operations tipc_topsrv_net_ops = {
++	.init = tipc_topsrv_init_net,
++	.exit = tipc_topsrv_exit_net,
++};
++
+ static int __init tipc_init(void)
+ {
+ 	int err;
+@@ -144,6 +136,14 @@ static int __init tipc_init(void)
+ 	if (err)
+ 		goto out_pernet;
+ 
++	err = tipc_socket_init();
++	if (err)
++		goto out_socket;
++
++	err = register_pernet_subsys(&tipc_topsrv_net_ops);
++	if (err)
++		goto out_pernet_topsrv;
++
+ 	err = tipc_bearer_setup();
+ 	if (err)
+ 		goto out_bearer;
+@@ -151,6 +151,10 @@ static int __init tipc_init(void)
+ 	pr_info("Started in single node mode\n");
+ 	return 0;
+ out_bearer:
++	unregister_pernet_subsys(&tipc_topsrv_net_ops);
++out_pernet_topsrv:
++	tipc_socket_stop();
++out_socket:
+ 	unregister_pernet_subsys(&tipc_net_ops);
+ out_pernet:
+ 	tipc_unregister_sysctl();
+@@ -166,6 +170,8 @@ out_netlink:
+ static void __exit tipc_exit(void)
+ {
+ 	tipc_bearer_cleanup();
++	unregister_pernet_subsys(&tipc_topsrv_net_ops);
++	tipc_socket_stop();
+ 	unregister_pernet_subsys(&tipc_net_ops);
+ 	tipc_netlink_stop();
+ 	tipc_netlink_compat_stop();
+diff --git a/net/tipc/subscr.h b/net/tipc/subscr.h
+index d793b4343885..aa015c233898 100644
+--- a/net/tipc/subscr.h
++++ b/net/tipc/subscr.h
+@@ -77,8 +77,9 @@ void tipc_sub_report_overlap(struct tipc_subscription *sub,
+ 			     u32 found_lower, u32 found_upper,
+ 			     u32 event, u32 port, u32 node,
+ 			     u32 scope, int must);
+-int tipc_topsrv_start(struct net *net);
+-void tipc_topsrv_stop(struct net *net);
++
++int __net_init tipc_topsrv_init_net(struct net *net);
++void __net_exit tipc_topsrv_exit_net(struct net *net);
+ 
+ void tipc_sub_put(struct tipc_subscription *subscription);
+ void tipc_sub_get(struct tipc_subscription *subscription);
+diff --git a/net/tipc/topsrv.c b/net/tipc/topsrv.c
+index f5edb213d760..00f25640877a 100644
+--- a/net/tipc/topsrv.c
++++ b/net/tipc/topsrv.c
+@@ -637,7 +637,7 @@ static void tipc_topsrv_work_stop(struct tipc_topsrv *s)
+ 	destroy_workqueue(s->send_wq);
+ }
+ 
+-int tipc_topsrv_start(struct net *net)
++static int tipc_topsrv_start(struct net *net)
+ {
+ 	struct tipc_net *tn = tipc_net(net);
+ 	const char name[] = "topology_server";
+@@ -671,7 +671,7 @@ int tipc_topsrv_start(struct net *net)
+ 	return ret;
+ }
+ 
+-void tipc_topsrv_stop(struct net *net)
++static void tipc_topsrv_stop(struct net *net)
+ {
+ 	struct tipc_topsrv *srv = tipc_topsrv(net);
+ 	struct socket *lsock = srv->listener;
+@@ -696,3 +696,13 @@ void tipc_topsrv_stop(struct net *net)
+ 	idr_destroy(&srv->conn_idr);
+ 	kfree(srv);
+ }
++
++int __net_init tipc_topsrv_init_net(struct net *net)
++{
++	return tipc_topsrv_start(net);
++}
++
++void __net_exit tipc_topsrv_exit_net(struct net *net)
++{
++	tipc_topsrv_stop(net);
++}
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index 7d5136ecee78..84f6b6906bcc 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -923,12 +923,6 @@ void tls_device_offload_cleanup_rx(struct sock *sk)
+ 	if (!netdev)
+ 		goto out;
+ 
+-	if (!(netdev->features & NETIF_F_HW_TLS_RX)) {
+-		pr_err_ratelimited("%s: device is missing NETIF_F_HW_TLS_RX cap\n",
+-				   __func__);
+-		goto out;
+-	}
+-
+ 	netdev->tlsdev_ops->tls_dev_del(netdev, tls_ctx,
+ 					TLS_OFFLOAD_CTX_DIR_RX);
+ 
+@@ -987,7 +981,8 @@ static int tls_dev_event(struct notifier_block *this, unsigned long event,
+ {
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+-	if (!(dev->features & (NETIF_F_HW_TLS_RX | NETIF_F_HW_TLS_TX)))
++	if (!dev->tlsdev_ops &&
++	    !(dev->features & (NETIF_F_HW_TLS_RX | NETIF_F_HW_TLS_TX)))
+ 		return NOTIFY_DONE;
+ 
+ 	switch (event) {
