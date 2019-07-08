@@ -26,10 +26,13 @@ $result = `rm -rf ${LOCAL_TMP}/linux-patches`;
 $result = `cd $LOCAL_TMP`;
 $result = `git -C ${LOCAL_TMP}/linux-patches reset`;
 #$result = `git clone --depth=50 $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
-$result = `git clone -b $ver --single-branch $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+$result = `git clone $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+#$result = `git clone -b $ver --single-branch $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
 
+#printf ("ver is ${ver} rel is ${rel} tag is ${tag}\n");
 # checkout branch
-$result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
+#$result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
+$result = `git -C ${LOCAL_TMP}/linux-patches checkout ${ver}`;
 
 # Try and find previous release
 if ($rel > 1) {
@@ -63,7 +66,8 @@ else {
     # just do git log
     #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$ver;
     #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ..'.$tag;
-    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" '.$tag.'...master';
+    #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$tag.'...master';
+    $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status  master..remotes/origin/'.$ver.' /tmp/linux-patches';
     @log_lines = `$cmd`;
 }
 
