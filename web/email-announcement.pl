@@ -25,13 +25,17 @@ $website_base = 'http://dev.gentoo.org/~mpagano/genpatches';
 $result = `rm -rf ${LOCAL_TMP}/linux-patches`;
 $result = `cd $LOCAL_TMP`;
 $result = `git -C ${LOCAL_TMP}/linux-patches reset`;
-#$result = `git clone --depth=50 $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
-$result = `git clone $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
-#$result = `git clone -b $ver --single-branch $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
 
-#printf ("ver is ${ver} rel is ${rel} tag is ${tag}\n");
-# checkout branch
-#$result = `git -C ${LOCAL_TMP}/linux-patches checkout ${tag}`;
+# for X.Y.0 kernels, you can't do a shallow clone
+# for non X.Y.0 kernels (notice the 0), you can do a shallow clone
+if ($rel == 1) {
+	$result = `git clone $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+}
+else {
+	$result = `git clone -b $ver --single-branch $REMOTE_BASE ${LOCAL_TMP}/linux-patches`;
+}
+
+# checkout branch, not really needed fir subgke-branch checkout
 $result = `git -C ${LOCAL_TMP}/linux-patches checkout ${ver}`;
 
 # Try and find previous release
@@ -50,8 +54,6 @@ if ($rel > 1) {
         }
     }
 
-
-
     if ($have_history == 1) {
         $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$oldtag.'..'.$tag;
         @log_lines = `$cmd`;
@@ -64,48 +66,10 @@ if ($rel > 1) {
 }
 else {
     # just do git log
-    #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$ver;
-    #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" ..'.$tag;
-    #$cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status '.$tag.'...master';
     $cmd='git --no-pager -C '.${LOCAL_TMP}.'/linux-patches log  --pretty=format:"%s (%an)" --name-status  master..remotes/origin/'.$ver.' /tmp/linux-patches';
     @log_lines = `$cmd`;
 }
 
-
-#if ($rel > 1) {
-#	$oldtag = $ver.'-'.($rel-1);
-#	#$cmd = 'svn log -q --stop-on-copy '.$subversion_root.'/tags/'.$oldtag;
-#	#$cmd = 'svn log -q --stop-on-copy '.$subversion_root.'/tags/'.$oldtag;
-#
-#    # check out branch
-#    printf("LOCAL_TMP is ${LOCAL_TMP}\n");
-#    $cmd='git -C '.${LOCAL_TMP}.' checkout '.$ver;
-#    @result = `$cmd`;
-#
-#    # get log in between tags
-#    $cmd='git -C '.${LOCAL_TMP}.' log '.$oldtag.'..'.$tag.' --name-status';
-#    printf (" cmd is $cmd\n");
-#
-#	@log_lines = `$cmd`;
-#	$lastrev = 0;
-#	foreach (@log_lines) {
-#		next if $_ !~ /^r(\d+) \|/;
-#		$lastrev = $1;
-#		last;
-#	}
-#}
-#
-#printf("lastrev is $lastrev\n");
-#
-#if ($lastrev) {
-#    printf("inside lastrev\n");
-#	@commits = _parse_log($tag, $lastrev);
-#	$have_history = @commits;
-#}
-#
-#local $ext;
-#$ext = get_tarball_ext($tag);
-#
 $email .= "To: Gentoo Kernel List <gentoo-kernel\@lists.gentoo.org>\n";
 $email .= "Subject: [ANNOUNCE] $kernel_name-$tag release\n";
 
@@ -123,15 +87,6 @@ else {
             $email .= "$line";
         }
 	}
-
-#$email .= "\nPATCHES\n";
-#$email .= "-------\n\n";
-#$email .= "When the website updates, the complete patch list and split-out patches will be\n";
-#$email .= "available here:\n";
-#$email .= $website_base."/patches-".$tag.".html\n";
-#$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".base.tar".$ext."\n";
-#$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".extras.tar".$ext."\n";
-#$email .= $website_base."/tarballs/".$kernel_name."-".$tag.".experimental.tar".$ext."\n";
 
 if ($kernel_name == "genpatches") {
 	$email .= "\n\nABOUT GENPATCHES\n";
