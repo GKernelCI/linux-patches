@@ -1,0 +1,1203 @@
+diff --git a/Makefile b/Makefile
+index d8f5dbfd6b76..d6c65b678d21 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 5
+ PATCHLEVEL = 2
+-SUBLEVEL = 1
++SUBLEVEL = 2
+ EXTRAVERSION =
+ NAME = Bobtail Squid
+ 
+diff --git a/arch/arc/kernel/unwind.c b/arch/arc/kernel/unwind.c
+index 182ce67dfe10..c2663fce7f6c 100644
+--- a/arch/arc/kernel/unwind.c
++++ b/arch/arc/kernel/unwind.c
+@@ -181,11 +181,6 @@ static void *__init unw_hdr_alloc_early(unsigned long sz)
+ 	return memblock_alloc_from(sz, sizeof(unsigned int), MAX_DMA_ADDRESS);
+ }
+ 
+-static void *unw_hdr_alloc(unsigned long sz)
+-{
+-	return kmalloc(sz, GFP_KERNEL);
+-}
+-
+ static void init_unwind_table(struct unwind_table *table, const char *name,
+ 			      const void *core_start, unsigned long core_size,
+ 			      const void *init_start, unsigned long init_size,
+@@ -366,6 +361,10 @@ ret_err:
+ }
+ 
+ #ifdef CONFIG_MODULES
++static void *unw_hdr_alloc(unsigned long sz)
++{
++	return kmalloc(sz, GFP_KERNEL);
++}
+ 
+ static struct unwind_table *last_table;
+ 
+diff --git a/arch/s390/include/asm/facility.h b/arch/s390/include/asm/facility.h
+index e78cda94456b..68c476b20b57 100644
+--- a/arch/s390/include/asm/facility.h
++++ b/arch/s390/include/asm/facility.h
+@@ -59,6 +59,18 @@ static inline int test_facility(unsigned long nr)
+ 	return __test_facility(nr, &S390_lowcore.stfle_fac_list);
+ }
+ 
++static inline unsigned long __stfle_asm(u64 *stfle_fac_list, int size)
++{
++	register unsigned long reg0 asm("0") = size - 1;
++
++	asm volatile(
++		".insn s,0xb2b00000,0(%1)" /* stfle */
++		: "+d" (reg0)
++		: "a" (stfle_fac_list)
++		: "memory", "cc");
++	return reg0;
++}
++
+ /**
+  * stfle - Store facility list extended
+  * @stfle_fac_list: array where facility list can be stored
+@@ -75,13 +87,8 @@ static inline void __stfle(u64 *stfle_fac_list, int size)
+ 	memcpy(stfle_fac_list, &S390_lowcore.stfl_fac_list, 4);
+ 	if (S390_lowcore.stfl_fac_list & 0x01000000) {
+ 		/* More facility bits available with stfle */
+-		register unsigned long reg0 asm("0") = size - 1;
+-
+-		asm volatile(".insn s,0xb2b00000,0(%1)" /* stfle */
+-			     : "+d" (reg0)
+-			     : "a" (stfle_fac_list)
+-			     : "memory", "cc");
+-		nr = (reg0 + 1) * 8; /* # bytes stored by stfle */
++		nr = __stfle_asm(stfle_fac_list, size);
++		nr = min_t(unsigned long, (nr + 1) * 8, size * 8);
+ 	}
+ 	memset((char *) stfle_fac_list + nr, 0, size * 8 - nr);
+ }
+diff --git a/arch/s390/include/asm/sclp.h b/arch/s390/include/asm/sclp.h
+index f577c5f6031a..c563f8368b19 100644
+--- a/arch/s390/include/asm/sclp.h
++++ b/arch/s390/include/asm/sclp.h
+@@ -80,7 +80,6 @@ struct sclp_info {
+ 	unsigned char has_gisaf : 1;
+ 	unsigned char has_diag318 : 1;
+ 	unsigned char has_sipl : 1;
+-	unsigned char has_sipl_g2 : 1;
+ 	unsigned char has_dirq : 1;
+ 	unsigned int ibc;
+ 	unsigned int mtid;
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index d836af3ccc38..2c0a515428d6 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -286,12 +286,7 @@ static struct kobj_attribute sys_ipl_secure_attr =
+ static ssize_t ipl_has_secure_show(struct kobject *kobj,
+ 				   struct kobj_attribute *attr, char *page)
+ {
+-	if (MACHINE_IS_LPAR)
+-		return sprintf(page, "%i\n", !!sclp.has_sipl);
+-	else if (MACHINE_IS_VM)
+-		return sprintf(page, "%i\n", !!sclp.has_sipl_g2);
+-	else
+-		return sprintf(page, "%i\n", 0);
++	return sprintf(page, "%i\n", !!sclp.has_sipl);
+ }
+ 
+ static struct kobj_attribute sys_ipl_has_secure_attr =
+diff --git a/arch/x86/entry/entry_32.S b/arch/x86/entry/entry_32.S
+index 7b23431be5cb..f49e11669271 100644
+--- a/arch/x86/entry/entry_32.S
++++ b/arch/x86/entry/entry_32.S
+@@ -1104,6 +1104,30 @@ ENTRY(irq_entries_start)
+     .endr
+ END(irq_entries_start)
+ 
++#ifdef CONFIG_X86_LOCAL_APIC
++	.align 8
++ENTRY(spurious_entries_start)
++    vector=FIRST_SYSTEM_VECTOR
++    .rept (NR_VECTORS - FIRST_SYSTEM_VECTOR)
++	pushl	$(~vector+0x80)			/* Note: always in signed byte range */
++    vector=vector+1
++	jmp	common_spurious
++	.align	8
++    .endr
++END(spurious_entries_start)
++
++common_spurious:
++	ASM_CLAC
++	addl	$-0x80, (%esp)			/* Adjust vector into the [-256, -1] range */
++	SAVE_ALL switch_stacks=1
++	ENCODE_FRAME_POINTER
++	TRACE_IRQS_OFF
++	movl	%esp, %eax
++	call	smp_spurious_interrupt
++	jmp	ret_from_intr
++ENDPROC(common_spurious)
++#endif
++
+ /*
+  * the CPU automatically disables interrupts when executing an IRQ vector,
+  * so IRQ-flags tracing has to follow that:
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index 11aa3b2afa4d..8dbca86c249b 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -375,6 +375,18 @@ ENTRY(irq_entries_start)
+     .endr
+ END(irq_entries_start)
+ 
++	.align 8
++ENTRY(spurious_entries_start)
++    vector=FIRST_SYSTEM_VECTOR
++    .rept (NR_VECTORS - FIRST_SYSTEM_VECTOR)
++	UNWIND_HINT_IRET_REGS
++	pushq	$(~vector+0x80)			/* Note: always in signed byte range */
++	jmp	common_spurious
++	.align	8
++	vector=vector+1
++    .endr
++END(spurious_entries_start)
++
+ .macro DEBUG_ENTRY_ASSERT_IRQS_OFF
+ #ifdef CONFIG_DEBUG_ENTRY
+ 	pushq %rax
+@@ -571,10 +583,20 @@ _ASM_NOKPROBE(interrupt_entry)
+ 
+ /* Interrupt entry/exit. */
+ 
+-	/*
+-	 * The interrupt stubs push (~vector+0x80) onto the stack and
+-	 * then jump to common_interrupt.
+-	 */
++/*
++ * The interrupt stubs push (~vector+0x80) onto the stack and
++ * then jump to common_spurious/interrupt.
++ */
++common_spurious:
++	addq	$-0x80, (%rsp)			/* Adjust vector to [-256, -1] range */
++	call	interrupt_entry
++	UNWIND_HINT_REGS indirect=1
++	call	smp_spurious_interrupt		/* rdi points to pt_regs */
++	jmp	ret_from_intr
++END(common_spurious)
++_ASM_NOKPROBE(common_spurious)
++
++/* common_interrupt is a hotpath. Align it */
+ 	.p2align CONFIG_X86_L1_CACHE_SHIFT
+ common_interrupt:
+ 	addq	$-0x80, (%rsp)			/* Adjust vector to [-256, -1] range */
+diff --git a/arch/x86/include/asm/hw_irq.h b/arch/x86/include/asm/hw_irq.h
+index 32e666e1231e..cbd97e22d2f3 100644
+--- a/arch/x86/include/asm/hw_irq.h
++++ b/arch/x86/include/asm/hw_irq.h
+@@ -150,8 +150,11 @@ extern char irq_entries_start[];
+ #define trace_irq_entries_start irq_entries_start
+ #endif
+ 
++extern char spurious_entries_start[];
++
+ #define VECTOR_UNUSED		NULL
+-#define VECTOR_RETRIGGERED	((void *)~0UL)
++#define VECTOR_SHUTDOWN		((void *)~0UL)
++#define VECTOR_RETRIGGERED	((void *)~1UL)
+ 
+ typedef struct irq_desc* vector_irq_t[NR_VECTORS];
+ DECLARE_PER_CPU(vector_irq_t, vector_irq);
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index 85be316665b4..16c21ed97cb2 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -2041,21 +2041,32 @@ __visible void __irq_entry smp_spurious_interrupt(struct pt_regs *regs)
+ 	entering_irq();
+ 	trace_spurious_apic_entry(vector);
+ 
++	inc_irq_stat(irq_spurious_count);
++
++	/*
++	 * If this is a spurious interrupt then do not acknowledge
++	 */
++	if (vector == SPURIOUS_APIC_VECTOR) {
++		/* See SDM vol 3 */
++		pr_info("Spurious APIC interrupt (vector 0xFF) on CPU#%d, should never happen.\n",
++			smp_processor_id());
++		goto out;
++	}
++
+ 	/*
+-	 * Check if this really is a spurious interrupt and ACK it
+-	 * if it is a vectored one.  Just in case...
+-	 * Spurious interrupts should not be ACKed.
++	 * If it is a vectored one, verify it's set in the ISR. If set,
++	 * acknowledge it.
+ 	 */
+ 	v = apic_read(APIC_ISR + ((vector & ~0x1f) >> 1));
+-	if (v & (1 << (vector & 0x1f)))
++	if (v & (1 << (vector & 0x1f))) {
++		pr_info("Spurious interrupt (vector 0x%02x) on CPU#%d. Acked\n",
++			vector, smp_processor_id());
+ 		ack_APIC_irq();
+-
+-	inc_irq_stat(irq_spurious_count);
+-
+-	/* see sw-dev-man vol 3, chapter 7.4.13.5 */
+-	pr_info("spurious APIC interrupt through vector %02x on CPU#%d, "
+-		"should never happen.\n", vector, smp_processor_id());
+-
++	} else {
++		pr_info("Spurious interrupt (vector 0x%02x) on CPU#%d. Not pending!\n",
++			vector, smp_processor_id());
++	}
++out:
+ 	trace_spurious_apic_exit(vector);
+ 	exiting_irq();
+ }
+diff --git a/arch/x86/kernel/apic/io_apic.c b/arch/x86/kernel/apic/io_apic.c
+index 53aa234a6803..c9fec0657eea 100644
+--- a/arch/x86/kernel/apic/io_apic.c
++++ b/arch/x86/kernel/apic/io_apic.c
+@@ -1893,6 +1893,50 @@ static int ioapic_set_affinity(struct irq_data *irq_data,
+ 	return ret;
+ }
+ 
++/*
++ * Interrupt shutdown masks the ioapic pin, but the interrupt might already
++ * be in flight, but not yet serviced by the target CPU. That means
++ * __synchronize_hardirq() would return and claim that everything is calmed
++ * down. So free_irq() would proceed and deactivate the interrupt and free
++ * resources.
++ *
++ * Once the target CPU comes around to service it it will find a cleared
++ * vector and complain. While the spurious interrupt is harmless, the full
++ * release of resources might prevent the interrupt from being acknowledged
++ * which keeps the hardware in a weird state.
++ *
++ * Verify that the corresponding Remote-IRR bits are clear.
++ */
++static int ioapic_irq_get_chip_state(struct irq_data *irqd,
++				   enum irqchip_irq_state which,
++				   bool *state)
++{
++	struct mp_chip_data *mcd = irqd->chip_data;
++	struct IO_APIC_route_entry rentry;
++	struct irq_pin_list *p;
++
++	if (which != IRQCHIP_STATE_ACTIVE)
++		return -EINVAL;
++
++	*state = false;
++	raw_spin_lock(&ioapic_lock);
++	for_each_irq_pin(p, mcd->irq_2_pin) {
++		rentry = __ioapic_read_entry(p->apic, p->pin);
++		/*
++		 * The remote IRR is only valid in level trigger mode. It's
++		 * meaning is undefined for edge triggered interrupts and
++		 * irrelevant because the IO-APIC treats them as fire and
++		 * forget.
++		 */
++		if (rentry.irr && rentry.trigger) {
++			*state = true;
++			break;
++		}
++	}
++	raw_spin_unlock(&ioapic_lock);
++	return 0;
++}
++
+ static struct irq_chip ioapic_chip __read_mostly = {
+ 	.name			= "IO-APIC",
+ 	.irq_startup		= startup_ioapic_irq,
+@@ -1902,6 +1946,7 @@ static struct irq_chip ioapic_chip __read_mostly = {
+ 	.irq_eoi		= ioapic_ack_level,
+ 	.irq_set_affinity	= ioapic_set_affinity,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
++	.irq_get_irqchip_state	= ioapic_irq_get_chip_state,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+@@ -1914,6 +1959,7 @@ static struct irq_chip ioapic_ir_chip __read_mostly = {
+ 	.irq_eoi		= ioapic_ir_ack_level,
+ 	.irq_set_affinity	= ioapic_set_affinity,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
++	.irq_get_irqchip_state	= ioapic_irq_get_chip_state,
+ 	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+diff --git a/arch/x86/kernel/apic/vector.c b/arch/x86/kernel/apic/vector.c
+index e7cb78aed644..fdacb864c3dd 100644
+--- a/arch/x86/kernel/apic/vector.c
++++ b/arch/x86/kernel/apic/vector.c
+@@ -340,7 +340,7 @@ static void clear_irq_vector(struct irq_data *irqd)
+ 	trace_vector_clear(irqd->irq, vector, apicd->cpu, apicd->prev_vector,
+ 			   apicd->prev_cpu);
+ 
+-	per_cpu(vector_irq, apicd->cpu)[vector] = VECTOR_UNUSED;
++	per_cpu(vector_irq, apicd->cpu)[vector] = VECTOR_SHUTDOWN;
+ 	irq_matrix_free(vector_matrix, apicd->cpu, vector, managed);
+ 	apicd->vector = 0;
+ 
+@@ -349,7 +349,7 @@ static void clear_irq_vector(struct irq_data *irqd)
+ 	if (!vector)
+ 		return;
+ 
+-	per_cpu(vector_irq, apicd->prev_cpu)[vector] = VECTOR_UNUSED;
++	per_cpu(vector_irq, apicd->prev_cpu)[vector] = VECTOR_SHUTDOWN;
+ 	irq_matrix_free(vector_matrix, apicd->prev_cpu, vector, managed);
+ 	apicd->prev_vector = 0;
+ 	apicd->move_in_progress = 0;
+diff --git a/arch/x86/kernel/idt.c b/arch/x86/kernel/idt.c
+index d2482bbbe3d0..87ef69a72c52 100644
+--- a/arch/x86/kernel/idt.c
++++ b/arch/x86/kernel/idt.c
+@@ -319,7 +319,8 @@ void __init idt_setup_apic_and_irq_gates(void)
+ #ifdef CONFIG_X86_LOCAL_APIC
+ 	for_each_clear_bit_from(i, system_vectors, NR_VECTORS) {
+ 		set_bit(i, system_vectors);
+-		set_intr_gate(i, spurious_interrupt);
++		entry = spurious_entries_start + 8 * (i - FIRST_SYSTEM_VECTOR);
++		set_intr_gate(i, entry);
+ 	}
+ #endif
+ }
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index 9b68b5b00ac9..cc496eb7a8d2 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -247,7 +247,7 @@ __visible unsigned int __irq_entry do_IRQ(struct pt_regs *regs)
+ 	if (!handle_irq(desc, regs)) {
+ 		ack_APIC_irq();
+ 
+-		if (desc != VECTOR_RETRIGGERED) {
++		if (desc != VECTOR_RETRIGGERED && desc != VECTOR_SHUTDOWN) {
+ 			pr_emerg_ratelimited("%s: %d.%d No irq handler for vector\n",
+ 					     __func__, smp_processor_id(),
+ 					     vector);
+diff --git a/drivers/base/cacheinfo.c b/drivers/base/cacheinfo.c
+index a7359535caf5..b444f89a2041 100644
+--- a/drivers/base/cacheinfo.c
++++ b/drivers/base/cacheinfo.c
+@@ -655,7 +655,8 @@ static int cacheinfo_cpu_pre_down(unsigned int cpu)
+ 
+ static int __init cacheinfo_sysfs_init(void)
+ {
+-	return cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "base/cacheinfo:online",
++	return cpuhp_setup_state(CPUHP_AP_BASE_CACHEINFO_ONLINE,
++				 "base/cacheinfo:online",
+ 				 cacheinfo_cpu_online, cacheinfo_cpu_pre_down);
+ }
+ device_initcall(cacheinfo_sysfs_init);
+diff --git a/drivers/base/firmware_loader/fallback.c b/drivers/base/firmware_loader/fallback.c
+index f962488546b6..103b5d37fa86 100644
+--- a/drivers/base/firmware_loader/fallback.c
++++ b/drivers/base/firmware_loader/fallback.c
+@@ -659,7 +659,7 @@ static bool fw_run_sysfs_fallback(enum fw_opt opt_flags)
+ 	/* Also permit LSMs and IMA to fail firmware sysfs fallback */
+ 	ret = security_kernel_load_data(LOADING_FIRMWARE);
+ 	if (ret < 0)
+-		return ret;
++		return false;
+ 
+ 	return fw_force_sysfs_fallback(opt_flags);
+ }
+diff --git a/drivers/crypto/nx/nx-842-powernv.c b/drivers/crypto/nx/nx-842-powernv.c
+index 4acbc47973e9..e78ff5c65ed6 100644
+--- a/drivers/crypto/nx/nx-842-powernv.c
++++ b/drivers/crypto/nx/nx-842-powernv.c
+@@ -27,8 +27,6 @@ MODULE_ALIAS_CRYPTO("842-nx");
+ #define WORKMEM_ALIGN	(CRB_ALIGN)
+ #define CSB_WAIT_MAX	(5000) /* ms */
+ #define VAS_RETRIES	(10)
+-/* # of requests allowed per RxFIFO at a time. 0 for unlimited */
+-#define MAX_CREDITS_PER_RXFIFO	(1024)
+ 
+ struct nx842_workmem {
+ 	/* Below fields must be properly aligned */
+@@ -812,7 +810,11 @@ static int __init vas_cfg_coproc_info(struct device_node *dn, int chip_id,
+ 	rxattr.lnotify_lpid = lpid;
+ 	rxattr.lnotify_pid = pid;
+ 	rxattr.lnotify_tid = tid;
+-	rxattr.wcreds_max = MAX_CREDITS_PER_RXFIFO;
++	/*
++	 * Maximum RX window credits can not be more than #CRBs in
++	 * RxFIFO. Otherwise, can get checkstop if RxFIFO overruns.
++	 */
++	rxattr.wcreds_max = fifo_size / CRB_SIZE;
+ 
+ 	/*
+ 	 * Open a VAS receice window which is used to configure RxFIFO
+diff --git a/drivers/crypto/talitos.c b/drivers/crypto/talitos.c
+index 427c78d4d948..8c57c5af0930 100644
+--- a/drivers/crypto/talitos.c
++++ b/drivers/crypto/talitos.c
+@@ -321,6 +321,21 @@ int talitos_submit(struct device *dev, int ch, struct talitos_desc *desc,
+ }
+ EXPORT_SYMBOL(talitos_submit);
+ 
++static __be32 get_request_hdr(struct talitos_request *request, bool is_sec1)
++{
++	struct talitos_edesc *edesc;
++
++	if (!is_sec1)
++		return request->desc->hdr;
++
++	if (!request->desc->next_desc)
++		return request->desc->hdr1;
++
++	edesc = container_of(request->desc, struct talitos_edesc, desc);
++
++	return ((struct talitos_desc *)(edesc->buf + edesc->dma_len))->hdr1;
++}
++
+ /*
+  * process what was done, notify callback of error if not
+  */
+@@ -342,12 +357,7 @@ static void flush_channel(struct device *dev, int ch, int error, int reset_ch)
+ 
+ 		/* descriptors with their done bits set don't get the error */
+ 		rmb();
+-		if (!is_sec1)
+-			hdr = request->desc->hdr;
+-		else if (request->desc->next_desc)
+-			hdr = (request->desc + 1)->hdr1;
+-		else
+-			hdr = request->desc->hdr1;
++		hdr = get_request_hdr(request, is_sec1);
+ 
+ 		if ((hdr & DESC_HDR_DONE) == DESC_HDR_DONE)
+ 			status = 0;
+@@ -477,8 +487,14 @@ static u32 current_desc_hdr(struct device *dev, int ch)
+ 		}
+ 	}
+ 
+-	if (priv->chan[ch].fifo[iter].desc->next_desc == cur_desc)
+-		return (priv->chan[ch].fifo[iter].desc + 1)->hdr;
++	if (priv->chan[ch].fifo[iter].desc->next_desc == cur_desc) {
++		struct talitos_edesc *edesc;
++
++		edesc = container_of(priv->chan[ch].fifo[iter].desc,
++				     struct talitos_edesc, desc);
++		return ((struct talitos_desc *)
++			(edesc->buf + edesc->dma_len))->hdr;
++	}
+ 
+ 	return priv->chan[ch].fifo[iter].desc->hdr;
+ }
+@@ -948,36 +964,6 @@ badkey:
+ 	goto out;
+ }
+ 
+-/*
+- * talitos_edesc - s/w-extended descriptor
+- * @src_nents: number of segments in input scatterlist
+- * @dst_nents: number of segments in output scatterlist
+- * @icv_ool: whether ICV is out-of-line
+- * @iv_dma: dma address of iv for checking continuity and link table
+- * @dma_len: length of dma mapped link_tbl space
+- * @dma_link_tbl: bus physical address of link_tbl/buf
+- * @desc: h/w descriptor
+- * @link_tbl: input and output h/w link tables (if {src,dst}_nents > 1) (SEC2)
+- * @buf: input and output buffeur (if {src,dst}_nents > 1) (SEC1)
+- *
+- * if decrypting (with authcheck), or either one of src_nents or dst_nents
+- * is greater than 1, an integrity check value is concatenated to the end
+- * of link_tbl data
+- */
+-struct talitos_edesc {
+-	int src_nents;
+-	int dst_nents;
+-	bool icv_ool;
+-	dma_addr_t iv_dma;
+-	int dma_len;
+-	dma_addr_t dma_link_tbl;
+-	struct talitos_desc desc;
+-	union {
+-		struct talitos_ptr link_tbl[0];
+-		u8 buf[0];
+-	};
+-};
+-
+ static void talitos_sg_unmap(struct device *dev,
+ 			     struct talitos_edesc *edesc,
+ 			     struct scatterlist *src,
+@@ -1466,15 +1452,11 @@ static struct talitos_edesc *talitos_edesc_alloc(struct device *dev,
+ 	edesc->dst_nents = dst_nents;
+ 	edesc->iv_dma = iv_dma;
+ 	edesc->dma_len = dma_len;
+-	if (dma_len) {
+-		void *addr = &edesc->link_tbl[0];
+-
+-		if (is_sec1 && !dst)
+-			addr += sizeof(struct talitos_desc);
+-		edesc->dma_link_tbl = dma_map_single(dev, addr,
++	if (dma_len)
++		edesc->dma_link_tbl = dma_map_single(dev, &edesc->link_tbl[0],
+ 						     edesc->dma_len,
+ 						     DMA_BIDIRECTIONAL);
+-	}
++
+ 	return edesc;
+ }
+ 
+@@ -1759,14 +1741,16 @@ static void common_nonsnoop_hash_unmap(struct device *dev,
+ 	struct talitos_private *priv = dev_get_drvdata(dev);
+ 	bool is_sec1 = has_ftr_sec1(priv);
+ 	struct talitos_desc *desc = &edesc->desc;
+-	struct talitos_desc *desc2 = desc + 1;
++	struct talitos_desc *desc2 = (struct talitos_desc *)
++				     (edesc->buf + edesc->dma_len);
+ 
+ 	unmap_single_talitos_ptr(dev, &edesc->desc.ptr[5], DMA_FROM_DEVICE);
+ 	if (desc->next_desc &&
+ 	    desc->ptr[5].ptr != desc2->ptr[5].ptr)
+ 		unmap_single_talitos_ptr(dev, &desc2->ptr[5], DMA_FROM_DEVICE);
+ 
+-	talitos_sg_unmap(dev, edesc, req_ctx->psrc, NULL, 0, 0);
++	if (req_ctx->psrc)
++		talitos_sg_unmap(dev, edesc, req_ctx->psrc, NULL, 0, 0);
+ 
+ 	/* When using hashctx-in, must unmap it. */
+ 	if (from_talitos_ptr_len(&edesc->desc.ptr[1], is_sec1))
+@@ -1833,7 +1817,6 @@ static void talitos_handle_buggy_hash(struct talitos_ctx *ctx,
+ 
+ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 				struct ahash_request *areq, unsigned int length,
+-				unsigned int offset,
+ 				void (*callback) (struct device *dev,
+ 						  struct talitos_desc *desc,
+ 						  void *context, int error))
+@@ -1872,9 +1855,7 @@ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 
+ 	sg_count = edesc->src_nents ?: 1;
+ 	if (is_sec1 && sg_count > 1)
+-		sg_pcopy_to_buffer(req_ctx->psrc, sg_count,
+-				   edesc->buf + sizeof(struct talitos_desc),
+-				   length, req_ctx->nbuf);
++		sg_copy_to_buffer(req_ctx->psrc, sg_count, edesc->buf, length);
+ 	else if (length)
+ 		sg_count = dma_map_sg(dev, req_ctx->psrc, sg_count,
+ 				      DMA_TO_DEVICE);
+@@ -1887,7 +1868,7 @@ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 				       DMA_TO_DEVICE);
+ 	} else {
+ 		sg_count = talitos_sg_map(dev, req_ctx->psrc, length, edesc,
+-					  &desc->ptr[3], sg_count, offset, 0);
++					  &desc->ptr[3], sg_count, 0, 0);
+ 		if (sg_count > 1)
+ 			sync_needed = true;
+ 	}
+@@ -1911,7 +1892,8 @@ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 		talitos_handle_buggy_hash(ctx, edesc, &desc->ptr[3]);
+ 
+ 	if (is_sec1 && req_ctx->nbuf && length) {
+-		struct talitos_desc *desc2 = desc + 1;
++		struct talitos_desc *desc2 = (struct talitos_desc *)
++					     (edesc->buf + edesc->dma_len);
+ 		dma_addr_t next_desc;
+ 
+ 		memset(desc2, 0, sizeof(*desc2));
+@@ -1932,7 +1914,7 @@ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 						      DMA_TO_DEVICE);
+ 		copy_talitos_ptr(&desc2->ptr[2], &desc->ptr[2], is_sec1);
+ 		sg_count = talitos_sg_map(dev, req_ctx->psrc, length, edesc,
+-					  &desc2->ptr[3], sg_count, offset, 0);
++					  &desc2->ptr[3], sg_count, 0, 0);
+ 		if (sg_count > 1)
+ 			sync_needed = true;
+ 		copy_talitos_ptr(&desc2->ptr[5], &desc->ptr[5], is_sec1);
+@@ -2043,7 +2025,6 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
+ 	struct device *dev = ctx->dev;
+ 	struct talitos_private *priv = dev_get_drvdata(dev);
+ 	bool is_sec1 = has_ftr_sec1(priv);
+-	int offset = 0;
+ 	u8 *ctx_buf = req_ctx->buf[req_ctx->buf_idx];
+ 
+ 	if (!req_ctx->last && (nbytes + req_ctx->nbuf <= blocksize)) {
+@@ -2083,6 +2064,8 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
+ 			sg_chain(req_ctx->bufsl, 2, areq->src);
+ 		req_ctx->psrc = req_ctx->bufsl;
+ 	} else if (is_sec1 && req_ctx->nbuf && req_ctx->nbuf < blocksize) {
++		int offset;
++
+ 		if (nbytes_to_hash > blocksize)
+ 			offset = blocksize - req_ctx->nbuf;
+ 		else
+@@ -2095,7 +2078,8 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
+ 		sg_copy_to_buffer(areq->src, nents,
+ 				  ctx_buf + req_ctx->nbuf, offset);
+ 		req_ctx->nbuf += offset;
+-		req_ctx->psrc = areq->src;
++		req_ctx->psrc = scatterwalk_ffwd(req_ctx->bufsl, areq->src,
++						 offset);
+ 	} else
+ 		req_ctx->psrc = areq->src;
+ 
+@@ -2135,8 +2119,7 @@ static int ahash_process_req(struct ahash_request *areq, unsigned int nbytes)
+ 	if (ctx->keylen && (req_ctx->first || req_ctx->last))
+ 		edesc->desc.hdr |= DESC_HDR_MODE0_MDEU_HMAC;
+ 
+-	return common_nonsnoop_hash(edesc, areq, nbytes_to_hash, offset,
+-				    ahash_done);
++	return common_nonsnoop_hash(edesc, areq, nbytes_to_hash, ahash_done);
+ }
+ 
+ static int ahash_update(struct ahash_request *areq)
+diff --git a/drivers/crypto/talitos.h b/drivers/crypto/talitos.h
+index a65a63e0d6c1..979f6a61e545 100644
+--- a/drivers/crypto/talitos.h
++++ b/drivers/crypto/talitos.h
+@@ -65,6 +65,36 @@ struct talitos_desc {
+ 
+ #define TALITOS_DESC_SIZE	(sizeof(struct talitos_desc) - sizeof(__be32))
+ 
++/*
++ * talitos_edesc - s/w-extended descriptor
++ * @src_nents: number of segments in input scatterlist
++ * @dst_nents: number of segments in output scatterlist
++ * @icv_ool: whether ICV is out-of-line
++ * @iv_dma: dma address of iv for checking continuity and link table
++ * @dma_len: length of dma mapped link_tbl space
++ * @dma_link_tbl: bus physical address of link_tbl/buf
++ * @desc: h/w descriptor
++ * @link_tbl: input and output h/w link tables (if {src,dst}_nents > 1) (SEC2)
++ * @buf: input and output buffeur (if {src,dst}_nents > 1) (SEC1)
++ *
++ * if decrypting (with authcheck), or either one of src_nents or dst_nents
++ * is greater than 1, an integrity check value is concatenated to the end
++ * of link_tbl data
++ */
++struct talitos_edesc {
++	int src_nents;
++	int dst_nents;
++	bool icv_ool;
++	dma_addr_t iv_dma;
++	int dma_len;
++	dma_addr_t dma_link_tbl;
++	struct talitos_desc desc;
++	union {
++		struct talitos_ptr link_tbl[0];
++		u8 buf[0];
++	};
++};
++
+ /**
+  * talitos_request - descriptor submission request
+  * @desc: descriptor pointer (kernel virtual)
+diff --git a/drivers/input/mouse/synaptics.c b/drivers/input/mouse/synaptics.c
+index b8ec301025b7..1080c0c49815 100644
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@ -173,6 +173,7 @@ static const char * const smbus_pnp_ids[] = {
+ 	"LEN0072", /* X1 Carbon Gen 5 (2017) - Elan/ALPS trackpoint */
+ 	"LEN0073", /* X1 Carbon G5 (Elantech) */
+ 	"LEN0092", /* X1 Carbon 6 */
++	"LEN0093", /* T480 */
+ 	"LEN0096", /* X280 */
+ 	"LEN0097", /* X280 -> ALPS trackpoint */
+ 	"LEN200f", /* T450s */
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index 0e09bede42a2..b081a1ef6859 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -4208,7 +4208,7 @@ void e1000e_up(struct e1000_adapter *adapter)
+ 		e1000_configure_msix(adapter);
+ 	e1000_irq_enable(adapter);
+ 
+-	netif_start_queue(adapter->netdev);
++	/* Tx queue started by watchdog timer when link is up */
+ 
+ 	e1000e_trigger_lsc(adapter);
+ }
+@@ -4606,6 +4606,7 @@ int e1000e_open(struct net_device *netdev)
+ 	pm_runtime_get_sync(&pdev->dev);
+ 
+ 	netif_carrier_off(netdev);
++	netif_stop_queue(netdev);
+ 
+ 	/* allocate transmit descriptors */
+ 	err = e1000e_setup_tx_resources(adapter->tx_ring);
+@@ -4666,7 +4667,6 @@ int e1000e_open(struct net_device *netdev)
+ 	e1000_irq_enable(adapter);
+ 
+ 	adapter->tx_hang_recheck = false;
+-	netif_start_queue(netdev);
+ 
+ 	hw->mac.get_link_status = true;
+ 	pm_runtime_put(&pdev->dev);
+@@ -5288,6 +5288,7 @@ static void e1000_watchdog_task(struct work_struct *work)
+ 			if (phy->ops.cfg_on_link_up)
+ 				phy->ops.cfg_on_link_up(hw);
+ 
++			netif_wake_queue(netdev);
+ 			netif_carrier_on(netdev);
+ 
+ 			if (!test_bit(__E1000_DOWN, &adapter->state))
+@@ -5301,6 +5302,7 @@ static void e1000_watchdog_task(struct work_struct *work)
+ 			/* Link status message must follow this format */
+ 			pr_info("%s NIC Link is Down\n", adapter->netdev->name);
+ 			netif_carrier_off(netdev);
++			netif_stop_queue(netdev);
+ 			if (!test_bit(__E1000_DOWN, &adapter->state))
+ 				mod_timer(&adapter->phy_info_timer,
+ 					  round_jiffies(jiffies + 2 * HZ));
+@@ -5308,13 +5310,8 @@ static void e1000_watchdog_task(struct work_struct *work)
+ 			/* 8000ES2LAN requires a Rx packet buffer work-around
+ 			 * on link down event; reset the controller to flush
+ 			 * the Rx packet buffer.
+-			 *
+-			 * If the link is lost the controller stops DMA, but
+-			 * if there is queued Tx work it cannot be done.  So
+-			 * reset the controller to flush the Tx packet buffers.
+ 			 */
+-			if ((adapter->flags & FLAG_RX_NEEDS_RESTART) ||
+-			    e1000_desc_unused(tx_ring) + 1 < tx_ring->count)
++			if (adapter->flags & FLAG_RX_NEEDS_RESTART)
+ 				adapter->flags |= FLAG_RESTART_NOW;
+ 			else
+ 				pm_schedule_suspend(netdev->dev.parent,
+@@ -5337,6 +5334,14 @@ link_up:
+ 	adapter->gotc_old = adapter->stats.gotc;
+ 	spin_unlock(&adapter->stats64_lock);
+ 
++	/* If the link is lost the controller stops DMA, but
++	 * if there is queued Tx work it cannot be done.  So
++	 * reset the controller to flush the Tx packet buffers.
++	 */
++	if (!netif_carrier_ok(netdev) &&
++	    (e1000_desc_unused(tx_ring) + 1 < tx_ring->count))
++		adapter->flags |= FLAG_RESTART_NOW;
++
+ 	/* If reset is necessary, do it outside of interrupt context. */
+ 	if (adapter->flags & FLAG_RESTART_NOW) {
+ 		schedule_work(&adapter->reset_task);
+diff --git a/drivers/s390/char/sclp_early.c b/drivers/s390/char/sclp_early.c
+index 6c90aa725f23..e71992a3c55f 100644
+--- a/drivers/s390/char/sclp_early.c
++++ b/drivers/s390/char/sclp_early.c
+@@ -41,7 +41,6 @@ static void __init sclp_early_facilities_detect(struct read_info_sccb *sccb)
+ 	sclp.has_hvs = !!(sccb->fac119 & 0x80);
+ 	sclp.has_kss = !!(sccb->fac98 & 0x01);
+ 	sclp.has_sipl = !!(sccb->cbl & 0x02);
+-	sclp.has_sipl_g2 = !!(sccb->cbl & 0x04);
+ 	if (sccb->fac85 & 0x02)
+ 		S390_lowcore.machine_flags |= MACHINE_FLAG_ESOP;
+ 	if (sccb->fac91 & 0x40)
+diff --git a/drivers/s390/cio/qdio_setup.c b/drivers/s390/cio/qdio_setup.c
+index 99d7d2566a3a..d4101cecdc8d 100644
+--- a/drivers/s390/cio/qdio_setup.c
++++ b/drivers/s390/cio/qdio_setup.c
+@@ -150,6 +150,7 @@ static int __qdio_allocate_qs(struct qdio_q **irq_ptr_qs, int nr_queues)
+ 			return -ENOMEM;
+ 		}
+ 		irq_ptr_qs[i] = q;
++		INIT_LIST_HEAD(&q->entry);
+ 	}
+ 	return 0;
+ }
+@@ -178,6 +179,7 @@ static void setup_queues_misc(struct qdio_q *q, struct qdio_irq *irq_ptr,
+ 	q->mask = 1 << (31 - i);
+ 	q->nr = i;
+ 	q->handler = handler;
++	INIT_LIST_HEAD(&q->entry);
+ }
+ 
+ static void setup_storage_lists(struct qdio_q *q, struct qdio_irq *irq_ptr,
+diff --git a/drivers/s390/cio/qdio_thinint.c b/drivers/s390/cio/qdio_thinint.c
+index 28d59ac2204c..d9763bbecbf9 100644
+--- a/drivers/s390/cio/qdio_thinint.c
++++ b/drivers/s390/cio/qdio_thinint.c
+@@ -79,7 +79,6 @@ void tiqdio_add_input_queues(struct qdio_irq *irq_ptr)
+ 	mutex_lock(&tiq_list_lock);
+ 	list_add_rcu(&irq_ptr->input_qs[0]->entry, &tiq_list);
+ 	mutex_unlock(&tiq_list_lock);
+-	xchg(irq_ptr->dsci, 1 << 7);
+ }
+ 
+ void tiqdio_remove_input_queues(struct qdio_irq *irq_ptr)
+@@ -87,14 +86,14 @@ void tiqdio_remove_input_queues(struct qdio_irq *irq_ptr)
+ 	struct qdio_q *q;
+ 
+ 	q = irq_ptr->input_qs[0];
+-	/* if establish triggered an error */
+-	if (!q || !q->entry.prev || !q->entry.next)
++	if (!q)
+ 		return;
+ 
+ 	mutex_lock(&tiq_list_lock);
+ 	list_del_rcu(&q->entry);
+ 	mutex_unlock(&tiq_list_lock);
+ 	synchronize_rcu();
++	INIT_LIST_HEAD(&q->entry);
+ }
+ 
+ static inline int has_multiple_inq_on_dsci(struct qdio_irq *irq_ptr)
+diff --git a/include/linux/cpuhotplug.h b/include/linux/cpuhotplug.h
+index 5c6062206760..52ec0d9fa1f7 100644
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@ -176,6 +176,7 @@ enum cpuhp_state {
+ 	CPUHP_AP_WATCHDOG_ONLINE,
+ 	CPUHP_AP_WORKQUEUE_ONLINE,
+ 	CPUHP_AP_RCUTREE_ONLINE,
++	CPUHP_AP_BASE_CACHEINFO_ONLINE,
+ 	CPUHP_AP_ONLINE_DYN,
+ 	CPUHP_AP_ONLINE_DYN_END		= CPUHP_AP_ONLINE_DYN + 30,
+ 	CPUHP_AP_X86_HPET_ONLINE,
+diff --git a/include/uapi/linux/nilfs2_ondisk.h b/include/uapi/linux/nilfs2_ondisk.h
+index a7e66ab11d1d..c23f91ae5fe8 100644
+--- a/include/uapi/linux/nilfs2_ondisk.h
++++ b/include/uapi/linux/nilfs2_ondisk.h
+@@ -29,7 +29,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/magic.h>
+-
++#include <asm/byteorder.h>
+ 
+ #define NILFS_INODE_BMAP_SIZE	7
+ 
+@@ -533,19 +533,19 @@ enum {
+ static inline void							\
+ nilfs_checkpoint_set_##name(struct nilfs_checkpoint *cp)		\
+ {									\
+-	cp->cp_flags = cpu_to_le32(le32_to_cpu(cp->cp_flags) |		\
+-				   (1UL << NILFS_CHECKPOINT_##flag));	\
++	cp->cp_flags = __cpu_to_le32(__le32_to_cpu(cp->cp_flags) |	\
++				     (1UL << NILFS_CHECKPOINT_##flag));	\
+ }									\
+ static inline void							\
+ nilfs_checkpoint_clear_##name(struct nilfs_checkpoint *cp)		\
+ {									\
+-	cp->cp_flags = cpu_to_le32(le32_to_cpu(cp->cp_flags) &		\
++	cp->cp_flags = __cpu_to_le32(__le32_to_cpu(cp->cp_flags) &	\
+ 				   ~(1UL << NILFS_CHECKPOINT_##flag));	\
+ }									\
+ static inline int							\
+ nilfs_checkpoint_##name(const struct nilfs_checkpoint *cp)		\
+ {									\
+-	return !!(le32_to_cpu(cp->cp_flags) &				\
++	return !!(__le32_to_cpu(cp->cp_flags) &				\
+ 		  (1UL << NILFS_CHECKPOINT_##flag));			\
+ }
+ 
+@@ -595,20 +595,20 @@ enum {
+ static inline void							\
+ nilfs_segment_usage_set_##name(struct nilfs_segment_usage *su)		\
+ {									\
+-	su->su_flags = cpu_to_le32(le32_to_cpu(su->su_flags) |		\
++	su->su_flags = __cpu_to_le32(__le32_to_cpu(su->su_flags) |	\
+ 				   (1UL << NILFS_SEGMENT_USAGE_##flag));\
+ }									\
+ static inline void							\
+ nilfs_segment_usage_clear_##name(struct nilfs_segment_usage *su)	\
+ {									\
+ 	su->su_flags =							\
+-		cpu_to_le32(le32_to_cpu(su->su_flags) &			\
++		__cpu_to_le32(__le32_to_cpu(su->su_flags) &		\
+ 			    ~(1UL << NILFS_SEGMENT_USAGE_##flag));      \
+ }									\
+ static inline int							\
+ nilfs_segment_usage_##name(const struct nilfs_segment_usage *su)	\
+ {									\
+-	return !!(le32_to_cpu(su->su_flags) &				\
++	return !!(__le32_to_cpu(su->su_flags) &				\
+ 		  (1UL << NILFS_SEGMENT_USAGE_##flag));			\
+ }
+ 
+@@ -619,15 +619,15 @@ NILFS_SEGMENT_USAGE_FNS(ERROR, error)
+ static inline void
+ nilfs_segment_usage_set_clean(struct nilfs_segment_usage *su)
+ {
+-	su->su_lastmod = cpu_to_le64(0);
+-	su->su_nblocks = cpu_to_le32(0);
+-	su->su_flags = cpu_to_le32(0);
++	su->su_lastmod = __cpu_to_le64(0);
++	su->su_nblocks = __cpu_to_le32(0);
++	su->su_flags = __cpu_to_le32(0);
+ }
+ 
+ static inline int
+ nilfs_segment_usage_clean(const struct nilfs_segment_usage *su)
+ {
+-	return !le32_to_cpu(su->su_flags);
++	return !__le32_to_cpu(su->su_flags);
+ }
+ 
+ /**
+diff --git a/kernel/irq/autoprobe.c b/kernel/irq/autoprobe.c
+index 16cbf6beb276..ae60cae24e9a 100644
+--- a/kernel/irq/autoprobe.c
++++ b/kernel/irq/autoprobe.c
+@@ -90,7 +90,7 @@ unsigned long probe_irq_on(void)
+ 			/* It triggered already - consider it spurious. */
+ 			if (!(desc->istate & IRQS_WAITING)) {
+ 				desc->istate &= ~IRQS_AUTODETECT;
+-				irq_shutdown(desc);
++				irq_shutdown_and_deactivate(desc);
+ 			} else
+ 				if (i < 32)
+ 					mask |= 1 << i;
+@@ -127,7 +127,7 @@ unsigned int probe_irq_mask(unsigned long val)
+ 				mask |= 1 << i;
+ 
+ 			desc->istate &= ~IRQS_AUTODETECT;
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 		}
+ 		raw_spin_unlock_irq(&desc->lock);
+ 	}
+@@ -169,7 +169,7 @@ int probe_irq_off(unsigned long val)
+ 				nr_of_irqs++;
+ 			}
+ 			desc->istate &= ~IRQS_AUTODETECT;
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 		}
+ 		raw_spin_unlock_irq(&desc->lock);
+ 	}
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 29d6c7d070b4..3ff4a1260885 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -314,6 +314,12 @@ void irq_shutdown(struct irq_desc *desc)
+ 		}
+ 		irq_state_clr_started(desc);
+ 	}
++}
++
++
++void irq_shutdown_and_deactivate(struct irq_desc *desc)
++{
++	irq_shutdown(desc);
+ 	/*
+ 	 * This must be called even if the interrupt was never started up,
+ 	 * because the activation can happen before the interrupt is
+diff --git a/kernel/irq/cpuhotplug.c b/kernel/irq/cpuhotplug.c
+index 5b1072e394b2..6c7ca2e983a5 100644
+--- a/kernel/irq/cpuhotplug.c
++++ b/kernel/irq/cpuhotplug.c
+@@ -116,7 +116,7 @@ static bool migrate_one_irq(struct irq_desc *desc)
+ 		 */
+ 		if (irqd_affinity_is_managed(d)) {
+ 			irqd_set_managed_shutdown(d);
+-			irq_shutdown(desc);
++			irq_shutdown_and_deactivate(desc);
+ 			return false;
+ 		}
+ 		affinity = cpu_online_mask;
+diff --git a/kernel/irq/internals.h b/kernel/irq/internals.h
+index 70c3053bc1f6..3a948f41ab00 100644
+--- a/kernel/irq/internals.h
++++ b/kernel/irq/internals.h
+@@ -82,6 +82,7 @@ extern int irq_activate_and_startup(struct irq_desc *desc, bool resend);
+ extern int irq_startup(struct irq_desc *desc, bool resend, bool force);
+ 
+ extern void irq_shutdown(struct irq_desc *desc);
++extern void irq_shutdown_and_deactivate(struct irq_desc *desc);
+ extern void irq_enable(struct irq_desc *desc);
+ extern void irq_disable(struct irq_desc *desc);
+ extern void irq_percpu_enable(struct irq_desc *desc, unsigned int cpu);
+@@ -96,6 +97,10 @@ static inline void irq_mark_irq(unsigned int irq) { }
+ extern void irq_mark_irq(unsigned int irq);
+ #endif
+ 
++extern int __irq_get_irqchip_state(struct irq_data *data,
++				   enum irqchip_irq_state which,
++				   bool *state);
++
+ extern void init_kstat_irqs(struct irq_desc *desc, int node, int nr);
+ 
+ irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc, unsigned int *flags);
+diff --git a/kernel/irq/manage.c b/kernel/irq/manage.c
+index 78f3ddeb7fe4..e8f7f179bf77 100644
+--- a/kernel/irq/manage.c
++++ b/kernel/irq/manage.c
+@@ -13,6 +13,7 @@
+ #include <linux/module.h>
+ #include <linux/random.h>
+ #include <linux/interrupt.h>
++#include <linux/irqdomain.h>
+ #include <linux/slab.h>
+ #include <linux/sched.h>
+ #include <linux/sched/rt.h>
+@@ -34,8 +35,9 @@ static int __init setup_forced_irqthreads(char *arg)
+ early_param("threadirqs", setup_forced_irqthreads);
+ #endif
+ 
+-static void __synchronize_hardirq(struct irq_desc *desc)
++static void __synchronize_hardirq(struct irq_desc *desc, bool sync_chip)
+ {
++	struct irq_data *irqd = irq_desc_get_irq_data(desc);
+ 	bool inprogress;
+ 
+ 	do {
+@@ -51,6 +53,20 @@ static void __synchronize_hardirq(struct irq_desc *desc)
+ 		/* Ok, that indicated we're done: double-check carefully. */
+ 		raw_spin_lock_irqsave(&desc->lock, flags);
+ 		inprogress = irqd_irq_inprogress(&desc->irq_data);
++
++		/*
++		 * If requested and supported, check at the chip whether it
++		 * is in flight at the hardware level, i.e. already pending
++		 * in a CPU and waiting for service and acknowledge.
++		 */
++		if (!inprogress && sync_chip) {
++			/*
++			 * Ignore the return code. inprogress is only updated
++			 * when the chip supports it.
++			 */
++			__irq_get_irqchip_state(irqd, IRQCHIP_STATE_ACTIVE,
++						&inprogress);
++		}
+ 		raw_spin_unlock_irqrestore(&desc->lock, flags);
+ 
+ 		/* Oops, that failed? */
+@@ -73,13 +89,18 @@ static void __synchronize_hardirq(struct irq_desc *desc)
+  *	Returns: false if a threaded handler is active.
+  *
+  *	This function may be called - with care - from IRQ context.
++ *
++ *	It does not check whether there is an interrupt in flight at the
++ *	hardware level, but not serviced yet, as this might deadlock when
++ *	called with interrupts disabled and the target CPU of the interrupt
++ *	is the current CPU.
+  */
+ bool synchronize_hardirq(unsigned int irq)
+ {
+ 	struct irq_desc *desc = irq_to_desc(irq);
+ 
+ 	if (desc) {
+-		__synchronize_hardirq(desc);
++		__synchronize_hardirq(desc, false);
+ 		return !atomic_read(&desc->threads_active);
+ 	}
+ 
+@@ -95,14 +116,19 @@ EXPORT_SYMBOL(synchronize_hardirq);
+  *	to complete before returning. If you use this function while
+  *	holding a resource the IRQ handler may need you will deadlock.
+  *
+- *	This function may be called - with care - from IRQ context.
++ *	Can only be called from preemptible code as it might sleep when
++ *	an interrupt thread is associated to @irq.
++ *
++ *	It optionally makes sure (when the irq chip supports that method)
++ *	that the interrupt is not pending in any CPU and waiting for
++ *	service.
+  */
+ void synchronize_irq(unsigned int irq)
+ {
+ 	struct irq_desc *desc = irq_to_desc(irq);
+ 
+ 	if (desc) {
+-		__synchronize_hardirq(desc);
++		__synchronize_hardirq(desc, true);
+ 		/*
+ 		 * We made sure that no hardirq handler is
+ 		 * running. Now verify that no threaded handlers are
+@@ -1699,6 +1725,7 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
+ 	/* If this was the last handler, shut down the IRQ line: */
+ 	if (!desc->action) {
+ 		irq_settings_clr_disable_unlazy(desc);
++		/* Only shutdown. Deactivate after synchronize_hardirq() */
+ 		irq_shutdown(desc);
+ 	}
+ 
+@@ -1727,8 +1754,12 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
+ 
+ 	unregister_handler_proc(irq, action);
+ 
+-	/* Make sure it's not being used on another CPU: */
+-	synchronize_hardirq(irq);
++	/*
++	 * Make sure it's not being used on another CPU and if the chip
++	 * supports it also make sure that there is no (not yet serviced)
++	 * interrupt in flight at the hardware level.
++	 */
++	__synchronize_hardirq(desc, true);
+ 
+ #ifdef CONFIG_DEBUG_SHIRQ
+ 	/*
+@@ -1768,6 +1799,14 @@ static struct irqaction *__free_irq(struct irq_desc *desc, void *dev_id)
+ 		 * require it to deallocate resources over the slow bus.
+ 		 */
+ 		chip_bus_lock(desc);
++		/*
++		 * There is no interrupt on the fly anymore. Deactivate it
++		 * completely.
++		 */
++		raw_spin_lock_irqsave(&desc->lock, flags);
++		irq_domain_deactivate_irq(&desc->irq_data);
++		raw_spin_unlock_irqrestore(&desc->lock, flags);
++
+ 		irq_release_resources(desc);
+ 		chip_bus_sync_unlock(desc);
+ 		irq_remove_timings(desc);
+@@ -1855,7 +1894,7 @@ static const void *__cleanup_nmi(unsigned int irq, struct irq_desc *desc)
+ 	}
+ 
+ 	irq_settings_clr_disable_unlazy(desc);
+-	irq_shutdown(desc);
++	irq_shutdown_and_deactivate(desc);
+ 
+ 	irq_release_resources(desc);
+ 
+@@ -2578,6 +2617,28 @@ out:
+ 	irq_put_desc_unlock(desc, flags);
+ }
+ 
++int __irq_get_irqchip_state(struct irq_data *data, enum irqchip_irq_state which,
++			    bool *state)
++{
++	struct irq_chip *chip;
++	int err = -EINVAL;
++
++	do {
++		chip = irq_data_get_irq_chip(data);
++		if (chip->irq_get_irqchip_state)
++			break;
++#ifdef CONFIG_IRQ_DOMAIN_HIERARCHY
++		data = data->parent_data;
++#else
++		data = NULL;
++#endif
++	} while (data);
++
++	if (data)
++		err = chip->irq_get_irqchip_state(data, which, state);
++	return err;
++}
++
+ /**
+  *	irq_get_irqchip_state - returns the irqchip state of a interrupt.
+  *	@irq: Interrupt line that is forwarded to a VM
+@@ -2596,7 +2657,6 @@ int irq_get_irqchip_state(unsigned int irq, enum irqchip_irq_state which,
+ {
+ 	struct irq_desc *desc;
+ 	struct irq_data *data;
+-	struct irq_chip *chip;
+ 	unsigned long flags;
+ 	int err = -EINVAL;
+ 
+@@ -2606,19 +2666,7 @@ int irq_get_irqchip_state(unsigned int irq, enum irqchip_irq_state which,
+ 
+ 	data = irq_desc_get_irq_data(desc);
+ 
+-	do {
+-		chip = irq_data_get_irq_chip(data);
+-		if (chip->irq_get_irqchip_state)
+-			break;
+-#ifdef CONFIG_IRQ_DOMAIN_HIERARCHY
+-		data = data->parent_data;
+-#else
+-		data = NULL;
+-#endif
+-	} while (data);
+-
+-	if (data)
+-		err = chip->irq_get_irqchip_state(data, which, state);
++	err = __irq_get_irqchip_state(data, which, state);
+ 
+ 	irq_put_desc_busunlock(desc, flags);
+ 	return err;
