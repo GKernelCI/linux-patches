@@ -1,0 +1,748 @@
+diff --git a/Makefile b/Makefile
+index f32e8d2e09c3..13fa3a409ddd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 5
+ PATCHLEVEL = 3
+-SUBLEVEL = 1
++SUBLEVEL = 2
+ EXTRAVERSION =
+ NAME = Bobtail Squid
+ 
+diff --git a/arch/powerpc/include/asm/opal.h b/arch/powerpc/include/asm/opal.h
+index 57bd029c715e..d5a0807d21db 100644
+--- a/arch/powerpc/include/asm/opal.h
++++ b/arch/powerpc/include/asm/opal.h
+@@ -272,7 +272,7 @@ int64_t opal_xive_get_vp_info(uint64_t vp,
+ int64_t opal_xive_set_vp_info(uint64_t vp,
+ 			      uint64_t flags,
+ 			      uint64_t report_cl_pair);
+-int64_t opal_xive_allocate_irq(uint32_t chip_id);
++int64_t opal_xive_allocate_irq_raw(uint32_t chip_id);
+ int64_t opal_xive_free_irq(uint32_t girq);
+ int64_t opal_xive_sync(uint32_t type, uint32_t id);
+ int64_t opal_xive_dump(uint32_t type, uint32_t id);
+diff --git a/arch/powerpc/platforms/powernv/opal-call.c b/arch/powerpc/platforms/powernv/opal-call.c
+index 29ca523c1c79..dccdc9df5213 100644
+--- a/arch/powerpc/platforms/powernv/opal-call.c
++++ b/arch/powerpc/platforms/powernv/opal-call.c
+@@ -257,7 +257,7 @@ OPAL_CALL(opal_xive_set_queue_info,		OPAL_XIVE_SET_QUEUE_INFO);
+ OPAL_CALL(opal_xive_donate_page,		OPAL_XIVE_DONATE_PAGE);
+ OPAL_CALL(opal_xive_alloc_vp_block,		OPAL_XIVE_ALLOCATE_VP_BLOCK);
+ OPAL_CALL(opal_xive_free_vp_block,		OPAL_XIVE_FREE_VP_BLOCK);
+-OPAL_CALL(opal_xive_allocate_irq,		OPAL_XIVE_ALLOCATE_IRQ);
++OPAL_CALL(opal_xive_allocate_irq_raw,		OPAL_XIVE_ALLOCATE_IRQ);
+ OPAL_CALL(opal_xive_free_irq,			OPAL_XIVE_FREE_IRQ);
+ OPAL_CALL(opal_xive_get_vp_info,		OPAL_XIVE_GET_VP_INFO);
+ OPAL_CALL(opal_xive_set_vp_info,		OPAL_XIVE_SET_VP_INFO);
+diff --git a/arch/powerpc/sysdev/xive/native.c b/arch/powerpc/sysdev/xive/native.c
+index 2f26b74f6cfa..cf156aadefe9 100644
+--- a/arch/powerpc/sysdev/xive/native.c
++++ b/arch/powerpc/sysdev/xive/native.c
+@@ -231,6 +231,17 @@ static bool xive_native_match(struct device_node *node)
+ 	return of_device_is_compatible(node, "ibm,opal-xive-vc");
+ }
+ 
++static s64 opal_xive_allocate_irq(u32 chip_id)
++{
++	s64 irq = opal_xive_allocate_irq_raw(chip_id);
++
++	/*
++	 * Old versions of skiboot can incorrectly return 0xffffffff to
++	 * indicate no space, fix it up here.
++	 */
++	return irq == 0xffffffff ? OPAL_RESOURCE : irq;
++}
++
+ #ifdef CONFIG_SMP
+ static int xive_native_get_ipi(unsigned int cpu, struct xive_cpu *xc)
+ {
+diff --git a/drivers/clk/imx/clk-imx8mm.c b/drivers/clk/imx/clk-imx8mm.c
+index 6b8e75df994d..6f46bcb1d643 100644
+--- a/drivers/clk/imx/clk-imx8mm.c
++++ b/drivers/clk/imx/clk-imx8mm.c
+@@ -55,8 +55,8 @@ static const struct imx_pll14xx_rate_table imx8mm_pll1416x_tbl[] = {
+ };
+ 
+ static const struct imx_pll14xx_rate_table imx8mm_audiopll_tbl[] = {
+-	PLL_1443X_RATE(786432000U, 655, 5, 2, 23593),
+-	PLL_1443X_RATE(722534400U, 301, 5, 1, 3670),
++	PLL_1443X_RATE(393216000U, 262, 2, 3, 9437),
++	PLL_1443X_RATE(361267200U, 361, 3, 3, 17511),
+ };
+ 
+ static const struct imx_pll14xx_rate_table imx8mm_videopll_tbl[] = {
+diff --git a/drivers/clocksource/timer-of.c b/drivers/clocksource/timer-of.c
+index 80542289fae7..d8c2bd4391d0 100644
+--- a/drivers/clocksource/timer-of.c
++++ b/drivers/clocksource/timer-of.c
+@@ -113,8 +113,10 @@ static __init int timer_of_clk_init(struct device_node *np,
+ 	of_clk->clk = of_clk->name ? of_clk_get_by_name(np, of_clk->name) :
+ 		of_clk_get(np, of_clk->index);
+ 	if (IS_ERR(of_clk->clk)) {
+-		pr_err("Failed to get clock for %pOF\n", np);
+-		return PTR_ERR(of_clk->clk);
++		ret = PTR_ERR(of_clk->clk);
++		if (ret != -EPROBE_DEFER)
++			pr_err("Failed to get clock for %pOF\n", np);
++		goto out;
+ 	}
+ 
+ 	ret = clk_prepare_enable(of_clk->clk);
+diff --git a/drivers/clocksource/timer-probe.c b/drivers/clocksource/timer-probe.c
+index dda1946e84dd..ee9574da53c0 100644
+--- a/drivers/clocksource/timer-probe.c
++++ b/drivers/clocksource/timer-probe.c
+@@ -29,7 +29,9 @@ void __init timer_probe(void)
+ 
+ 		ret = init_func_ret(np);
+ 		if (ret) {
+-			pr_err("Failed to initialize '%pOF': %d\n", np, ret);
++			if (ret != -EPROBE_DEFER)
++				pr_err("Failed to initialize '%pOF': %d\n", np,
++				       ret);
+ 			continue;
+ 		}
+ 
+diff --git a/drivers/crypto/talitos.c b/drivers/crypto/talitos.c
+index c9d686a0e805..4818ae427098 100644
+--- a/drivers/crypto/talitos.c
++++ b/drivers/crypto/talitos.c
+@@ -3140,6 +3140,7 @@ static int talitos_remove(struct platform_device *ofdev)
+ 			break;
+ 		case CRYPTO_ALG_TYPE_AEAD:
+ 			crypto_unregister_aead(&t_alg->algt.alg.aead);
++			break;
+ 		case CRYPTO_ALG_TYPE_AHASH:
+ 			crypto_unregister_ahash(&t_alg->algt.alg.hash);
+ 			break;
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+index 45be7a2132bb..beb2d268d1ef 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c
+@@ -4548,20 +4548,10 @@ static int dm_plane_atomic_check(struct drm_plane *plane,
+ static int dm_plane_atomic_async_check(struct drm_plane *plane,
+ 				       struct drm_plane_state *new_plane_state)
+ {
+-	struct drm_plane_state *old_plane_state =
+-		drm_atomic_get_old_plane_state(new_plane_state->state, plane);
+-
+ 	/* Only support async updates on cursor planes. */
+ 	if (plane->type != DRM_PLANE_TYPE_CURSOR)
+ 		return -EINVAL;
+ 
+-	/*
+-	 * DRM calls prepare_fb and cleanup_fb on new_plane_state for
+-	 * async commits so don't allow fb changes.
+-	 */
+-	if (old_plane_state->fb != new_plane_state->fb)
+-		return -EINVAL;
+-
+ 	return 0;
+ }
+ 
+@@ -7284,6 +7274,26 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 	if (ret)
+ 		goto fail;
+ 
++	if (state->legacy_cursor_update) {
++		/*
++		 * This is a fast cursor update coming from the plane update
++		 * helper, check if it can be done asynchronously for better
++		 * performance.
++		 */
++		state->async_update =
++			!drm_atomic_helper_async_check(dev, state);
++
++		/*
++		 * Skip the remaining global validation if this is an async
++		 * update. Cursor updates can be done without affecting
++		 * state or bandwidth calcs and this avoids the performance
++		 * penalty of locking the private state object and
++		 * allocating a new dc_state.
++		 */
++		if (state->async_update)
++			return 0;
++	}
++
+ 	/* Check scaling and underscan changes*/
+ 	/* TODO Removed scaling changes validation due to inability to commit
+ 	 * new stream into context w\o causing full reset. Need to
+@@ -7336,13 +7346,29 @@ static int amdgpu_dm_atomic_check(struct drm_device *dev,
+ 			ret = -EINVAL;
+ 			goto fail;
+ 		}
+-	} else if (state->legacy_cursor_update) {
++	} else {
+ 		/*
+-		 * This is a fast cursor update coming from the plane update
+-		 * helper, check if it can be done asynchronously for better
+-		 * performance.
++		 * The commit is a fast update. Fast updates shouldn't change
++		 * the DC context, affect global validation, and can have their
++		 * commit work done in parallel with other commits not touching
++		 * the same resource. If we have a new DC context as part of
++		 * the DM atomic state from validation we need to free it and
++		 * retain the existing one instead.
+ 		 */
+-		state->async_update = !drm_atomic_helper_async_check(dev, state);
++		struct dm_atomic_state *new_dm_state, *old_dm_state;
++
++		new_dm_state = dm_atomic_get_new_state(state);
++		old_dm_state = dm_atomic_get_old_state(state);
++
++		if (new_dm_state && old_dm_state) {
++			if (new_dm_state->context)
++				dc_release_state(new_dm_state->context);
++
++			new_dm_state->context = old_dm_state->context;
++
++			if (old_dm_state->context)
++				dc_retain_state(old_dm_state->context);
++		}
+ 	}
+ 
+ 	/* Must be success */
+diff --git a/drivers/gpu/drm/amd/display/dc/calcs/Makefile b/drivers/gpu/drm/amd/display/dc/calcs/Makefile
+index 95f332ee3e7e..16614d73a5fc 100644
+--- a/drivers/gpu/drm/amd/display/dc/calcs/Makefile
++++ b/drivers/gpu/drm/amd/display/dc/calcs/Makefile
+@@ -32,6 +32,10 @@ endif
+ 
+ calcs_ccflags := -mhard-float -msse $(cc_stack_align)
+ 
++ifdef CONFIG_CC_IS_CLANG
++calcs_ccflags += -msse2
++endif
++
+ CFLAGS_dcn_calcs.o := $(calcs_ccflags)
+ CFLAGS_dcn_calc_auto.o := $(calcs_ccflags)
+ CFLAGS_dcn_calc_math.o := $(calcs_ccflags) -Wno-tautological-compare
+diff --git a/drivers/gpu/drm/amd/display/dc/dcn20/Makefile b/drivers/gpu/drm/amd/display/dc/dcn20/Makefile
+index e9721a906592..f57a3b281408 100644
+--- a/drivers/gpu/drm/amd/display/dc/dcn20/Makefile
++++ b/drivers/gpu/drm/amd/display/dc/dcn20/Makefile
+@@ -18,6 +18,10 @@ endif
+ 
+ CFLAGS_dcn20_resource.o := -mhard-float -msse $(cc_stack_align)
+ 
++ifdef CONFIG_CC_IS_CLANG
++CFLAGS_dcn20_resource.o += -msse2
++endif
++
+ AMD_DAL_DCN20 = $(addprefix $(AMDDALPATH)/dc/dcn20/,$(DCN20))
+ 
+ AMD_DISPLAY_FILES += $(AMD_DAL_DCN20)
+diff --git a/drivers/gpu/drm/amd/display/dc/dml/Makefile b/drivers/gpu/drm/amd/display/dc/dml/Makefile
+index 0bb7a20675c4..132ade1a234e 100644
+--- a/drivers/gpu/drm/amd/display/dc/dml/Makefile
++++ b/drivers/gpu/drm/amd/display/dc/dml/Makefile
+@@ -32,6 +32,10 @@ endif
+ 
+ dml_ccflags := -mhard-float -msse $(cc_stack_align)
+ 
++ifdef CONFIG_CC_IS_CLANG
++dml_ccflags += -msse2
++endif
++
+ CFLAGS_display_mode_lib.o := $(dml_ccflags)
+ 
+ ifdef CONFIG_DRM_AMD_DC_DCN2_0
+diff --git a/drivers/gpu/drm/amd/display/dc/dsc/Makefile b/drivers/gpu/drm/amd/display/dc/dsc/Makefile
+index e019cd9447e8..17db603f2d1f 100644
+--- a/drivers/gpu/drm/amd/display/dc/dsc/Makefile
++++ b/drivers/gpu/drm/amd/display/dc/dsc/Makefile
+@@ -9,6 +9,10 @@ endif
+ 
+ dsc_ccflags := -mhard-float -msse $(cc_stack_align)
+ 
++ifdef CONFIG_CC_IS_CLANG
++dsc_ccflags += -msse2
++endif
++
+ CFLAGS_rc_calc.o := $(dsc_ccflags)
+ CFLAGS_rc_calc_dpi.o := $(dsc_ccflags)
+ CFLAGS_codec_main_amd.o := $(dsc_ccflags)
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+index 0a00be19f7a0..e4d51ce20a6a 100644
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -568,6 +568,7 @@
+ #define USB_PRODUCT_ID_HP_LOGITECH_OEM_USB_OPTICAL_MOUSE_0B4A	0x0b4a
+ #define USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE		0x134a
+ #define USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_094A	0x094a
++#define USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_0941	0x0941
+ #define USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_0641	0x0641
+ 
+ #define USB_VENDOR_ID_HUION		0x256c
+diff --git a/drivers/hid/hid-lg.c b/drivers/hid/hid-lg.c
+index 5008a3dc28f4..0dc7cdfc56f7 100644
+--- a/drivers/hid/hid-lg.c
++++ b/drivers/hid/hid-lg.c
+@@ -818,7 +818,7 @@ static int lg_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 
+ 		if (!buf) {
+ 			ret = -ENOMEM;
+-			goto err_free;
++			goto err_stop;
+ 		}
+ 
+ 		ret = hid_hw_raw_request(hdev, buf[0], buf, sizeof(cbuf),
+@@ -850,9 +850,12 @@ static int lg_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 		ret = lg4ff_init(hdev);
+ 
+ 	if (ret)
+-		goto err_free;
++		goto err_stop;
+ 
+ 	return 0;
++
++err_stop:
++	hid_hw_stop(hdev);
+ err_free:
+ 	kfree(drv_data);
+ 	return ret;
+@@ -863,8 +866,7 @@ static void lg_remove(struct hid_device *hdev)
+ 	struct lg_drv_data *drv_data = hid_get_drvdata(hdev);
+ 	if (drv_data->quirks & LG_FF4)
+ 		lg4ff_deinit(hdev);
+-	else
+-		hid_hw_stop(hdev);
++	hid_hw_stop(hdev);
+ 	kfree(drv_data);
+ }
+ 
+diff --git a/drivers/hid/hid-lg4ff.c b/drivers/hid/hid-lg4ff.c
+index cefba038520c..03f0220062ca 100644
+--- a/drivers/hid/hid-lg4ff.c
++++ b/drivers/hid/hid-lg4ff.c
+@@ -1477,7 +1477,6 @@ int lg4ff_deinit(struct hid_device *hid)
+ 		}
+ 	}
+ #endif
+-	hid_hw_stop(hid);
+ 	drv_data->device_props = NULL;
+ 
+ 	kfree(entry);
+diff --git a/drivers/hid/hid-logitech-dj.c b/drivers/hid/hid-logitech-dj.c
+index cc47f948c1d0..7badbaa18878 100644
+--- a/drivers/hid/hid-logitech-dj.c
++++ b/drivers/hid/hid-logitech-dj.c
+@@ -1734,14 +1734,14 @@ static int logi_dj_probe(struct hid_device *hdev,
+ 		if (retval < 0) {
+ 			hid_err(hdev, "%s: logi_dj_recv_query_paired_devices error:%d\n",
+ 				__func__, retval);
+-			goto logi_dj_recv_query_paired_devices_failed;
++			/*
++			 * This can happen with a KVM, let the probe succeed,
++			 * logi_dj_recv_queue_unknown_work will retry later.
++			 */
+ 		}
+ 	}
+ 
+-	return retval;
+-
+-logi_dj_recv_query_paired_devices_failed:
+-	hid_hw_close(hdev);
++	return 0;
+ 
+ llopen_failed:
+ switch_to_dj_mode_fail:
+diff --git a/drivers/hid/hid-prodikeys.c b/drivers/hid/hid-prodikeys.c
+index 21544ebff855..5a3b3d974d84 100644
+--- a/drivers/hid/hid-prodikeys.c
++++ b/drivers/hid/hid-prodikeys.c
+@@ -551,10 +551,14 @@ static void pcmidi_setup_extra_keys(
+ 
+ static int pcmidi_set_operational(struct pcmidi_snd *pm)
+ {
++	int rc;
++
+ 	if (pm->ifnum != 1)
+ 		return 0; /* only set up ONCE for interace 1 */
+ 
+-	pcmidi_get_output_report(pm);
++	rc = pcmidi_get_output_report(pm);
++	if (rc < 0)
++		return rc;
+ 	pcmidi_submit_output_report(pm, 0xc1);
+ 	return 0;
+ }
+@@ -683,7 +687,11 @@ static int pcmidi_snd_initialise(struct pcmidi_snd *pm)
+ 	spin_lock_init(&pm->rawmidi_in_lock);
+ 
+ 	init_sustain_timers(pm);
+-	pcmidi_set_operational(pm);
++	err = pcmidi_set_operational(pm);
++	if (err < 0) {
++		pk_error("failed to find output report\n");
++		goto fail_register;
++	}
+ 
+ 	/* register it */
+ 	err = snd_card_register(card);
+diff --git a/drivers/hid/hid-quirks.c b/drivers/hid/hid-quirks.c
+index 166f41f3173b..c50bcd967d99 100644
+--- a/drivers/hid/hid-quirks.c
++++ b/drivers/hid/hid-quirks.c
+@@ -92,6 +92,7 @@ static const struct hid_device_id hid_quirks[] = {
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_HP, USB_PRODUCT_ID_HP_LOGITECH_OEM_USB_OPTICAL_MOUSE_0B4A), HID_QUIRK_ALWAYS_POLL },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_HP, USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE), HID_QUIRK_ALWAYS_POLL },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_HP, USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_094A), HID_QUIRK_ALWAYS_POLL },
++	{ HID_USB_DEVICE(USB_VENDOR_ID_HP, USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_0941), HID_QUIRK_ALWAYS_POLL },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_HP, USB_PRODUCT_ID_HP_PIXART_OEM_USB_OPTICAL_MOUSE_0641), HID_QUIRK_ALWAYS_POLL },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_IDEACOM, USB_DEVICE_ID_IDEACOM_IDC6680), HID_QUIRK_MULTI_INPUT },
+ 	{ HID_USB_DEVICE(USB_VENDOR_ID_INNOMEDIA, USB_DEVICE_ID_INNEX_GENESIS_ATARI), HID_QUIRK_MULTI_INPUT },
+diff --git a/drivers/hid/hid-sony.c b/drivers/hid/hid-sony.c
+index 49dd2d905c7f..73c0f7a95e2d 100644
+--- a/drivers/hid/hid-sony.c
++++ b/drivers/hid/hid-sony.c
+@@ -2811,7 +2811,6 @@ err_stop:
+ 	sony_cancel_work_sync(sc);
+ 	sony_remove_dev_list(sc);
+ 	sony_release_device_id(sc);
+-	hid_hw_stop(hdev);
+ 	return ret;
+ }
+ 
+@@ -2876,6 +2875,7 @@ static int sony_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 	 */
+ 	if (!(hdev->claimed & HID_CLAIMED_INPUT)) {
+ 		hid_err(hdev, "failed to claim input\n");
++		hid_hw_stop(hdev);
+ 		return -ENODEV;
+ 	}
+ 
+diff --git a/drivers/hid/hidraw.c b/drivers/hid/hidraw.c
+index 006bd6f4f653..62ef47a730b0 100644
+--- a/drivers/hid/hidraw.c
++++ b/drivers/hid/hidraw.c
+@@ -370,7 +370,7 @@ static long hidraw_ioctl(struct file *file, unsigned int cmd,
+ 
+ 	mutex_lock(&minors_lock);
+ 	dev = hidraw_table[minor];
+-	if (!dev) {
++	if (!dev || !dev->exist) {
+ 		ret = -ENODEV;
+ 		goto out;
+ 	}
+diff --git a/drivers/mtd/chips/cfi_cmdset_0002.c b/drivers/mtd/chips/cfi_cmdset_0002.c
+index f4da7bd552e9..7d29f596bc9e 100644
+--- a/drivers/mtd/chips/cfi_cmdset_0002.c
++++ b/drivers/mtd/chips/cfi_cmdset_0002.c
+@@ -1717,31 +1717,37 @@ static int __xipram do_write_oneword(struct map_info *map, struct flchip *chip,
+ 			continue;
+ 		}
+ 
++		/*
++		 * We check "time_after" and "!chip_good" before checking
++		 * "chip_good" to avoid the failure due to scheduling.
++		 */
+ 		if (time_after(jiffies, timeo) &&
+-		    !chip_ready(map, chip, adr)) {
++		    !chip_good(map, chip, adr, datum)) {
+ 			xip_enable(map, chip, adr);
+ 			printk(KERN_WARNING "MTD %s(): software timeout\n", __func__);
+ 			xip_disable(map, chip, adr);
++			ret = -EIO;
+ 			break;
+ 		}
+ 
+-		if (chip_ready(map, chip, adr))
++		if (chip_good(map, chip, adr, datum))
+ 			break;
+ 
+ 		/* Latency issues. Drop the lock, wait a while and retry */
+ 		UDELAY(map, chip, adr, 1);
+ 	}
++
+ 	/* Did we succeed? */
+-	if (!chip_good(map, chip, adr, datum)) {
++	if (ret) {
+ 		/* reset on all failures. */
+ 		cfi_check_err_status(map, chip, adr);
+ 		map_write(map, CMD(0xF0), chip->start);
+ 		/* FIXME - should have reset delay before continuing */
+ 
+-		if (++retry_cnt <= MAX_RETRIES)
++		if (++retry_cnt <= MAX_RETRIES) {
++			ret = 0;
+ 			goto retry;
+-
+-		ret = -EIO;
++		}
+ 	}
+ 	xip_enable(map, chip, adr);
+  op_done:
+diff --git a/drivers/platform/x86/i2c-multi-instantiate.c b/drivers/platform/x86/i2c-multi-instantiate.c
+index 197d8a192721..70efa3d29825 100644
+--- a/drivers/platform/x86/i2c-multi-instantiate.c
++++ b/drivers/platform/x86/i2c-multi-instantiate.c
+@@ -92,7 +92,7 @@ static int i2c_multi_inst_probe(struct platform_device *pdev)
+ 	for (i = 0; i < multi->num_clients && inst_data[i].type; i++) {
+ 		memset(&board_info, 0, sizeof(board_info));
+ 		strlcpy(board_info.type, inst_data[i].type, I2C_NAME_SIZE);
+-		snprintf(name, sizeof(name), "%s-%s.%d", match->id,
++		snprintf(name, sizeof(name), "%s-%s.%d", dev_name(dev),
+ 			 inst_data[i].type, i);
+ 		board_info.dev_name = name;
+ 		switch (inst_data[i].flags & IRQ_RESOURCE_TYPE) {
+diff --git a/include/net/netfilter/nf_tables.h b/include/net/netfilter/nf_tables.h
+index 475d6f28ca67..7f7a4d9137e5 100644
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@ -1206,6 +1206,8 @@ void nft_trace_notify(struct nft_traceinfo *info);
+ #define MODULE_ALIAS_NFT_OBJ(type) \
+ 	MODULE_ALIAS("nft-obj-" __stringify(type))
+ 
++#if IS_ENABLED(CONFIG_NF_TABLES)
++
+ /*
+  * The gencursor defines two generations, the currently active and the
+  * next one. Objects contain a bitmask of 2 bits specifying the generations
+@@ -1279,6 +1281,8 @@ static inline void nft_set_elem_change_active(const struct net *net,
+ 	ext->genmask ^= nft_genmask_next(net);
+ }
+ 
++#endif /* IS_ENABLED(CONFIG_NF_TABLES) */
++
+ /*
+  * We use a free bit in the genmask field to indicate the element
+  * is busy, meaning it is currently being processed either by
+diff --git a/mm/z3fold.c b/mm/z3fold.c
+index 75b7962439ff..ed19d98c9dcd 100644
+--- a/mm/z3fold.c
++++ b/mm/z3fold.c
+@@ -41,7 +41,6 @@
+ #include <linux/workqueue.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
+-#include <linux/wait.h>
+ #include <linux/zpool.h>
+ #include <linux/magic.h>
+ 
+@@ -146,8 +145,6 @@ struct z3fold_header {
+  * @release_wq:	workqueue for safe page release
+  * @work:	work_struct for safe page release
+  * @inode:	inode for z3fold pseudo filesystem
+- * @destroying: bool to stop migration once we start destruction
+- * @isolated: int to count the number of pages currently in isolation
+  *
+  * This structure is allocated at pool creation time and maintains metadata
+  * pertaining to a particular z3fold pool.
+@@ -166,11 +163,8 @@ struct z3fold_pool {
+ 	const struct zpool_ops *zpool_ops;
+ 	struct workqueue_struct *compact_wq;
+ 	struct workqueue_struct *release_wq;
+-	struct wait_queue_head isolate_wait;
+ 	struct work_struct work;
+ 	struct inode *inode;
+-	bool destroying;
+-	int isolated;
+ };
+ 
+ /*
+@@ -775,7 +769,6 @@ static struct z3fold_pool *z3fold_create_pool(const char *name, gfp_t gfp,
+ 		goto out_c;
+ 	spin_lock_init(&pool->lock);
+ 	spin_lock_init(&pool->stale_lock);
+-	init_waitqueue_head(&pool->isolate_wait);
+ 	pool->unbuddied = __alloc_percpu(sizeof(struct list_head)*NCHUNKS, 2);
+ 	if (!pool->unbuddied)
+ 		goto out_pool;
+@@ -815,15 +808,6 @@ out:
+ 	return NULL;
+ }
+ 
+-static bool pool_isolated_are_drained(struct z3fold_pool *pool)
+-{
+-	bool ret;
+-
+-	spin_lock(&pool->lock);
+-	ret = pool->isolated == 0;
+-	spin_unlock(&pool->lock);
+-	return ret;
+-}
+ /**
+  * z3fold_destroy_pool() - destroys an existing z3fold pool
+  * @pool:	the z3fold pool to be destroyed
+@@ -833,22 +817,6 @@ static bool pool_isolated_are_drained(struct z3fold_pool *pool)
+ static void z3fold_destroy_pool(struct z3fold_pool *pool)
+ {
+ 	kmem_cache_destroy(pool->c_handle);
+-	/*
+-	 * We set pool-> destroying under lock to ensure that
+-	 * z3fold_page_isolate() sees any changes to destroying. This way we
+-	 * avoid the need for any memory barriers.
+-	 */
+-
+-	spin_lock(&pool->lock);
+-	pool->destroying = true;
+-	spin_unlock(&pool->lock);
+-
+-	/*
+-	 * We need to ensure that no pages are being migrated while we destroy
+-	 * these workqueues, as migration can queue work on either of the
+-	 * workqueues.
+-	 */
+-	wait_event(pool->isolate_wait, !pool_isolated_are_drained(pool));
+ 
+ 	/*
+ 	 * We need to destroy pool->compact_wq before pool->release_wq,
+@@ -1339,28 +1307,6 @@ static u64 z3fold_get_pool_size(struct z3fold_pool *pool)
+ 	return atomic64_read(&pool->pages_nr);
+ }
+ 
+-/*
+- * z3fold_dec_isolated() expects to be called while pool->lock is held.
+- */
+-static void z3fold_dec_isolated(struct z3fold_pool *pool)
+-{
+-	assert_spin_locked(&pool->lock);
+-	VM_BUG_ON(pool->isolated <= 0);
+-	pool->isolated--;
+-
+-	/*
+-	 * If we have no more isolated pages, we have to see if
+-	 * z3fold_destroy_pool() is waiting for a signal.
+-	 */
+-	if (pool->isolated == 0 && waitqueue_active(&pool->isolate_wait))
+-		wake_up_all(&pool->isolate_wait);
+-}
+-
+-static void z3fold_inc_isolated(struct z3fold_pool *pool)
+-{
+-	pool->isolated++;
+-}
+-
+ static bool z3fold_page_isolate(struct page *page, isolate_mode_t mode)
+ {
+ 	struct z3fold_header *zhdr;
+@@ -1387,34 +1333,6 @@ static bool z3fold_page_isolate(struct page *page, isolate_mode_t mode)
+ 		spin_lock(&pool->lock);
+ 		if (!list_empty(&page->lru))
+ 			list_del(&page->lru);
+-		/*
+-		 * We need to check for destruction while holding pool->lock, as
+-		 * otherwise destruction could see 0 isolated pages, and
+-		 * proceed.
+-		 */
+-		if (unlikely(pool->destroying)) {
+-			spin_unlock(&pool->lock);
+-			/*
+-			 * If this page isn't stale, somebody else holds a
+-			 * reference to it. Let't drop our refcount so that they
+-			 * can call the release logic.
+-			 */
+-			if (unlikely(kref_put(&zhdr->refcount,
+-					      release_z3fold_page_locked))) {
+-				/*
+-				 * If we get here we have kref problems, so we
+-				 * should freak out.
+-				 */
+-				WARN(1, "Z3fold is experiencing kref problems\n");
+-				z3fold_page_unlock(zhdr);
+-				return false;
+-			}
+-			z3fold_page_unlock(zhdr);
+-			return false;
+-		}
+-
+-
+-		z3fold_inc_isolated(pool);
+ 		spin_unlock(&pool->lock);
+ 		z3fold_page_unlock(zhdr);
+ 		return true;
+@@ -1483,10 +1401,6 @@ static int z3fold_page_migrate(struct address_space *mapping, struct page *newpa
+ 
+ 	queue_work_on(new_zhdr->cpu, pool->compact_wq, &new_zhdr->work);
+ 
+-	spin_lock(&pool->lock);
+-	z3fold_dec_isolated(pool);
+-	spin_unlock(&pool->lock);
+-
+ 	page_mapcount_reset(page);
+ 	put_page(page);
+ 	return 0;
+@@ -1506,14 +1420,10 @@ static void z3fold_page_putback(struct page *page)
+ 	INIT_LIST_HEAD(&page->lru);
+ 	if (kref_put(&zhdr->refcount, release_z3fold_page_locked)) {
+ 		atomic64_dec(&pool->pages_nr);
+-		spin_lock(&pool->lock);
+-		z3fold_dec_isolated(pool);
+-		spin_unlock(&pool->lock);
+ 		return;
+ 	}
+ 	spin_lock(&pool->lock);
+ 	list_add(&page->lru, &pool->lru);
+-	z3fold_dec_isolated(pool);
+ 	spin_unlock(&pool->lock);
+ 	z3fold_page_unlock(zhdr);
+ }
+diff --git a/sound/firewire/dice/dice-alesis.c b/sound/firewire/dice/dice-alesis.c
+index 218292bdace6..f5b325263b67 100644
+--- a/sound/firewire/dice/dice-alesis.c
++++ b/sound/firewire/dice/dice-alesis.c
+@@ -15,7 +15,7 @@ alesis_io14_tx_pcm_chs[MAX_STREAMS][SND_DICE_RATE_MODE_COUNT] = {
+ 
+ static const unsigned int
+ alesis_io26_tx_pcm_chs[MAX_STREAMS][SND_DICE_RATE_MODE_COUNT] = {
+-	{10, 10, 8},	/* Tx0 = Analog + S/PDIF. */
++	{10, 10, 4},	/* Tx0 = Analog + S/PDIF. */
+ 	{16, 8, 0},	/* Tx1 = ADAT1 + ADAT2. */
+ };
+ 
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index 99fc0917339b..b0de3e3b33e5 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -2517,8 +2517,7 @@ static const struct pci_device_id azx_ids[] = {
+ 			 AZX_DCAPS_PM_RUNTIME },
+ 	/* AMD Raven */
+ 	{ PCI_DEVICE(0x1022, 0x15e3),
+-	  .driver_data = AZX_DRIVER_GENERIC | AZX_DCAPS_PRESET_ATI_SB |
+-			 AZX_DCAPS_PM_RUNTIME },
++	  .driver_data = AZX_DRIVER_GENERIC | AZX_DCAPS_PRESET_AMD_SB },
+ 	/* ATI HDMI */
+ 	{ PCI_DEVICE(0x1002, 0x0002),
+ 	  .driver_data = AZX_DRIVER_ATIHDMI_NS | AZX_DCAPS_PRESET_ATI_HDMI_NS },
+diff --git a/sound/pci/hda/patch_analog.c b/sound/pci/hda/patch_analog.c
+index e283966bdbb1..bc9dd8e6fd86 100644
+--- a/sound/pci/hda/patch_analog.c
++++ b/sound/pci/hda/patch_analog.c
+@@ -357,6 +357,7 @@ static const struct hda_fixup ad1986a_fixups[] = {
+ 
+ static const struct snd_pci_quirk ad1986a_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x103c, 0x30af, "HP B2800", AD1986A_FIXUP_LAPTOP_IMIC),
++	SND_PCI_QUIRK(0x1043, 0x1153, "ASUS M9V", AD1986A_FIXUP_LAPTOP_IMIC),
+ 	SND_PCI_QUIRK(0x1043, 0x1443, "ASUS Z99He", AD1986A_FIXUP_EAPD),
+ 	SND_PCI_QUIRK(0x1043, 0x1447, "ASUS A8JN", AD1986A_FIXUP_EAPD),
+ 	SND_PCI_QUIRK_MASK(0x1043, 0xff00, 0x8100, "ASUS P5", AD1986A_FIXUP_3STACK),
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 78858918cbc1..b6f7b13768a1 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -1655,6 +1655,8 @@ u64 snd_usb_interface_dsd_format_quirks(struct snd_usb_audio *chip,
+ 	case 0x152a:  /* Thesycon devices */
+ 	case 0x25ce:  /* Mytek devices */
+ 	case 0x2ab6:  /* T+A devices */
++	case 0x3842:  /* EVGA */
++	case 0xc502:  /* HiBy devices */
+ 		if (fp->dsd_raw)
+ 			return SNDRV_PCM_FMTBIT_DSD_U32_BE;
+ 		break;
+diff --git a/tools/objtool/Makefile b/tools/objtool/Makefile
+index 88158239622b..20f67fcf378d 100644
+--- a/tools/objtool/Makefile
++++ b/tools/objtool/Makefile
+@@ -35,7 +35,7 @@ INCLUDES := -I$(srctree)/tools/include \
+ 	    -I$(srctree)/tools/arch/$(HOSTARCH)/include/uapi \
+ 	    -I$(srctree)/tools/objtool/arch/$(ARCH)/include
+ WARNINGS := $(EXTRA_WARNINGS) -Wno-switch-default -Wno-switch-enum -Wno-packed
+-CFLAGS   += -Werror $(WARNINGS) $(KBUILD_HOSTCFLAGS) -g $(INCLUDES) $(LIBELF_FLAGS)
++CFLAGS   := -Werror $(WARNINGS) $(KBUILD_HOSTCFLAGS) -g $(INCLUDES) $(LIBELF_FLAGS)
+ LDFLAGS  += $(LIBELF_LIBS) $(LIBSUBCMD) $(KBUILD_HOSTLDFLAGS)
+ 
+ # Allow old libelf to be used:
