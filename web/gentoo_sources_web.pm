@@ -33,7 +33,7 @@ $website_base = 'http://dev.gentoo.org/~mpagano/genpatches';
 $git_root='/home/mike/gentoo/linux-patches';
 
 $ebuild_base = '/usr/local/gentoo-x86'; # /usr/portage
-@kernels = ('sys-kernel/aufs-sources','sys-kernel/ck-sources','sys-kernel/gentoo-sources','sys-kernel/zen-sources');
+@kernels = ('sys-kernel/mips-sources','sys-kernel/pf-sources','sys-kernel/rt-sources','sys-kernel/gentoo-sources','sys-kernel/zen-sources');
 
 sub html_header {
 	local *FD = shift;
