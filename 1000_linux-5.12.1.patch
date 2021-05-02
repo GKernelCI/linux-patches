@@ -1,0 +1,209 @@
+diff --git a/Makefile b/Makefile
+index 3a10a8e08b6d5..78b0941f0de40 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 5
+ PATCHLEVEL = 12
+-SUBLEVEL = 0
++SUBLEVEL = 1
+ EXTRAVERSION =
+ NAME = Frozen Wasteland
+ 
+diff --git a/drivers/misc/mei/hw-me-regs.h b/drivers/misc/mei/hw-me-regs.h
+index 14be76d4c2e61..cb34925e10f15 100644
+--- a/drivers/misc/mei/hw-me-regs.h
++++ b/drivers/misc/mei/hw-me-regs.h
+@@ -105,6 +105,7 @@
+ 
+ #define MEI_DEV_ID_ADP_S      0x7AE8  /* Alder Lake Point S */
+ #define MEI_DEV_ID_ADP_LP     0x7A60  /* Alder Lake Point LP */
++#define MEI_DEV_ID_ADP_P      0x51E0  /* Alder Lake Point P */
+ 
+ /*
+  * MEI HW Section
+diff --git a/drivers/misc/mei/pci-me.c b/drivers/misc/mei/pci-me.c
+index a7e179626b635..c3393b383e598 100644
+--- a/drivers/misc/mei/pci-me.c
++++ b/drivers/misc/mei/pci-me.c
+@@ -111,6 +111,7 @@ static const struct pci_device_id mei_me_pci_tbl[] = {
+ 
+ 	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_S, MEI_ME_PCH15_CFG)},
+ 	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_LP, MEI_ME_PCH15_CFG)},
++	{MEI_PCI_DEVICE(MEI_DEV_ID_ADP_P, MEI_ME_PCH15_CFG)},
+ 
+ 	/* required last entry */
+ 	{0, }
+diff --git a/drivers/net/usb/hso.c b/drivers/net/usb/hso.c
+index 9bc58e64b5b7a..3ef4b2841402c 100644
+--- a/drivers/net/usb/hso.c
++++ b/drivers/net/usb/hso.c
+@@ -3104,7 +3104,7 @@ static void hso_free_interface(struct usb_interface *interface)
+ 			cancel_work_sync(&serial_table[i]->async_put_intf);
+ 			cancel_work_sync(&serial_table[i]->async_get_intf);
+ 			hso_serial_tty_unregister(serial);
+-			kref_put(&serial_table[i]->ref, hso_serial_ref_free);
++			kref_put(&serial->parent->ref, hso_serial_ref_free);
+ 		}
+ 	}
+ 
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c b/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c
+index 4456abb9a0742..34bde8c873244 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/tx-gen2.c
+@@ -40,6 +40,7 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iwl_trans *trans,
+ 	const u8 *cmddata[IWL_MAX_CMD_TBS_PER_TFD];
+ 	u16 cmdlen[IWL_MAX_CMD_TBS_PER_TFD];
+ 	struct iwl_tfh_tfd *tfd;
++	unsigned long flags;
+ 
+ 	copy_size = sizeof(struct iwl_cmd_header_wide);
+ 	cmd_size = sizeof(struct iwl_cmd_header_wide);
+@@ -108,14 +109,14 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iwl_trans *trans,
+ 		goto free_dup_buf;
+ 	}
+ 
+-	spin_lock_bh(&txq->lock);
++	spin_lock_irqsave(&txq->lock, flags);
+ 
+ 	idx = iwl_txq_get_cmd_index(txq, txq->write_ptr);
+ 	tfd = iwl_txq_get_tfd(trans, txq, txq->write_ptr);
+ 	memset(tfd, 0, sizeof(*tfd));
+ 
+ 	if (iwl_txq_space(trans, txq) < ((cmd->flags & CMD_ASYNC) ? 2 : 1)) {
+-		spin_unlock_bh(&txq->lock);
++		spin_unlock_irqrestore(&txq->lock, flags);
+ 
+ 		IWL_ERR(trans, "No space in command queue\n");
+ 		iwl_op_mode_cmd_queue_full(trans->op_mode);
+@@ -250,7 +251,7 @@ int iwl_pcie_gen2_enqueue_hcmd(struct iwl_trans *trans,
+ 	spin_unlock(&trans_pcie->reg_lock);
+ 
+ out:
+-	spin_unlock_bh(&txq->lock);
++	spin_unlock_irqrestore(&txq->lock, flags);
+ free_dup_buf:
+ 	if (idx < 0)
+ 		kfree(dup_buf);
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 3fda1ec961d7d..f5886c512fec1 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -1634,12 +1634,13 @@ static int acm_resume(struct usb_interface *intf)
+ 	struct urb *urb;
+ 	int rv = 0;
+ 
+-	acm_unpoison_urbs(acm);
+ 	spin_lock_irq(&acm->write_lock);
+ 
+ 	if (--acm->susp_count)
+ 		goto out;
+ 
++	acm_unpoison_urbs(acm);
++
+ 	if (tty_port_initialized(&acm->port)) {
+ 		rv = usb_submit_urb(acm->ctrlurb, GFP_ATOMIC);
+ 
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index a2785379df6e5..589ee5a69a2e5 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -332,14 +332,29 @@ static void cfg80211_event_work(struct work_struct *work)
+ void cfg80211_destroy_ifaces(struct cfg80211_registered_device *rdev)
+ {
+ 	struct wireless_dev *wdev, *tmp;
++	bool found = false;
+ 
+ 	ASSERT_RTNL();
+-	lockdep_assert_wiphy(&rdev->wiphy);
+ 
++	list_for_each_entry(wdev, &rdev->wiphy.wdev_list, list) {
++		if (wdev->nl_owner_dead) {
++			if (wdev->netdev)
++				dev_close(wdev->netdev);
++			found = true;
++		}
++	}
++
++	if (!found)
++		return;
++
++	wiphy_lock(&rdev->wiphy);
+ 	list_for_each_entry_safe(wdev, tmp, &rdev->wiphy.wdev_list, list) {
+-		if (wdev->nl_owner_dead)
++		if (wdev->nl_owner_dead) {
++			cfg80211_leave(rdev, wdev);
+ 			rdev_del_virtual_intf(rdev, wdev);
++		}
+ 	}
++	wiphy_unlock(&rdev->wiphy);
+ }
+ 
+ static void cfg80211_destroy_iface_wk(struct work_struct *work)
+@@ -350,9 +365,7 @@ static void cfg80211_destroy_iface_wk(struct work_struct *work)
+ 			    destroy_work);
+ 
+ 	rtnl_lock();
+-	wiphy_lock(&rdev->wiphy);
+ 	cfg80211_destroy_ifaces(rdev);
+-	wiphy_unlock(&rdev->wiphy);
+ 	rtnl_unlock();
+ }
+ 
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index b1df42e4f1eb9..a5224da638328 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -3929,7 +3929,7 @@ static int nl80211_set_interface(struct sk_buff *skb, struct genl_info *info)
+ 	return err;
+ }
+ 
+-static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
++static int _nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+ 	struct vif_params params;
+@@ -3938,9 +3938,6 @@ static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ 	int err;
+ 	enum nl80211_iftype type = NL80211_IFTYPE_UNSPECIFIED;
+ 
+-	/* to avoid failing a new interface creation due to pending removal */
+-	cfg80211_destroy_ifaces(rdev);
+-
+ 	memset(&params, 0, sizeof(params));
+ 
+ 	if (!info->attrs[NL80211_ATTR_IFNAME])
+@@ -4028,6 +4025,21 @@ static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
+ 	return genlmsg_reply(msg, info);
+ }
+ 
++static int nl80211_new_interface(struct sk_buff *skb, struct genl_info *info)
++{
++	struct cfg80211_registered_device *rdev = info->user_ptr[0];
++	int ret;
++
++	/* to avoid failing a new interface creation due to pending removal */
++	cfg80211_destroy_ifaces(rdev);
++
++	wiphy_lock(&rdev->wiphy);
++	ret = _nl80211_new_interface(skb, info);
++	wiphy_unlock(&rdev->wiphy);
++
++	return ret;
++}
++
+ static int nl80211_del_interface(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+@@ -15040,7 +15052,9 @@ static const struct genl_small_ops nl80211_small_ops[] = {
+ 		.doit = nl80211_new_interface,
+ 		.flags = GENL_UNS_ADMIN_PERM,
+ 		.internal_flags = NL80211_FLAG_NEED_WIPHY |
+-				  NL80211_FLAG_NEED_RTNL,
++				  NL80211_FLAG_NEED_RTNL |
++				  /* we take the wiphy mutex later ourselves */
++				  NL80211_FLAG_NO_WIPHY_MTX,
+ 	},
+ 	{
+ 		.cmd = NL80211_CMD_DEL_INTERFACE,
