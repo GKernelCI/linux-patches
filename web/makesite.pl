@@ -17,6 +17,10 @@ use Sort::Versions;
 # print out arguments for easier debugging
 print "makesite.pl called with arguments: @ARGV \n";
 
+if (!precheck()) {
+	exit 0;
+}
+
 my $cmd = 'rm -rf /tmp/linux-patches';
 $output = `$cmd`;
 
@@ -184,6 +188,11 @@ sub make_kernels_page {
 	my $kernel;
 	print ">> Making kernels page\n";
 	my %kernels = _get_genpatches_kernels();
+
+	if (!@kernels) {
+		print ">> No Kernels found, check ebuild_base variable in gentoo_sources_web.pm\n";
+		exit
+	}
 	
 	open(FD, '> '.$output_path.'/kernels.html');
 	html_header *FD;

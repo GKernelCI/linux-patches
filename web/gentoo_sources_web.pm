@@ -35,6 +35,18 @@ $git_root='/home/mike/gentoo/linux-patches';
 $ebuild_base = '/usr/local/gentoo-x86'; # /usr/portage
 @kernels = ('sys-kernel/mips-sources','sys-kernel/pf-sources','sys-kernel/rt-sources','sys-kernel/gentoo-sources','sys-kernel/zen-sources');
 
+sub precheck {
+
+	# run some early checks to make sure everything is present
+
+	if ( !-d  $ebuild_base) {
+		printf "WARNING: ebuild base directory $ebuild_base does not exist\n";
+		return 0
+	}
+
+	return 1
+}
+
 sub html_header {
 	local *FD = shift;
 	my $title = shift;
